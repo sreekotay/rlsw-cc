@@ -2,6 +2,8 @@
 
 Optimized fork of raylib’s **rlsw** software rasterizer (OpenGL 1.1-style) in [Concurrent-C](https://github.com/sreekotay/concurrent-c) — a strict C11-superset preprocessor: `.ccs` lowers to plain C and compiles with your host C compiler. Span kernels and `@parallel` stripe fill ship as checked-in C plus a portable runtime snapshot.
 
+![Heightmap + knot — textured fill via rlsw-cc](docs/viewer.jpg)
+
 **Showcase / harness:** [rayrender](https://github.com/sreekotay/rayrender) — FetchContents raylib 6.0 + this package, overlays `rlsw.h`, dual binaries vs stock rlsw 1.5, parity benches.
 
 Drop this directory into a project (or FetchContent / submodule it) and overlay onto raylib 6.0 **Software / RGFW**.
