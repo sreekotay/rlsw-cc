@@ -1,0 +1,198 @@
+/*
+ * CCParallel — one @parallel join as a holdable completion-or-error.
+ *
+ * `@parallel { … }` is CCParallel !>(CCError): create can fail.
+ * `.wait()` is the join: it synchronizes-with every arm; captured
+ * writes are visible after it returns. Binding the handle does not
+ * join. UFCS is the surface (`h.wait()` is `cc_parallel_wait(h)`).
+ * A void host unwraps in place: `h.wait() !>(e) { (void)e; };`.
+ * `.cancel()` is bool !>(CCIoError): Ok(true) means this call
+ * stored live→cancelled on this handle or an adopted descendant.
+ * Joined dest: wait is ok; cancel/pause/resume are ok(false).
+ * `cancelled` is atomic. Spawned arms do not inherit the caller's
+ * deadline; poll `h.cancelled`. `.pause()` / `.resume()` are
+ * bool !>(CCIoError). `.adopt(child)` links a cancel tree: parent
+ * cancel walks children first, then self. Child cancel does not
+ * cancel the parent.
+ */
+#ifndef CC_PARALLEL_H
+#define CC_PARALLEL_H
+
+#include <ccc/cc_compat.h>
+#include <ccc/cc_result.h>
+#include <ccc/cc_io_error.h>
+#include <ccc/cc_atomic.h>
+#include <ccc/cc_sched.h>
+#include <ccc/cc_nursery.h>
+#include <ccc/cc_type.h>
+#include <ccc/cc_ufcs.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifndef CC_PARALLEL_TASK_MAX
+#define CC_PARALLEL_TASK_MAX 32
+#endif
+
+#ifndef CC_PARALLEL_CHILD_MAX
+#define CC_PARALLEL_CHILD_MAX 8
+#endif
+
+typedef struct CCParallel {
+    cc_atomic_int joined;
+    int paused;
+    cc_atomic_int cancelled;
+    int fail;
+    int fin;
+    int nt;
+    int nch;
+    CCError err;
+    CCNurseryHost* n;
+    struct CCParallel* parent;
+    struct CCParallel* children[CC_PARALLEL_CHILD_MAX];
+    CCTask tasks[CC_PARALLEL_TASK_MAX];
+    void* envs[CC_PARALLEL_TASK_MAX];
+} CCParallel;
+
+#ifndef CCResult_CCParallel_CCError_DEFINED
+#define CCResult_CCParallel_CCError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCParallel_CCError, CCParallel, CCError)
+#endif
+
+static inline CCParallel cc_parallel_empty(void) {
+    CCParallel h;
+    memset(&h, 0, sizeof(h));
+    return h;
+}
+
+static inline CCResult_void_CCError cc_parallel_wait(CCParallel* h) {
+    int i;
+    if (!h)
+        return cc_err_CCResult_void_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "cc_parallel_wait"));
+    if (cc_atomic_load(&h->joined))
+        return cc_ok_CCResult_void_CCError();
+    if (h->n)
+        (void)cc_nursery_wait(h->n);
+    for (i = 0; i < h->nt; i++) {
+        cc_parallel_join(h->tasks[i]);
+        free(h->envs[i]);
+        h->envs[i] = NULL;
+    }
+    h->nt = 0;
+    cc_atomic_store(&h->joined, 1);
+    if (h->fail)
+        return cc_err_CCResult_void_CCError(h->err);
+    return cc_ok_CCResult_void_CCError();
+}
+
+static inline int cc__parallel_contains(const CCParallel* root,
+                                        const CCParallel* needle) {
+    int i;
+    if (!root || !needle)
+        return 0;
+    if (root == needle)
+        return 1;
+    for (i = 0; i < root->nch; i++) {
+        if (cc__parallel_contains(root->children[i], needle))
+            return 1;
+    }
+    return 0;
+}
+
+/* 0→1 on this handle. True if this call stored the transition. */
+static inline int cc__parallel_cancel_one(CCParallel* h) {
+    int expected = 0;
+    if (!h)
+        return 0;
+    if (cc_atomic_load(&h->joined))
+        return 0;
+    if (!cc_atomic_cas(&h->cancelled, &expected, 1))
+        return 0;
+    if (h->n)
+        cc_nursery_cancel(h->n);
+    return 1;
+}
+
+static inline int cc__parallel_cancel_tree(CCParallel* h) {
+    int i;
+    int did = 0;
+    if (!h)
+        return 0;
+    for (i = h->nch - 1; i >= 0; i--)
+        did |= cc__parallel_cancel_tree(h->children[i]);
+    did |= cc__parallel_cancel_one(h);
+    return did;
+}
+
+static inline CCResult_bool_CCIoError cc_parallel_cancel(CCParallel* h) {
+    if (!h)
+        return cc_err_CCResult_bool_CCIoError(cc_io_error(CC_IO_INVALID_ARGUMENT));
+    return cc_ok_CCResult_bool_CCIoError(cc__parallel_cancel_tree(h) != 0);
+}
+
+static inline CCResult_void_CCError cc__parallel_adopt(CCParallel* parent,
+                                                 CCParallel* child) {
+    if (!parent || !child)
+        return cc_err_CCResult_void_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "adopt"));
+    if (parent == child)
+        return cc_err_CCResult_void_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "adopt self"));
+    if (cc_atomic_load(&parent->joined))
+        return cc_err_CCResult_void_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "adopt: parent already joined"));
+    if (cc_atomic_load(&child->joined))
+        return cc_err_CCResult_void_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "adopt: child already joined"));
+    if (child->parent)
+        return cc_err_CCResult_void_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "adopt: child already adopted"));
+    if (cc__parallel_contains(child, parent))
+        return cc_err_CCResult_void_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "adopt: cycle"));
+    if (parent->nch >= CC_PARALLEL_CHILD_MAX)
+        return cc_err_CCResult_void_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "adopt: too many children"));
+    parent->children[parent->nch++] = child;
+    child->parent = parent;
+    return cc_ok_CCResult_void_CCError();
+}
+
+/* UFCS `h1.adopt(h2)` passes the child as a value; take its address. */
+#define cc_parallel_adopt(parent, child)                                       \
+    cc__parallel_adopt((parent),                                               \
+                       _Generic((child), CCParallel *: (child), default: &(child)))
+
+static inline CCResult_bool_CCIoError cc_parallel_pause(CCParallel* h) {
+    if (!h)
+        return cc_err_CCResult_bool_CCIoError(cc_io_error(CC_IO_INVALID_ARGUMENT));
+    if (cc_atomic_load(&h->joined))
+        return cc_ok_CCResult_bool_CCIoError(false);
+    if (h->paused)
+        return cc_ok_CCResult_bool_CCIoError(false);
+    h->paused = 1;
+    return cc_ok_CCResult_bool_CCIoError(true);
+}
+
+static inline CCResult_bool_CCIoError cc_parallel_resume(CCParallel* h) {
+    if (!h)
+        return cc_err_CCResult_bool_CCIoError(cc_io_error(CC_IO_INVALID_ARGUMENT));
+    if (cc_atomic_load(&h->joined))
+        return cc_ok_CCResult_bool_CCIoError(false);
+    if (!h->paused)
+        return cc_ok_CCResult_bool_CCIoError(false);
+    h->paused = 0;
+    return cc_ok_CCResult_bool_CCIoError(true);
+}
+
+static inline CCSlice cc_parallel_lower_c(CCSlice recv_type,
+                                          CCSlice method,
+                                          CCSlice mode,
+                                          CCSliceArray argv,
+                                          CCSliceArray arg_types,
+                                          CCArena* arena) {
+    (void)recv_type;
+    (void)mode;
+    (void)argv;
+    (void)arg_types;
+    return cc_slice_concat2(
+        cc_slice_from_static((void*)"cc_parallel_",
+                             sizeof("cc_parallel_") - 1),
+        method, arena);
+}
+
+
+
+#endif

@@ -18,10 +18,10 @@ void sw_bin_par_stripes(int n, int vertical, const sw_bin_flush_args_t *a)
     if (vertical) {
         @parallel for (tx in 0..n) {
             sw_bin_fill_cell((int)tx, 0, a);
-        }
+        } !>.wait()!>;
     } else {
         @parallel for (ty in 0..n) {
             sw_bin_fill_cell(0, (int)ty, a);
-        }
+        } !>.wait()!>;
     }
 }

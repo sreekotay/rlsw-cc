@@ -24,6 +24,7 @@
 #include "slice.h"
 #include <ccc/cc_channel.h>
 #include <ccc/cc_nursery.h>
+#include <ccc/cc_parallel.h>
 #include <ccc/cc_exec.h>
 #include "string.h"
 #include "slice_packed.h"
