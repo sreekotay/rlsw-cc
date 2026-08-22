@@ -1,0 +1,28 @@
+/*
+ * cc_emit_tpl.cch — backtick emit-template builder for @comptime factories.
+ *
+ * `@emit(`...${expr}...`, arena)` (return form -> CCSlice) and
+ * `@emit(anchor, `...`)` (anchored splice) lower to CCString builders over an
+ * arena (same ${...} grammar as `@string`).  Used by compiled generic factories
+ * and the libtcc comptime executor.  These helpers remain for cc_emit_format and
+ * any direct cc_emit_tpl_* callers.
+ */
+#ifndef CC_EMIT_TPL_CCH
+#define CC_EMIT_TPL_CCH
+
+#include <ccc/cc_slice.h>
+#include <string.h>
+#include <stdio.h>
+
+#include <ccc/cc_emit_tpl_core.inc.h>
+
+#ifdef CC_COMPTIME_EXEC
+extern void cc_emit_raw(int anchor, const char *ptr, size_t len);
+
+static inline void cc_emit_tpl_splice(int anchor, CCSlice fragment) {
+    if (!fragment.ptr || fragment.len == 0) return;
+    cc_emit_raw(anchor, (const char *)fragment.ptr, fragment.len);
+}
+#endif
+
+#endif /* CC_EMIT_TPL_CCH */

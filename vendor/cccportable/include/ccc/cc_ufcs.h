@@ -1,0 +1,107 @@
+#ifndef CC_UFCS_H
+#define CC_UFCS_H
+
+#include <string.h>
+
+#include <ccc/cc_arena.h>
+
+typedef CCSlice (*CCUfcsRewriteFn)(CCSlice recv_type, CCSlice method, CCSlice mode, CCSliceArray argv, CCSliceArray arg_types, CCArena *arena);
+
+typedef struct {
+    CCSlice pattern;
+    CCUfcsRewriteFn rewrite;
+} CCUfcsRegistration;
+
+#define CC_UFCS_VALUE_TAG "__cc_ufcs_value__:"
+
+/* Sentinel returned by a registered `.ufcs` hook to mean "I don't want to
+ * handle this (type, method) pair — please fall through to whatever
+ * dispatch path would have run with no registered hook at all."  This is
+ * distinct from returning `cc_slice_empty()`, which is "strict reject:
+ * raise a hard error".  Used by the global wildcard hooks in
+ * cc_arena.cch to defer to the compiler's hardcoded channel / slice
+ * dispatchers for the handful of types whose surface spelling diverges
+ * from the stdlib naming convention. */
+#define CC_UFCS_PASS_TAG "__cc_ufcs_pass__"
+
+static inline CCSlice cc_ufcs_pass(void) {
+    return cc_slice_from_static((void*)CC_UFCS_PASS_TAG, sizeof(CC_UFCS_PASS_TAG) - 1);
+}
+
+static inline bool cc_ufcs_slice_eq_cstr(CCSlice s, const char *cstr) {
+    size_t len = cstr ? strlen(cstr) : 0;
+    return cstr && s.len == len && memcmp(s.ptr, cstr, len) == 0;
+}
+
+static inline CCSlice cc_ufcs_emit_value(CCArena *arena, CCSlice callee) {
+    size_t prefix_len = sizeof(CC_UFCS_VALUE_TAG) - 1;
+    size_t total = prefix_len + callee.len;
+    CCSlice out = arena ? cc_arena_alloc_slice_bytes(arena, total) : cc_slice_empty();
+    char *buf = (char *)out.ptr;
+    if (total > 0 && !buf) return cc_slice_empty();
+    memcpy(buf, CC_UFCS_VALUE_TAG, prefix_len);
+    if (callee.len > 0 && callee.ptr) memcpy(buf + prefix_len, callee.ptr, callee.len);
+    return out;
+}
+
+static inline CCSlice cc_ufcs_emit_value_cstr(CCArena *arena, const char *callee) {
+    CCSlice callee_slice = callee ? cc_slice_from_static((void *)callee, strlen(callee)) : cc_slice_empty();
+    return cc_ufcs_emit_value(arena, callee_slice);
+}
+
+/* `.ufcs` rewrite hooks compose their callee name (`<prefix><method>`) with
+ * `cc_slice_concat2(prefix, method, arena)` from cc_arena.cch — the shared
+ * slice concatenator (arena last).  There is no UFCS-specific concat helper:
+ * name composition is just slice concatenation. */
+
+/* The generic UFCS name composers live in cc_arena.cch — their bodies need
+ * `cc_arena_alloc`, and cc_ufcs.cch is the one that includes that header, so
+ * putting the helpers there avoids a circular include.  The global
+ * `@typehooks on * { … }` entry wires in the snake_case default; slice
+ * marker types register a narrower composer that routes back to `cc_slice_*`. */
+
+/* Prefer `@typehooks on T { .ufcs = rewrite, };` — see docs/deprecated.md. */
+static inline CCUfcsRegistration cc_ufcs_register(const char *pattern, CCUfcsRewriteFn rewrite) {
+    CCUfcsRegistration reg = {0};
+    reg.pattern = pattern ? cc_slice_from_static((void *)pattern, strlen(pattern)) : cc_slice_empty();
+    reg.rewrite = rewrite;
+    return reg;
+}
+
+static inline CCSlice cc_ufcs_apply(CCUfcsRegistration reg, CCSlice recv_type, CCSlice method, CCSlice mode, CCSliceArray argv, CCSliceArray arg_types, CCArena *arena) {
+    if (!reg.rewrite) return cc_slice_empty();
+    return reg.rewrite(recv_type, method, mode, argv, arg_types, arena);
+}
+
+/* Default UFCS dispatch is wired up globally in cc_arena.cch via
+ * `@typehooks` entries:
+ *
+ *     @typehooks on * { .ufcs = cc_ufcs_generic_cc_prefix_lower_c };
+ *     @typehooks on CCSliceUnique* { .ufcs = cc_ufcs_generic_cc_slice_family_c };
+ *     @typehooks on CCSliceShared* { .ufcs = cc_ufcs_generic_cc_slice_family_c };
+ *
+ * Every CamelCase receiver whose C API follows the `<snake_type>_<method>`
+ * convention gets UFCS dispatch for free — headers no longer need a
+ * per-type `@typehooks` opt-in.  Two shapes are
+ * recognized by the generic composer:
+ *
+ *   - Stdlib `CCFoo` / `CCFoo*` receivers (CCArena, CCArenaCheckpoint,
+ *     CCArenaPool, CCFile, CCCommand, CCSocket, CCListener, CCString, ...)
+ *     keep their `cc_` prefix and map to `cc_<snake_foo>_<method>`.
+ *   - Bare user types (e.g. `RedisConn*`) map directly to
+ *     `<snake_type>_<method>` — `conn->retain()` -> `redis_conn_retain(conn)`
+ *     with no synthetic `cc_` prefix, matching idiomatic C naming.
+ *
+ * CCSlice itself follows the default stdlib convention (`cc_slice_<method>`).
+ * The semantic marker aliases `CCSliceUnique` / `CCSliceShared` keep their
+ * distinct type names for compiler reasoning, while the narrower registrations
+ * route their methods back to the shared `cc_slice_*` ABI.
+ *
+ * Types that diverge further from both conventions — CCNursery and the
+ * CCChanTx / CCChanRx families whose method names deliberately differ
+ * from their C entry points (spawn -> spawn_closure0, etc.) — still
+ * register a more specific pattern with a bespoke rewrite function and
+ * win over both generic defaults by the same longest-prefix rule.
+ */
+
+#endif

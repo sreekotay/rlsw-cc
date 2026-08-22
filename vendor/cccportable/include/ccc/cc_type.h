@@ -1,0 +1,391 @@
+#ifndef CC_TYPE_H
+#define CC_TYPE_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include <ccc/cc_slice.h>
+#include <ccc/cc_arena.h>
+
+/* ============================================================
+ * Runtime type information (cc_type_info)
+ *
+ * This is the first piece of CC's real type system.  Every CC
+ * type (primitive, struct, generic instantiation, closure) gets
+ * one `cc_type_info` symbol describing its size, alignment,
+ * layout, and lifecycle hooks.  Two consumers share the same
+ * data:
+ *   - Generic containers can dispatch on it to provide a
+ *     type-erased footprint (`cc_dyn_vec`, etc.) instead of
+ *     monomorphizing per-T.
+ *   - Comptime code can introspect it via `type_of(T)` to drive
+ *     codegen, serialization, schema emission, etc.
+ *
+ * Primitive `cc_type_info` symbols (`__cc_ti_int`, etc.) live in
+ * `cc/runtime/cc_type_info.c` and are always linked in.  User
+ * types and container instantiations emit their own per-TU
+ * `cc_type_info` symbols — generic containers (Vec/Map) via
+ * codegen, user structs via the `CC_TYPE_INFO_BEGIN/FIELD/END`
+ * macros below.  See milestone #4a in
+ * `cc/docs/COMPILER_CLEANUP_STATUS.md` for the design.
+ *
+ * Access pattern (prefer the typed accessors over raw fields —
+ * `kind`/`flags`/`nfields` are stored as `uint16_t` for compactness):
+ *     const cc_type_info* ti = type_of(int);
+ *     printf("%s size=%zu align=%zu\n",
+ *            ti->name, cc_ti_size(ti), cc_ti_align(ti));
+ * ============================================================ */
+
+typedef enum cc_type_kind {
+    CC_TK_UNKNOWN       = 0,
+    CC_TK_PRIMITIVE     = 1,
+    CC_TK_POINTER       = 2,
+    CC_TK_STRUCT        = 3,
+    CC_TK_GENERIC_INST  = 4,    /* CCVec::[T], Map<K,V>, Chan<T> */
+    CC_TK_CLOSURE       = 5,
+    CC_TK_FUNCTION      = 6,
+    CC_TK_ARRAY         = 7,
+} cc_type_kind;
+
+typedef enum cc_type_flag {
+    CC_TF_NONE          = 0,
+    CC_TF_POD           = 1u << 0,  /* plain old data — bitwise copy is safe */
+    CC_TF_TRIVIAL_COPY  = 1u << 1,  /* copy_fn is NULL — caller uses memcpy(dst, src, size) */
+    CC_TF_TRIVIAL_DROP  = 1u << 2,  /* drop_fn is NULL — caller does nothing */
+    /* CC_TF_ERASABLE: a *hint* that the type is safe through a
+     * type-erased container.  Set by primitives and by codegen-
+     * emitted / pre-baked container instantiations.  Today no
+     * runtime path enforces it — `cc_dyn_vec` will accept any
+     * `cc_type_info` regardless.  Treat it as advisory: code
+     * generating generic dispatch tables can refuse types that
+     * don't have it set; everything else can ignore it. */
+    CC_TF_ERASABLE      = 1u << 3,
+} cc_type_flag;
+
+typedef struct cc_type_field {
+    const char*                  name;
+    const struct cc_type_info*   type;
+    uint32_t                     offset;     /* bytes from struct start */
+    uint32_t                     reserved;   /* future: nelems for array fields, bit width for bitfields */
+} cc_type_field;
+
+typedef struct cc_type_info {
+    const char*           name;        /* display name: "int", "Point", "CCVec::[int]" */
+    const char*           mangled;     /* symbol-safe: "int", "Point", "CCVec_int" */
+    /* `id`: reserved slot for a per-binary stable type ID.
+     * Currently always 0; populated by a future commit once we
+     * have a use case (cross-process serialization, debugger
+     * dumps).  Smokes pin it to 0 so we don't accidentally start
+     * relying on it before it exists. */
+    uint32_t              id;
+    uint32_t              size;        /* sizeof(T) */
+    uint32_t              align;       /* alignof(T) */
+    uint16_t              kind;        /* cc_type_kind, narrowed to uint16_t — use cc_ti_kind() to read */
+    uint16_t              nfields;     /* use cc_ti_nfields() to read */
+    uint16_t              flags;       /* cc_type_flag bitset — use cc_ti_flags() to read */
+    uint16_t              _reserved;   /* padding; keeps the struct 16-byte aligned */
+    const cc_type_field*  fields;      /* may be NULL when nfields == 0 */
+    void (*copy_fn)(void* dst, const void* src);  /* NULL → bitwise copy */
+    void (*drop_fn)(void* p);                     /* NULL → no-op */
+} cc_type_info;
+
+/* Typed accessors — read storage-narrowed fields back as their
+ * semantic types so user code doesn't have to cast at every
+ * comparison.  Storage stays packed (uint16_t kind/flags/nfields,
+ * uint32_t size/align — keeps the struct compact for the many
+ * thousands of cc_type_info symbols a large program will carry);
+ * accessors give callers the wide type they actually want.
+ *
+ *   if (cc_ti_kind(ti) == CC_TK_STRUCT) { ... }    // no cast
+ *   if (cc_ti_flags(ti) & CC_TF_POD)    { ... }    // no cast
+ *   printf("size=%zu\n", cc_ti_size(ti));          // %zu just works
+ *
+ * Prefer these over direct field access in new code; the raw
+ * struct fields stay public for serialization / debug-printer
+ * use cases that need the on-wire shape. */
+static inline cc_type_kind cc_ti_kind(const cc_type_info* ti) {
+    return (cc_type_kind)ti->kind;
+}
+static inline cc_type_flag cc_ti_flags(const cc_type_info* ti) {
+    return (cc_type_flag)ti->flags;
+}
+static inline size_t cc_ti_size(const cc_type_info* ti) {
+    return (size_t)ti->size;
+}
+static inline size_t cc_ti_align(const cc_type_info* ti) {
+    return (size_t)ti->align;
+}
+static inline size_t cc_ti_nfields(const cc_type_info* ti) {
+    return (size_t)ti->nfields;
+}
+
+/* `cc_type_of(mangled)` — runtime lookup of a `cc_type_info*` by
+ * mangled-name string.  Returns NULL if the type hasn't been
+ * registered in the current binary.  This is the public API; the
+ * `type_of(T)` macro below is sugar over it.
+ *
+ * Lookup is currently O(n) (small global array, populated by
+ * static constructors at startup).  Primitives, per-TU container
+ * instantiations (codegen-emitted), and user struct registrations
+ * (`CC_TYPE_INFO_BEGIN/FIELD/END` below) all flow through the same
+ * registry — giving stable pointer-identity across all callers
+ * within a single binary.
+ *
+ * `cc_type_info_register` is the registration entry-point.
+ * Primitives and codegen-emitted constructors call it for you.
+ * User code MAY call it directly to teach the registry about a
+ * hand-rolled `cc_type_info`.  (The name is deliberately distinct
+ * from the legacy `cc_type_register(name, hooks)` comptime API
+ * below; unifying the two is deferred to milestone #4a's later
+ * commits — see COMPILER_CLEANUP_STATUS.md.) */
+const cc_type_info* cc_type_of(const char* mangled);
+void cc_type_info_register(const cc_type_info* ti);
+
+/* `type_of(T)` — sugar: `cc_type_of(#T)`.  Why a function call
+ * rather than `(&__cc_ti_##T)`?  Because T is often a typedef
+ * (e.g. `CCVec_int`) whose `__cc_ti_T` symbol is emitted by a
+ * later codegen pass, and a function call with a string literal
+ * trivially parses where `&undeclared_symbol` does not.  The
+ * registry lookup is cheap (linear scan of a small table) and
+ * happens once per call-site at runtime.  Comptime
+ * (`@comptime { type_of(T).fields ... }`) will get a real
+ * parser-level builtin in a separate commit (3c.3). */
+#define type_of(T) cc_type_of(#T)
+
+/* Primitive type-info symbols — defined in cc/runtime/cc_type_info.c
+ * and always linked into the runtime.  Kept exposed so callers that
+ * really want compile-time-constant pointers (e.g. static
+ * initializers) can still take their address directly.  Most code
+ * should prefer `type_of(int)`, which is just `cc_type_of("int")`
+ * and goes through the registry. */
+extern const cc_type_info __cc_ti_int;
+extern const cc_type_info __cc_ti_char;
+extern const cc_type_info __cc_ti_short;
+extern const cc_type_info __cc_ti_long;
+extern const cc_type_info __cc_ti_float;
+extern const cc_type_info __cc_ti_double;
+extern const cc_type_info __cc_ti_size_t;
+extern const cc_type_info __cc_ti_intptr_t;
+extern const cc_type_info __cc_ti_bool;
+
+/* `offsetof` lives in stddef.h, which `cc_type.cch` includes at
+ * the top.  We rely on it inside CC_TYPE_INFO_FIELD below. */
+
+/* ============================================================
+ * User struct registration helpers (Commit 3c.2-lite)
+ *
+ * Goal: let user code register a plain `typedef struct {...}` so
+ * that `type_of(MyStruct).fields[i].{name,type,offset}` walks the
+ * declared layout at runtime.  This is the runtime half of
+ * comptime introspection — once the parser-level builtin (3c.3)
+ * lands, comptime code calls into the same `cc_type_info` we
+ * emit here, so there is only one source of truth per type.
+ *
+ * Usage:
+ *
+ *     typedef struct {
+ *         int   a;
+ *         float b;
+ *     } Point;
+ *
+ *     CC_TYPE_INFO_BEGIN(Point)
+ *         CC_TYPE_INFO_FIELD(Point, a, int)
+ *         CC_TYPE_INFO_FIELD(Point, b, float)
+ *     CC_TYPE_INFO_END(Point, "Point")
+ *
+ * Constraints / footguns:
+ *   - The third arg to CC_TYPE_INFO_FIELD is the *mangled* type
+ *     name of the field (e.g. `int`, `float`, `CCVec_int`,
+ *     `MyStruct`).  The macro expands to `&__cc_ti_<mangled>`,
+ *     which must be a declared symbol at expansion site —
+ *     primitives are pre-declared in cc_type.cch above; user
+ *     structs declared with these macros work because the
+ *     `static const cc_type_info __cc_ti_<T>` IS the declaration.
+ *     Pointer fields aren't supported by this minimal form yet
+ *     (would need a `CC_TF_POINTER` flag plus a separate macro);
+ *     use the long form by hand if you need them.
+ *   - Field order in the macro block MUST match struct
+ *     declaration order; `offsetof()` enforces correct offsets
+ *     but does not guard against missing or reordered fields.
+ *   - Each TU that registers a type T gets its own static
+ *     `__cc_ti_T` — the runtime registry de-dupes by mangled
+ *     name (first-registration wins), giving stable pointer
+ *     identity across all callers.
+ * ============================================================ */
+
+#define CC_TYPE_INFO_BEGIN(T)                                                \
+    static const cc_type_field cc__ti_fields_##T[] = {
+
+/* Use `__builtin_offsetof` instead of the stddef.h `offsetof`:
+ * the latter expands on some libc implementations to
+ * `((size_t)&(((T*)0)->F))`, which trips CC's stub-AST parser
+ * (the "&-of-NULL-deref" idiom is not in the subset the parser
+ * accepts).  `__builtin_offsetof` is a single token both TCC
+ * and the host C compiler recognize directly. */
+#define CC_TYPE_INFO_FIELD(T, FNAME, FTYPE_MANGLED)                          \
+        { .name     = #FNAME,                                                \
+          .type     = &__cc_ti_##FTYPE_MANGLED,                              \
+          .offset   = (uint32_t)__builtin_offsetof(T, FNAME),                \
+          .reserved = 0 },
+
+#define CC_TYPE_INFO_END(T, DISPLAY)                                         \
+    };                                                                       \
+    static const cc_type_info __cc_ti_##T = {                                \
+        .name      = DISPLAY,                                                \
+        .mangled   = #T,                                                     \
+        .id        = 0,                                                      \
+        .size      = (uint32_t)sizeof(T),                                    \
+        .align     = (uint32_t)_Alignof(T),                                  \
+        .kind      = (uint16_t)CC_TK_STRUCT,                                 \
+        .nfields   = (uint16_t)(sizeof(cc__ti_fields_##T)                    \
+                                / sizeof(cc_type_field)),                    \
+        .flags     = 0,                                                      \
+        ._reserved = 0,                                                      \
+        .fields    = cc__ti_fields_##T,                                      \
+        .copy_fn   = NULL,                                                   \
+        .drop_fn   = NULL,                                                   \
+    };                                                                       \
+    __attribute__((constructor))                                             \
+    static void cc__ti_reg_##T(void) {                                       \
+        cc_type_info_register(&__cc_ti_##T);                                 \
+    }
+
+/* ============================================================
+ * Legacy comptime type-registration API.
+ *
+ * Pre-dates `cc_type_info`.  Today this is the only way to wire
+ * up create/destroy/UFCS hooks for user types via comptime.
+ * The two APIs will be unified in milestone #4b (see status doc):
+ * `cc_type_register(T, hooks)` will additionally emit the
+ * per-T `cc_type_info` symbol so `type_of(T)` works seamlessly.
+ * ============================================================ */
+
+typedef struct {
+    const char* callee1;
+    const char* callee2;
+    const void* callable;
+} CCTypeCreateHook;
+
+typedef struct {
+    const char* pre_callee;
+    const char* callee;
+} CCTypeDestroyHook;
+
+typedef CCSlice (*CCTypeCreateHandler)(CCSlice type_name, CCSliceArray argv, CCSliceArray arg_types, CCArena* arena);
+typedef CCSlice (*CCTypeUfcsHandler)(CCSlice recv_type, CCSlice method, CCSlice mode, CCSliceArray argv, CCSliceArray arg_types, CCArena* arena);
+
+/* Niche descriptor (spec/draft_variants.md §11).  A type declares a bit
+ * pattern a valid instance is guaranteed never to exhibit — an (offset,
+ * width, sentinel) triple over its storage — so a `@variant(packed)` arm of
+ * this type can donate that pattern to carry the discriminant.  `size`/`align`
+ * pin the type's footprint for the packing engine (and become `_Static_assert`s
+ * in the emitted C). */
+typedef struct {
+    int has_niche;
+    unsigned size;
+    unsigned align;
+    unsigned offset;
+    unsigned width;
+    unsigned long long sentinel;
+} CCTypeNicheHook;
+
+/* Dynamic UFCS sink: a method call on the type that resolves to nothing
+ * (no exact owner, no wildcard hit, no as: path) lowers to
+ * `callee(&recv, "method", N, arg_wrap(a1), arg_wrap(a2), ...)` — the
+ * method identifier becomes a string argument and each argument is
+ * lifted by the named wrapper macro. Last resort only; never wildcard.
+ *
+ * Wherever a typed destination is visible (`T name = recv.method(args)`,
+ * an assignment to a resolvable lvalue, or a cast `(T)recv.method(args)`)
+ * the destination joins resolution — the sink callee composes as
+ * <callee>_<mangled dest type> when that function is declared
+ * (compose-then-verify; plain callee otherwise). A composed cast is
+ * absorbed: it spells the destination, performs no conversion, and never
+ * consumes a Result. No sigil involved. */
+typedef struct {
+    const char* callee;
+    const char* arg_wrap;
+} CCTypeDynamicHook;
+
+typedef struct {
+    CCTypeCreateHook create;
+    CCTypeDestroyHook destroy;
+    CCTypeUfcsHandler ufcs;
+    CCTypeDynamicHook ufcs_sink;
+    CCTypeNicheHook niche;
+} CCTypeHooks;
+
+static inline CCTypeCreateHook cc_type_create_call(const char* callee) {
+    CCTypeCreateHook hook = {0};
+    hook.callee1 = callee;
+    return hook;
+}
+
+static inline CCTypeCreateHook cc_type_create_overloads(const char* callee1, const char* callee2) {
+    CCTypeCreateHook hook = {0};
+    hook.callee1 = callee1;
+    hook.callee2 = callee2;
+    return hook;
+}
+
+static inline CCTypeCreateHook cc_type_create_hook(CCTypeCreateHandler callable) {
+    CCTypeCreateHook hook = {0};
+    hook.callable = (const void*)callable;
+    return hook;
+}
+
+static inline CCTypeDynamicHook cc_type_dynamic_call(const char* callee,
+                                                     const char* arg_wrap) {
+    CCTypeDynamicHook hook = {0};
+    hook.callee = callee;
+    hook.arg_wrap = arg_wrap;
+    return hook;
+}
+
+static inline CCTypeDestroyHook cc_type_destroy_call(const char* callee) {
+    CCTypeDestroyHook hook = {0};
+    hook.callee = callee;
+    return hook;
+}
+
+static inline CCTypeDestroyHook cc_type_pre_destroy_call(const char* callee) {
+    CCTypeDestroyHook hook = {0};
+    hook.pre_callee = callee;
+    return hook;
+}
+
+static inline CCTypeDestroyHook cc_type_destroy_hooks(const char* pre_callee, const char* callee) {
+    CCTypeDestroyHook hook = {0};
+    hook.pre_callee = pre_callee;
+    hook.callee = callee;
+    return hook;
+}
+
+static inline CCTypeNicheHook cc_type_niche(unsigned size, unsigned align,
+                                            unsigned offset, unsigned width,
+                                            unsigned long long sentinel) {
+    CCTypeNicheHook hook = {0};
+    hook.has_niche = 1;
+    hook.size = size;
+    hook.align = align;
+    hook.offset = offset;
+    hook.width = width;
+    hook.sentinel = sentinel;
+    return hook;
+}
+
+static inline int cc_type_register(const char* type_name, CCTypeHooks hooks) {
+    (void)type_name;
+    (void)hooks;
+    return 0;
+}
+
+/* Preferred Concurrent-C surface is `@typehooks on T { … };` (rewrites to
+ * `cc_type_register`). `cc_type_define` is a thin alias of `cc_type_register`;
+ * the compiler's `@comptime` scanner (cc/src/comptime/symbols.c) recognizes
+ * both spellings identically. See docs/deprecated.md. */
+static inline int cc_type_define(const char* mangled_name, CCTypeHooks proto) {
+    return cc_type_register(mangled_name, proto);
+}
+
+#endif

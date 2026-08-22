@@ -1,0 +1,152 @@
+/*
+ * CCSelect: compose-once / reuse-many multi-source select primitive.
+ *
+ * Scope-attached usage (preferred):
+ *
+ *   CCSelect sel@() @destroy;
+ *   cc_select_add_recv(&sel, conn->reply_rx, &reply_slot,
+ *                      () => [&env] { ... handler body ... });
+ *   cc_select_add_close(&sel, conn->reply_rx, &close_err,
+ *                       () => [&env] { ... handler body ... });
+ *   cc_select_add_readable(&sel, &client,
+ *                          () => [&env] { ... handler body ... });
+ *   while (keep_going) {
+ *       bool !>(CCIoError) r = cc_select_wait(&sel);
+ *       if (!r.ok) break;
+ *       keep_going = r.u.value;
+ *   }
+ *
+ * Semantics:
+ *   - Handlers are CCClosure0 callbacks invoked from inside cc_select_wait().
+ *     Per-case data (received pointer, close error) is written to caller-
+ *     supplied slots BEFORE the handler runs, so the closure can capture the
+ *     slot and read the value.
+ *   - Handler return (void* cast to bool): nonzero = continue, zero = stop.
+ *   - Exactly one handler fires per wait() call. Handler's bool is propagated
+ *     back as the Ok value.
+ *   - If the runtime encounters a real I/O error (EINVAL, cancelled, etc.)
+ *     wait returns Err(CCIoError) without invoking any handler.
+ *   - v1 requires at least one readable-socket case. Pure-channel selects
+ *     will be supported in v2 once a socket-independent signal lands.
+ *   - v1 supports recv / close / readable. send / writable / deadline are
+ *     deferred; the corresponding add_* returns EINVAL.
+ *
+ * Channel handles: the add_recv / add_close callers may pass either CCChan*
+ * or CCChanRx. _Generic dispatches to the right arm; no .raw unwrap needed
+ * at the call site.
+ */
+#ifndef CC_SELECT_H
+#define CC_SELECT_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
+#include <ccc/cc_compat.h>
+#include <ccc/cc_closure.h>
+#include <ccc/cc_io_error.h>
+#include <ccc/cc_result.h>
+#include <ccc/cc_chan_handle.h>
+#include <ccc/cc_type.h>
+
+typedef struct CCChan CCChan;
+typedef struct CCSocket CCSocket;
+typedef union CCSocketSignal CCSocketSignal;
+
+#define CC_SELECT_MAX_CASES 16
+
+typedef enum {
+    CC_SEL_NONE = 0,
+    CC_SEL_RECV = 1,
+    CC_SEL_CLOSE = 2,
+    CC_SEL_READABLE = 3,
+} CCSelectCaseKind;
+
+typedef struct {
+    uint8_t kind;            /* CCSelectCaseKind */
+    uint8_t _pad[7];
+    void* source;            /* CCChan* (recv/close) or CCSocket* (readable) */
+    void** out_ptr_slot;     /* recv: runtime writes received pointer here before
+                              * invoking the handler; caller captures the slot in
+                              * the closure. NULL means the runtime discards. */
+    CCIoError* out_err_slot; /* close: runtime writes the close error here before
+                              * invoking the handler. NULL means discard. */
+    /* Handler is always CCClosure0; closure fn returns void*; nonzero = true,
+     * zero = false. Per-case data is exchanged through the out_*_slot pointers
+     * above so the closure can simply capture them. */
+    CCClosure0 h;
+} CCSelectCase;
+
+typedef struct CCSelect {
+    uint8_t count;
+    uint8_t _pad[7];
+    CCSelectCase cases[CC_SELECT_MAX_CASES];
+    /* Lazily-initialized shared signal anchored to the first readable socket.
+     * Channels' recv_signal is wired to this so send/close wakes hit the
+     * signal, and the signal's socket-fd wait arm catches socket readiness. */
+    CCSocketSignal* _sig;      /* allocated internally (malloc) */
+    CCSocket* _anchor_sock;    /* first readable socket registered */
+    uint8_t _wired;            /* 1 once signals are attached */
+} CCSelect;
+
+/* Initialize an empty select in place (rarely needed directly; prefer
+ * `CCSelect sel@() @destroy;`). */
+void cc_select_init(CCSelect* sel);
+
+/* Release resources (shared signal, unwire channel signals, drop handler
+ * closure envs). Matches @destroy. */
+void cc_select_dispose(CCSelect* sel);
+
+/* create hook: returns a zeroed CCSelect by value. Paired with
+ * cc_select_dispose via cc_type_register below. */
+static inline CCSelect cc_select_create(void) {
+    CCSelect s;
+    memset(&s, 0, sizeof(s));
+    return s;
+}
+
+/* Raw builders (take CCChan*). All return 0 on success, errno-style on
+ * failure (e.g. ENOSPC if the fixed case array is full; EINVAL on NULL args).
+ *
+ * Prefer the `cc_select_add_recv` / `cc_select_add_close` macros below which
+ * also accept CCChanRx. */
+int cc_select_add_recv_raw(CCSelect* sel, CCChan* ch, void** out_ptr_slot, CCClosure0 handler);
+int cc_select_add_close_raw(CCSelect* sel, CCChan* ch, CCIoError* out_err_slot, CCClosure0 handler);
+int cc_select_add_readable(CCSelect* sel, CCSocket* sock, CCClosure0 handler);
+
+/* Typed wrappers: accept CCChanRx and unwrap the raw handle. */
+static inline int cc__select_add_recv_rx(CCSelect* sel, CCChanRx rx, void** out_ptr_slot, CCClosure0 handler) {
+    return cc_select_add_recv_raw(sel, rx.raw, out_ptr_slot, handler);
+}
+static inline int cc__select_add_close_rx(CCSelect* sel, CCChanRx rx, CCIoError* out_err_slot, CCClosure0 handler) {
+    return cc_select_add_close_raw(sel, rx.raw, out_err_slot, handler);
+}
+
+/* _Generic dispatch: call with either CCChan* or CCChanRx as the 2nd arg.
+ *
+ * Variadic on the handler so closure literals with internal commas
+ * (captures `[a, b, c]` and body `{ stmt; stmt; }`) pass through the
+ * preprocessor unsplit — the preprocessor only protects `()`, not `[]`/`{}`. */
+#define cc_select_add_recv(sel, h, slot, ...) _Generic((h), \
+    CCChan*: cc_select_add_recv_raw, \
+    CCChanRx: cc__select_add_recv_rx \
+)((sel), (h), (slot), __VA_ARGS__)
+
+#define cc_select_add_close(sel, h, slot, ...) _Generic((h), \
+    CCChan*: cc_select_add_close_raw, \
+    CCChanRx: cc__select_add_close_rx \
+)((sel), (h), (slot), __VA_ARGS__)
+
+/* Wait until exactly one case fires. Invokes the handler and returns:
+ *   - Ok(true)  if handler returned nonzero
+ *   - Ok(false) if handler returned zero
+ *   - Err(e)    on runtime-level failure (no handler invoked)
+ * Re-entrant: may be called many times on the same sel. */
+CCResult_bool_CCIoError cc_select_wait(CCSelect* sel);
+
+
+
+
+
+#endif /* CC_SELECT_H */

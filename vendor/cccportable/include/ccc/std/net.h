@@ -1,0 +1,286 @@
+/*
+ * Concurrent-C Networking Primitives
+ * <std/net.h>
+ *
+ * TCP/UDP sockets with async-first design.
+ * All read operations allocate into caller-provided arenas.
+ */
+#ifndef CC_STD_NET_H
+#define CC_STD_NET_H
+
+#include <ccc/cc_arena.h>
+#include <ccc/cc_chan_handle.h>
+#include <ccc/cc_slice.h>
+#include <ccc/cc_result.h>
+#include <ccc/cc_sched.h>
+#include <ccc/cc_closure.h>
+#include <ccc/cc_nursery.h>
+#include <ccc/cc_type.h>
+#include <ccc/cc_ufcs.h>
+#include "io.h"
+
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+
+/* ============================================================================
+ * Error Types
+ * ============================================================================ */
+
+typedef enum CCNetError {
+    CC_NET_OK = 0,
+    CC_NET_CONNECTION_REFUSED,
+    CC_NET_CONNECTION_RESET,
+    CC_NET_CONNECTION_CLOSED,   /* Legacy/other ops; byte reads use Ok(false) for FIN */
+    CC_NET_TIMED_OUT,
+    CC_NET_HOST_UNREACHABLE,
+    CC_NET_NETWORK_UNREACHABLE,
+    CC_NET_ADDRESS_IN_USE,
+    CC_NET_ADDRESS_NOT_AVAILABLE,
+    CC_NET_INVALID_ADDRESS,
+    CC_NET_DNS_FAILURE,
+    CC_NET_TLS_HANDSHAKE_FAILED,
+    CC_NET_TLS_CERTIFICATE_ERROR,
+    CC_NET_OTHER,               /* os_code in extended info */
+} CCNetError;
+
+/* ============================================================================
+ * Socket Types
+ * ============================================================================ */
+
+/* Opaque socket handle */
+typedef struct CCSocket {
+    int fd;
+    uint8_t flags;  /* Internal: closed, etc. */
+    void* watcher;  /* Internal runtime-owned I/O watcher */
+} CCSocket;
+
+/* Socket-bound readiness signal.
+ * Opaque storage for the runtime impl. On i386, long long / long double are
+ * only 4-byte aligned while _Atomic uint64_t needs 8 — force that with
+ * _Alignas(8) rather than relying on max_align_t (missing in TCC sysinclude). */
+#define CC_SOCKET_SIGNAL_STORAGE_SIZE 128
+typedef union CCSocketSignal {
+    _Alignas(8) unsigned char __cc_storage[CC_SOCKET_SIGNAL_STORAGE_SIZE];
+    long long __cc_align_ll;
+    void* __cc_align_ptr;
+} CCSocketSignal;
+
+/* TCP listener */
+typedef struct CCListener {
+    int fd;
+    uint8_t flags;
+    void* watcher;  /* Internal runtime-owned I/O watcher */
+} CCListener;
+
+/* UDP socket */
+typedef struct CCUdpSocket {
+    int fd;
+    uint8_t flags;
+} CCUdpSocket;
+
+/* UDP packet with sender info */
+typedef struct CCUdpPacket {
+    CCSlice data;
+    CCSlice from_addr;
+} CCUdpPacket;
+
+
+/* IP address (v4 or v6) */
+typedef struct CCIpAddr {
+    uint8_t family;  /* 4 or 6 */
+    union {
+        uint8_t v4[4];
+        uint8_t v6[16];
+    } addr;
+} CCIpAddr;
+
+/* Result types for listen / accept / connect (primary Result surface). */
+#ifndef CCResult_CCSocket_CCNetError_DEFINED
+#define CCResult_CCSocket_CCNetError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCSocket_CCNetError, CCSocket, CCNetError)
+#endif
+
+#ifndef CCResult_CCListener_CCNetError_DEFINED
+#define CCResult_CCListener_CCNetError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCListener_CCNetError, CCListener, CCNetError)
+#endif
+
+/* Map CCNetError into the shared I/O error domain (channels, files, redis). */
+static inline CCIoError cc_net_to_io_error(CCNetError err) {
+    switch (err) {
+        case CC_NET_CONNECTION_CLOSED:
+        case CC_NET_CONNECTION_RESET:
+            return __cc_io_error_from_kind(CC_IO_CONNECTION_CLOSED);
+        case CC_NET_TIMED_OUT:
+            return __cc_io_error_from_kind(CC_IO_BUSY);
+        default:
+            return __cc_io_error_from_kind(CC_IO_OTHER);
+    }
+}
+
+/* Socket byte I/O uses the shared CCIoError Result domain (files/channels).
+ * Listen/accept/connect keep CCNetError for address/connect fidelity. */
+
+/* ============================================================================
+ * TCP Client
+ * ============================================================================ */
+
+/* Connect to addr ("host:port" or "ip:port").
+ * On error the returned socket has fd == -1. */
+CCResult_CCSocket_CCNetError cc_tcp_connect(const char* addr, size_t addr_len);
+
+/* Async variant (requires runtime integration) */
+/* @async CCSocket !>(CCNetError) cc_tcp_connect_async(const char* addr, size_t addr_len); */
+
+/* ============================================================================
+ * TCP Server
+ * ============================================================================ */
+
+/* Listen on addr ("0.0.0.0:8080", "[::]:8080").
+ * `addr` is a NUL-terminated borrow (char[:0] / CCSlice), same shape as
+ * cc_file_open's path. On error the returned listener has fd == -1. */
+CCResult_CCListener_CCNetError cc_tcp_listen(CCSlice addr);
+
+/* Accept connection (blocking / fiber-parked).
+ * On error the returned socket has fd == -1. */
+CCResult_CCSocket_CCNetError cc_listener_accept(CCListener* ln);
+
+/* Async accept */
+/* @async CCSocket !>(CCNetError) cc_listener_accept_async(CCListener* ln); */
+
+/* Accept until `n` is cancelled (or accept fails).
+ * Each connection is handed to `on_conn` as `CCSocket*` (arg0) for the
+ * duration of that call — copy or n.spawn(async_fn(...)) before returning.
+ * `on_conn` is borrow-invoked each accept (not single-shot); serve takes
+ * ownership and drops it when the loop ends.
+ * UFCS: `ln.serve(nursery, on_conn)`. */
+void cc_listener_serve(CCListener* ln, CCNursery n, CCClosure1 on_conn);
+
+/* Close listener */
+void cc_listener_close(CCListener* ln);
+
+/* ============================================================================
+ * Socket I/O (implements Duplex-like interface)
+ *
+ * Byte reads follow EOF model B (same shape as files / channels):
+ *   Ok(true)  — got bytes (payload in out-param)
+ *   Ok(false) — clean peer close (recv == 0 / FIN); not an error
+ *   Err(e)    — RST, timeout, and other failures
+ *
+ * Caller-buffer Duplex fill name is `read_buf_into` (matches CCFile). Socket
+ * also keeps `read_into` as the historical spelling of the same ABI.
+ *
+ * Non-blocking try_read is three-way: Ok(true)/Ok(false) as above;
+ * would-block (EAGAIN) is Err with CC_IO_BUSY — never Ok(false).
+ *
+ * Usage: while (cc_io_avail(cc_socket_read(sock, arena, n, &data))) { ... }
+ * ============================================================================ */
+
+/* Read up to max_bytes into arena; payload in *out. */
+CCResult_bool_CCIoError cc_socket_read(CCSocket* sock, CCArena* arena, size_t max_bytes, CCSlice* out);
+
+/* Read up to max_bytes into caller buffer; byte count in *out. */
+CCResult_bool_CCIoError cc_socket_read_into(CCSocket* sock, char* buf, size_t max_bytes, size_t* out);
+CCResult_bool_CCIoError cc_socket_read_into_deadline(CCSocket* sock,
+                                                    char* buf,
+                                                    size_t max_bytes,
+                                                    size_t* out,
+                                                    const CCDeadline* deadline);
+
+/* Duplex-compatible alias of read_into (BufReader::[CCSocket] fill). */
+static inline CCResult_bool_CCIoError cc_socket_read_buf_into(CCSocket* sock, char* buf,
+                                                             size_t max_bytes, size_t* out) {
+    return cc_socket_read_into(sock, buf, max_bytes, out);
+}
+
+/* Non-blocking read into caller buffer (three-way; see above). */
+CCResult_bool_CCIoError cc_socket_try_read_into(CCSocket* sock,
+                                               char* buf,
+                                               size_t max_bytes,
+                                               size_t* out);
+
+/* Async read */
+/* @async bool !>(CCIoError) cc_socket_read_async(...); */
+
+/* Write data. Returns bytes written (may be short); no EOF story. */
+CCResult_size_t_CCIoError cc_socket_write(CCSocket* sock, const char* data, size_t len);
+CCResult_size_t_CCIoError cc_socket_write_deadline(CCSocket* sock,
+                                                  const char* data,
+                                                  size_t len,
+                                                  const CCDeadline* deadline);
+
+/* Async write */
+/* @async size_t !>(CCIoError) cc_socket_write_async(...); */
+
+/* Shutdown modes */
+typedef enum CCShutdownMode {
+    CC_SHUTDOWN_READ = 1,
+    CC_SHUTDOWN_WRITE = 2,
+    CC_SHUTDOWN_BOTH = 3,
+} CCShutdownMode;
+
+/* Half-close or full close */
+void cc_socket_shutdown(CCSocket* sock, CCShutdownMode mode, CCNetError* out_err);
+
+/* Close socket */
+void cc_socket_close(CCSocket* sock);
+
+/* TCP_NODELAY — disable Nagle (UFCS: `sock.set_nodelay(1)`).
+ * Returns 0 on success, -1 on failure (invalid sock / setsockopt). */
+int cc_socket_set_nodelay(CCSocket* sock, int on);
+
+/* Address info */
+CCSlice cc_socket_peer_addr(CCSocket* sock, CCArena* arena, CCNetError* out_err);
+CCSlice cc_socket_local_addr(CCSocket* sock, CCArena* arena, CCNetError* out_err);
+
+/* Socket-bound readiness signaling. */
+void cc_socket_create_signal(CCSocket* sock, CCSocketSignal* out_sig);
+void cc_socket_signal_init(CCSocketSignal* sig, CCSocket* sock);
+void cc_socket_signal_free(CCSocketSignal* sig);
+void cc_socket_signal_signal(CCSocketSignal* sig);
+CCResult_bool_CCIoError cc_socket_signal_wait(CCSocketSignal* sig);
+uint64_t cc_socket_signal_snapshot(CCSocketSignal* sig);
+CCResult_bool_CCIoError cc_socket_signal_wait_since(CCSocketSignal* sig, uint64_t seen_epoch);
+
+/* ============================================================================
+ * UDP
+ * ============================================================================ */
+
+/* Bind to local address */
+CCUdpSocket cc_udp_bind(const char* addr, size_t addr_len, CCNetError* out_err);
+
+/* Send to specific address */
+size_t cc_udp_send_to(CCUdpSocket* sock, const char* data, size_t len,
+                      const char* addr, size_t addr_len, CCNetError* out_err);
+
+/* Receive with sender address */
+CCUdpPacket cc_udp_recv_from(CCUdpSocket* sock, CCArena* arena, size_t max_bytes, CCNetError* out_err);
+
+/* Close UDP socket */
+void cc_udp_close(CCUdpSocket* sock);
+
+/* ============================================================================
+ * DNS
+ * ============================================================================ */
+
+/* Resolve hostname to IP addresses. Returns slice of CCIpAddr. */
+CCSlice cc_dns_lookup(CCArena* arena, const char* hostname, size_t hostname_len, CCNetError* out_err);
+
+/* Async DNS lookup */
+/* @async CCSlice cc_dns_lookup_async(CCArena* arena, const char* hostname, size_t hostname_len, CCNetError* out_err); */
+
+/* Format IP address as string */
+CCSlice cc_ip_addr_to_string(CCIpAddr* addr, CCArena* arena);
+
+/* Parse string to IP address */
+CCIpAddr cc_ip_parse(const char* s, size_t len, CCNetError* out_err);
+
+/* CCSocket / CCListener UFCS use the shared generic snake_case helper:
+   smart-lowering CCSocket -> cc_socket_*, CCListener -> cc_listener_*,
+   matching the existing C API. */
+
+/* CCSocket / CCListener UFCS dispatch is covered by the global `*`
+   registration in cc_arena.cch; no per-type opt-in needed here. */
+
+#endif /* CC_STD_NET_H */

@@ -1,0 +1,412 @@
+/*
+ * Thin process wrappers for .shcc orchestration.
+ * Program/path arguments are CCSlice (NUL-terminated borrows).
+ *
+ * Task-friendly runners take one @string line (whitespace words; '…' / "…"
+ * keep a word together). Own arena, cwd = project root:
+ *   cc_script_sh(@string(`rm -rf out bin`, @scratch));
+ *   cc_script_ccc(@string(`build --build-file build.cc ${target}`, @scratch));
+ */
+#ifndef CC_SCRIPT_SH_H
+#define CC_SCRIPT_SH_H
+
+#include <stdio.h>
+#include <string.h>
+
+#include <ccc/cc_arena.h>
+#include <ccc/cc_io_error.h>
+#include <ccc/cc_result.h>
+#include <ccc/script/pathx.h>
+#include <ccc/std/exec.h>
+
+/*
+ * Run program with one argument; fail if exit status != 0.
+ * Empty `arg` omits the argument. Arena is last.
+ */
+static inline CCResult_int_CCError cc_sh_run(CCSlice program,
+                                            CCSlice arg,
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_int_CCIoError_DEFINED
+#define CCResult_int_CCIoError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_int_CCIoError, int, CCIoError)
+#endif
+                                            CCArena *arena) {
+    CCCommand cmd;
+    CCResult_int_CCIoError st;
+    if (!program.ptr || !arena) {
+        return cc_err_CCResult_int_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "cc_sh_run: bad args"));
+    }
+    cmd = cc_command(arena, program);
+    if (arg.ptr && arg.len) (void)cc_command_arg_slice(&cmd, arg);
+    st = cc_command_status(&cmd);
+    if (cc_is_err(st)) {
+        return cc_err_CCResult_int_CCError(CC_ERROR(CC_ERR_IO, cc_io_error_str(cc_error(st))));
+    }
+    if (cc_value(st) != 0) {
+        return cc_err_CCResult_int_CCError(CC_ERROR(CC_ERR_IO, "cc_sh_run: non-zero exit"));
+    }
+    return cc_ok_CCResult_int_CCError(cc_value(st));
+}
+
+static inline void cc__script_forward_args(CCCommand *cmd, int argc, char **argv) {
+    int i;
+    if (!cmd) return;
+    for (i = 1; i < argc; i++) {
+        if (argv && argv[i]) (void)cc_command_arg(cmd, argv[i]);
+    }
+}
+
+static inline int cc__script_status_or_fail(CCCommand *cmd, const char *label) {
+    CCResult_int_CCIoError st;
+    if (!cmd || !label) return 1;
+    st = cc_command_status(cmd);
+    if (cc_is_err(st)) {
+        fprintf(stderr, "shcc: failed to run %s: %s\n",
+                label, cc_io_error_str(cc_error(st)));
+        return 1;
+    }
+    return cc_value(st);
+}
+
+/*
+ * Task-friendly: run repo-relative executable from repo root, forward argv[1..],
+ * inherit stdio. Returns process exit status (1 on spawn/resolve failure).
+ */
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCSlice_CCError_DEFINED
+#define CCResult_CCSlice_CCError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCSlice_CCError, CCSlice, CCError)
+#endif
+static inline int cc_script_task_exe(int argc, char **argv, const char *rel_exe) {
+    CCArena a;
+    CCResult_CCSlice_CCError root_r;
+    CCSlice root, exe;
+    CCCommand cmd;
+    int rc;
+    if (!rel_exe || !rel_exe[0]) {
+        fprintf(stderr, "shcc: cc_script_task_exe: missing path\n");
+        return 1;
+    }
+    a = cc_arena_create(megabytes(1));
+    root_r = cc_script_repo_root(
+        argv && argv[0] ? cc_slice_cstr(argv[0]) : cc_slice_empty(), &a);
+    if (cc_is_err(root_r)) {
+        fprintf(stderr, "shcc: %s\n", cc_error(root_r).message);
+        cc_arena_destroy(&a);
+        return 1;
+    }
+    root = cc_value(root_r);
+    exe = cc_script_path_join(root, cc_slice_cstr(rel_exe), &a);
+    cmd = cc_command(&a, exe);
+    (void)cc_command_cwd(&cmd, root);
+    (void)cc_command_inherit_stdio(&cmd);
+    cc__script_forward_args(&cmd, argc, argv);
+    rc = cc__script_status_or_fail(&cmd, rel_exe);
+    cc_arena_destroy(&a);
+    return rc;
+}
+
+/* Repo-relative path with '/' → '__' and ".shcc" stripped (avoids bin/
+ * basename collisions across directories). NUL-terminated slice. */
+static inline CCSlice cc__script_shcc_stem(const char *rel_tool, CCArena *arena) {
+    size_t n, i, o, cap;
+    CCSlice out;
+    if (!rel_tool || !arena) return cc_slice_empty();
+    while (rel_tool[0] == '.' && rel_tool[1] == '/') rel_tool += 2;
+    n = strlen(rel_tool);
+    if (n >= 5 && memcmp(rel_tool + n - 5, ".shcc", 5) == 0) n -= 5;
+    cap = n + 1;
+    for (i = 0; i < n; i++)
+        if (rel_tool[i] == '/') cap++; /* each '/' becomes "__" */
+    out = cc_arena_alloc_slice_bytes(arena, cap);
+    if (!out.ptr) return cc_slice_empty();
+    o = 0;
+    for (i = 0; i < n; i++) {
+        if (rel_tool[i] == '/') {
+            ((char *)out.ptr)[o++] = '_';
+            ((char *)out.ptr)[o++] = '_';
+        } else {
+            ((char *)out.ptr)[o++] = rel_tool[i];
+        }
+    }
+    ((char *)out.ptr)[o] = '\0';
+    out.len = o;
+    return out;
+}
+static inline int cc_script_task_shcc(int argc, char **argv, const char *rel_tool) {
+    CCArena a;
+    CCResult_CCSlice_CCError root_r;
+    CCSlice root, ccc, stem, bin, bin_rel;
+    CCCommand build, run;
+    int rc;
+    if (!rel_tool || !rel_tool[0]) {
+        fprintf(stderr, "shcc: cc_script_task_shcc: missing path\n");
+        return 1;
+    }
+    a = cc_arena_create(megabytes(1));
+    root_r = cc_script_repo_root(
+        argv && argv[0] ? cc_slice_cstr(argv[0]) : cc_slice_empty(), &a);
+    if (cc_is_err(root_r)) {
+        fprintf(stderr, "shcc: %s\n", cc_error(root_r).message);
+        cc_arena_destroy(&a);
+        return 1;
+    }
+    root = cc_value(root_r);
+    stem = cc__script_shcc_stem(rel_tool, &a);
+    if (!stem.ptr || stem.len == 0) {
+        fprintf(stderr, "shcc: cc_script_task_shcc: bad stem for %s\n", rel_tool);
+        cc_arena_destroy(&a);
+        return 1;
+    }
+    bin_rel = cc_script_path_join(CC_SLICE_LIT("bin"), stem, &a);
+    bin = cc_script_path_join(root, bin_rel, &a);
+    ccc = cc_script_path_join(root, CC_SLICE_LIT("cc/bin/ccc"), &a);
+
+    build = cc_command(&a, ccc);
+    (void)cc_command_cwd(&build, root);
+    (void)cc_command_inherit_stdio(&build);
+    (void)cc_command_arg(&build, "build");
+    (void)cc_command_arg(&build, "--link");
+    (void)cc_command_arg(&build, rel_tool);
+    (void)cc_command_arg(&build, "-o");
+    (void)cc_command_arg_slice(&build, bin_rel);
+    rc = cc__script_status_or_fail(&build, "ccc build");
+    if (rc != 0) {
+        cc_arena_destroy(&a);
+        return rc;
+    }
+
+    run = cc_command(&a, bin);
+    (void)cc_command_cwd(&run, root);
+    (void)cc_command_inherit_stdio(&run);
+    cc__script_forward_args(&run, argc, argv);
+    rc = cc__script_status_or_fail(&run, rel_tool);
+    cc_arena_destroy(&a);
+    return rc;
+}
+
+/* Project root for make.shcc: repo walk, else cwd. */
+static inline int cc__script_project_root(CCArena *a, CCSlice *out) {
+    CCResult_CCSlice_CCError root_r;
+    char cwd[PATH_MAX];
+    if (!a || !out) return 1;
+    root_r = cc_script_repo_root(cc_slice_empty(), a);
+    if (!cc_is_err(root_r)) {
+        *out = cc_value(root_r);
+        return 0;
+    }
+    if (!getcwd(cwd, sizeof(cwd))) return 1;
+    *out = cc__script_dup_cstr(a, cwd);
+    return (out->ptr && out->len) ? 0 : 1;
+}
+
+#ifndef CCResult_CCString_CCError_DEFINED
+#define CCResult_CCString_CCError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCString_CCError_DEFINED
+#define CCResult_CCString_CCError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCString_CCError, CCString, CCError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_CCString_CCError, CCString, CCError)
+#endif
+
+static inline int cc__script_is_ws(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+static inline int cc__script_dup_range(CCArena *a, CCSlice s,
+                                       size_t start, size_t end, CCSlice *out) {
+    size_t n = end - start;
+    CCSlice d;
+    if (!a || !out || !s.ptr || end < start || end > s.len) return 1;
+    d = cc_arena_alloc_slice_bytes(a, n + 1);
+    if (!d.ptr) return 1;
+    if (n) memcpy(d.ptr, (const char *)s.ptr + start, n);
+    ((char *)d.ptr)[n] = '\0';
+    d.len = n;
+    *out = d;
+    return 0;
+}
+
+/* 0 = word, 1 = error (unclosed quote / OOM), 2 = end. */
+static inline int cc__script_next_word(CCSlice s, size_t *i, CCArena *a, CCSlice *word) {
+    size_t n, p, start;
+    char q;
+    if (!i || !a || !word) return 1;
+    n = s.len;
+    p = *i;
+    while (p < n && cc__script_is_ws(s.ptr[p])) p++;
+    if (p >= n) {
+        *i = p;
+        return 2;
+    }
+    q = s.ptr[p];
+    if (q == '"' || q == '\'') {
+        start = p + 1;
+        p = start;
+        while (p < n && s.ptr[p] != q) p++;
+        if (p >= n) return 1;
+        if (cc__script_dup_range(a, s, start, p, word)) return 1;
+        *i = p + 1;
+        return 0;
+    }
+    start = p;
+    while (p < n && !cc__script_is_ws(s.ptr[p]) && s.ptr[p] != '"' && s.ptr[p] != '\'')
+        p++;
+    if (cc__script_dup_range(a, s, start, p, word)) return 1;
+    *i = p;
+    return 0;
+}
+
+/* first_is_program: first word becomes cmd's program; else all words are args. */
+static inline int cc__script_apply_line(CCCommand *cmd, CCSlice line, CCArena *a,
+                                        int first_is_program, const char **prog_out) {
+    size_t i = 0;
+    int first = 1;
+    if (!cmd || !a) return 1;
+    for (;;) {
+        CCSlice w;
+        int st = cc__script_next_word(line, &i, a, &w);
+        if (st == 2) break;
+        if (st != 0) return 1;
+        if (first) {
+            first = 0;
+            if (prog_out) *prog_out = (const char *)w.ptr;
+            if (first_is_program) *cmd = cc_command(a, w);
+            else (void)cc_command_arg_slice(cmd, w);
+        } else {
+            (void)cc_command_arg_slice(cmd, w);
+        }
+    }
+    return (first && first_is_program) ? 1 : 0;
+}
+
+/*
+ * Run a @string line from the project root (first word = program).
+ * Inherit stdio. Returns process exit status (1 on spawn/resolve failure).
+ */
+static inline int cc_script_sh(CCString cmdline) {
+    CCArena a;
+    CCSlice root, line;
+    CCCommand cmd;
+    const char *prog = "sh";
+    int rc;
+    line = cc_string_as_slice(&cmdline);
+    a = cc_arena_create(megabytes(1));
+    if (cc__script_project_root(&a, &root) != 0) {
+        fprintf(stderr, "shcc: cc_script_sh: no project root\n");
+        cc_arena_destroy(&a);
+        return 1;
+    }
+    if (cc__script_apply_line(&cmd, line, &a, 1, &prog) != 0) {
+        fprintf(stderr, "shcc: cc_script_sh: empty or unclosed quote\n");
+        cc_arena_destroy(&a);
+        return 1;
+    }
+    (void)cc_command_cwd(&cmd, root);
+    (void)cc_command_inherit_stdio(&cmd);
+    rc = cc__script_status_or_fail(&cmd, prog);
+    cc_arena_destroy(&a);
+    return rc;
+}
+
+/*
+ * Like cc_script_sh, but return trimmed stdout as a CCString on `arena`.
+ * Non-zero exit, spawn failure, or a bad line is Err.
+ * `cc_script_sh_read(cmd)` is this with the function `@scratch` arena.
+ */
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCProcessOutput_CCIoError_DEFINED
+#define CCResult_CCProcessOutput_CCIoError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCProcessOutput_CCIoError, CCProcessOutput, CCIoError)
+#endif
+static inline CCResult_CCString_CCError cc_script_sh_read_at(CCString cmdline, CCArena *arena) {
+    CCArena a;
+    CCSlice root, line, s;
+    CCCommand cmd;
+    CCResult_CCProcessOutput_CCIoError out_r;
+    CCProcessOutput po;
+    const char *prog = "sh";
+    size_t n;
+    CCString out;
+    if (!arena) {
+        return cc_err_CCResult_CCString_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "cc_script_sh_read_at: no arena"));
+    }
+    line = cc_string_as_slice(&cmdline);
+    a = cc_arena_create(megabytes(1));
+    if (cc__script_project_root(&a, &root) != 0) {
+        cc_arena_destroy(&a);
+        return cc_err_CCResult_CCString_CCError(CC_ERROR(CC_ERR_NOT_FOUND, "cc_script_sh_read_at: no project root"));
+    }
+    if (cc__script_apply_line(&cmd, line, &a, 1, &prog) != 0) {
+        cc_arena_destroy(&a);
+        return cc_err_CCResult_CCString_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "cc_script_sh_read_at: empty or unclosed quote"));
+    }
+    (void)cc_command_cwd(&cmd, root);
+    out_r = cc_command_output(&cmd, &a);
+    if (cc_is_err(out_r)) {
+        CCError e = CC_ERROR(CC_ERR_IO, cc_io_error_str(cc_error(out_r)));
+        cc_arena_destroy(&a);
+        return cc_err_CCResult_CCString_CCError(e);
+    }
+    po = cc_value(out_r);
+    if (cc_process_output_exit_code(&po) != 0) {
+        cc_arena_destroy(&a);
+        return cc_err_CCResult_CCString_CCError(CC_ERROR(CC_ERR_IO, "cc_script_sh_read_at: non-zero exit"));
+    }
+    s = po.stdout_data;
+    n = s.len;
+    while (n > 0) {
+        char c = s.ptr[n - 1];
+        if (c != '\n' && c != '\r') break;
+        n--;
+    }
+    out = cc_string_from_slice(arena, cc_slice_from_buffer((void *)s.ptr, n));
+    cc_arena_destroy(&a);
+    return cc_ok_CCResult_CCString_CCError(out);
+}
+
+#define cc_script_sh_read(cmd) cc_script_sh_read_at((cmd), &__cc_str_scratch)
+
+/*
+ * Run `ccc` with a @string extra-argv line. $CCC, else <root>/cc/bin/ccc,
+ * else PATH "ccc". Prepends absolute --out-dir / --bin-dir. Inherit stdio.
+ */
+static inline int cc_script_ccc(CCString args) {
+    CCArena a;
+    CCSlice root, out, bin, local, line;
+    CCCommand cmd;
+    const char *ccc;
+    int rc;
+    line = cc_string_as_slice(&args);
+    a = cc_arena_create(megabytes(1));
+    if (cc__script_project_root(&a, &root) != 0) {
+        fprintf(stderr, "shcc: cc_script_ccc: no project root\n");
+        cc_arena_destroy(&a);
+        return 1;
+    }
+    ccc = getenv("CCC");
+    if (!ccc || !ccc[0]) {
+        local = cc_script_path_join(root, CC_SLICE_LIT("cc/bin/ccc"), &a);
+        ccc = cc_script_path_exists(local) ? (const char *)local.ptr : "ccc";
+    }
+    out = cc_script_path_join(root, CC_SLICE_LIT("out"), &a);
+    bin = cc_script_path_join(root, CC_SLICE_LIT("bin"), &a);
+    cmd = cc_command(&a, cc_slice_cstr(ccc));
+    (void)cc_command_cwd(&cmd, root);
+    (void)cc_command_inherit_stdio(&cmd);
+    (void)cc_command_arg(&cmd, "--out-dir");
+    (void)cc_command_arg_slice(&cmd, out);
+    (void)cc_command_arg(&cmd, "--bin-dir");
+    (void)cc_command_arg_slice(&cmd, bin);
+    if (cc__script_apply_line(&cmd, line, &a, 0, NULL) != 0) {
+        fprintf(stderr, "shcc: cc_script_ccc: unclosed quote\n");
+        cc_arena_destroy(&a);
+        return 1;
+    }
+    rc = cc__script_status_or_fail(&cmd, ccc);
+    cc_arena_destroy(&a);
+    return rc;
+}
+
+#endif /* CC_SCRIPT_SH_H */

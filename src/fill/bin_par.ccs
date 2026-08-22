@@ -1,0 +1,27 @@
+#!ccc ccs
+/*
+ * Stripe flush via Concurrent-C @parallel for.
+ * Regenerated into include/generated/bin_par.c by tools/gen.sh.
+ * Default cmake never runs ccc — only this script does.
+ */
+#include <ccc/std/prelude.cch>
+
+/* Must match sw_bin_flush_args_t in rlsw.h */
+typedef struct sw_bin_flush_args {
+    int fbW, fbH, bw, bh;
+} sw_bin_flush_args_t;
+
+extern void sw_bin_fill_cell(int tx, int ty, const sw_bin_flush_args_t *a);
+
+void sw_bin_par_stripes(int n, int vertical, const sw_bin_flush_args_t *a)
+{
+    if (vertical) {
+        @parallel for (tx in 0..n) {
+            sw_bin_fill_cell((int)tx, 0, a);
+        }
+    } else {
+        @parallel for (ty in 0..n) {
+            sw_bin_fill_cell(0, (int)ty, a);
+        }
+    }
+}

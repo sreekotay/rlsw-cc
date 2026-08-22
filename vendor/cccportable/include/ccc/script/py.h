@@ -1,0 +1,7290 @@
+/*
+ * Python interop: interpreter arenas (see "Python interop" in
+ * spec/concurrent-c-stdlib-spec.md), light v1.
+ *
+ *   CCPy py = cc_py_new(false, &a) !> @destroy;
+ *   CCPyObj m = py.import("math") !> @destroy;
+ *   CCPyObj r = m.call_f("sqrt", 2.0) !> @destroy;
+ *   double v = r.as_f64() !>;
+ *
+ * `cc_py_new(true, &a)` opens a process-isolated domain: a python child
+ * on the broker.py wire (remote handles / materialized scalars).
+ *
+ * libpython is dlopen'd at cc_py; absence is a CCPyError, not a link
+ * dependency. Stable-ABI symbols only; no '#' argument formats (their
+ * length ABI shifted across versions). Single interpreter, calling
+ * thread only. `obj.clone_into(&other)` moves by pickle between
+ * same-process inproc homes; process-isolated and PyObject* sharing
+ * are refused.
+ */
+#ifndef CC_SCRIPT_PY_H
+#define CC_SCRIPT_PY_H
+
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdarg.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <ccc/cc_arena.h>
+#include <ccc/cc_compat.h>
+#include <ccc/cc_result.h>
+#include <ccc/cc_slice.h>
+#include <ccc/cc_type.h>
+
+/* Build-detection declaration, read textually by the driver: a TU that
+ * exports a `PyInit_*` entry and defines no `main` builds as a shared
+ * module with this suffix, and the symbol's own suffix names the
+ * artifact (PyInit_counter → counter.abi3.so — the .abi3 tag is in every
+ * CPython finder's suffix list and advertises the stable-ABI promise the
+ * binding keeps). */
+#ifndef CC_MODULE_ENTRY
+#define CC_MODULE_ENTRY(...)
+#endif
+CC_MODULE_ENTRY("PyInit_*", ".abi3.so")
+
+/* Export sugar, declared beside the entry it guarantees.  A TU spells
+ * one directive per exported type:
+ *
+ *     @comptime cc_py_export("counter", "Counter", &seed);
+ *
+ * and the compiler's template pass expands each IN PLACE to exactly the
+ * init a hand-written module spells (independent stanzas — CPython
+ * resolves one init per module name, so every export is its own entry):
+ *
+ *     void *PyInit_counter(void) { return py_module::[Counter]("counter", &seed); }
+ *
+ * The name is the type lowered to snake, or the string override in the
+ * third argument.  The explicit stanza stays legal. */
+#ifndef CC_MODULE_EXPORT
+#define CC_MODULE_EXPORT(...)
+#endif
+CC_MODULE_EXPORT(cc_py_export,
+    "$groups{void *PyInit_$module(void) {\n"
+    "    void *m__ = cc__py_group_begin(\"$module\", $count);\n"
+    "$each{    {\n"
+    "        void *cc__child_$name = py_module::[$T](\"$name\", $seed);\n"
+    "        m__ = cc__py_group_add(m__, \"$name\", cc__child_$name);\n"
+    "    }\n}"
+    "    return m__;\n"
+    "}\n}")
+
+#define CC__PY_NAME_CACHE 32
+
+typedef struct CCPy {
+    int ready;
+    CCArena *arena; /* error text + default extract backing */
+    /* Transport: INPROC (libpython in this process) or PROC (python
+     * child on the broker.py wire).  Never aliased — `cc_py_new(true)`
+     * is always PROC. */
+    int tier; /* CC__PY_TIER_INPROC or CC__PY_TIER_PROC */
+    /* The interpreter this handle names (INPROC).  `tstate` is the thread
+     * state created with the interpreter; `interp` identifies the
+     * interpreter itself, which is what a per-thread attach needs.
+     * `owns_interp` is 0 for the process interpreter (never finalized)
+     * and 1 for one this handle created. */
+    void *tstate;
+    void *interp;
+    int owns_interp;
+    int isolated; /* INPROC: 1 when this interpreter holds its own GIL */
+    /* PROC: socketpair to the child, pid, crash flag, request ids, and
+     * a line-reassembly buffer — the same shape as CCJsDom isolated. */
+    int fd;
+    long long pid;
+    int crashed;
+    long long next_id;
+    char *rb;
+    size_t rb_len, rb_cap, rb_off;
+    /* Method names already interned for THIS interpreter.  Lookup prefers
+     * pointer identity (UFCS literals), then strcmp so a reused buffer that
+     * once held a different name cannot hit the wrong interned object.
+     * Keys are the UTF-8 of the held interned Unicode (stable for the
+     * handle's life), not the caller's possibly-reused pointer.
+     *
+     * Per handle rather than global: an interned string belongs to the
+     * interpreter that made it, and a global table would hand one
+     * interpreter's object to another.  It also inherits the handle's
+     * threading rule instead of inventing a new one. */
+    struct { const char *key; void *name; } names[CC__PY_NAME_CACHE];
+    int name_count;
+    /* sys.getrefcount, resolved once — the py_buf retained-export check
+     * runs per view, and importing sys per call was most of its cost. */
+    void *sys_getrefcount;
+    /* Host callables passed into Python (`py_fn`): isolated wire table +
+     * inproc mint boxes that outlive a single call when Python retains them. */
+    struct { void *fn; void *userdata; long long userdata_i64; int is_i64; } *cbs;
+    size_t cbs_cap;
+    long long next_cb;
+    int cb_depth;
+    struct CC__PyFnBox *fn_boxes;
+} CCPy;
+
+typedef struct CCPyObj {
+    CCPy *home;  /* interpreter / domain that produced this value */
+    int kind;    /* CC__PY_K_LOCAL / HANDLE / NUM / STR / BOOL / NULL / RAW */
+    void *o;     /* kind LOCAL: PyObject*, owned reference; NULL after release */
+    long long h; /* kind HANDLE: remote id on the child's table */
+    double num;  /* kind NUM */
+    long long inum;
+    int num_is_int;
+    int b;       /* kind BOOL */
+    CCSlice text; /* kind STR / RAW */
+} CCPyObj;
+
+/* `py_fn` typedefs follow CCResult_CCPyObj_CCPyError. */
+static long long cc__py_fn_add(CCPy *d, void *fn, void *userdata,
+                               long long userdata_i64, int is_i64);
+static void cc__py_fn_kill_boxes(CCPy *d);
+static void *cc__py_fn_mint(CCPy *d, void *fn, void *userdata,
+                            long long userdata_i64, int is_i64,
+                            char *errbuf, size_t errcap);
+
+#ifndef CC__PY_MAX_CALL_ARGS
+#define CC__PY_MAX_CALL_ARGS 64
+#endif
+
+/* Transport + value kinds for dual-tier Python (in-process vs child). */
+#define CC__PY_TIER_INPROC 0
+#define CC__PY_TIER_PROC   1
+
+#define CC__PY_K_LOCAL  0 /* PyObject* in o */
+#define CC__PY_K_HANDLE 1 /* remote handle id in h */
+#define CC__PY_K_NUM    2
+#define CC__PY_K_STR    3
+#define CC__PY_K_BOOL   4
+#define CC__PY_K_NULL   5
+#define CC__PY_K_RAW    6 /* plain list/dict / ta — refuse scalar extract */
+
+/* Python failure with a CCError face: default @errhandler(CCError)
+ * prints the exception text; exact @errhandler(CCPyError) claims it. */
+typedef struct CCPyError {
+    CCError base;
+    /* Exception class name (`ValueError`, `KeyError`, …) and the formatted
+     * traceback, both anchored in the handle's scratch arena. Empty when the
+     * failure came from the binding rather than from Python. */
+    CCSlice type_name;
+    CCSlice traceback;
+} CCPyError;
+
+
+
+#ifndef CCResult_CCPy_CCPyError_DEFINED
+#define CCResult_CCPy_CCPyError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCPy_CCPyError_DEFINED
+#define CCResult_CCPy_CCPyError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCPy_CCPyError, CCPy, CCPyError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_CCPy_CCPyError, CCPy, CCPyError)
+#endif
+#ifndef CCResult_CCPyptr_CCError_DEFINED
+#define CCResult_CCPyptr_CCError_DEFINED 1
+/* Ok type is the interpreter pointer so `py_expose` can hand the receiver
+ * back and chain. */
+CC_DECL_RESULT_SPEC(CCResult_CCPyptr_CCError, CCPy*, CCError)
+#endif
+#ifndef CCResult_CCPyObj_CCPyError_DEFINED
+#define CCResult_CCPyObj_CCPyError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCPyObj_CCPyError_DEFINED
+#define CCResult_CCPyObj_CCPyError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCPyObj_CCPyError, CCPyObj, CCPyError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_CCPyObj_CCPyError, CCPyObj, CCPyError)
+#endif
+
+/* Sync Python→CC callable (`py_fn`).  Return `CCPyObj !>(CCPyError)`: Ok
+ * value crosses back to Python; Err becomes a Python exception.  Works on
+ * both in-process (minted CFunction) and process-isolated (`{$f}` wire).
+ * `py_fn(fn, userdata)` picks the host ABI from userdata's type: integer
+ * scalars are passed by value (`CCPyHostFnI64`); pointers use
+ * `CCPyHostFn`.  `CCPyHostUserdata` is `void *` under a typedef so host
+ * bodies can use the `T !>(E)` return spelling (a leading `void *`
+ * parameter is parsed as a `(void)` prototype). */
+typedef void *CCPyHostUserdata;
+typedef CCResult_CCPyObj_CCPyError (*CCPyHostFn)(CCPyHostUserdata userdata,
+                                                 const CCPyObj *args,
+                                                 int argc);
+typedef CCResult_CCPyObj_CCPyError (*CCPyHostFnI64)(long long userdata,
+                                                    const CCPyObj *args,
+                                                    int argc);
+
+typedef struct CCPyFn {
+    void *fn;               /* CCPyHostFn or CCPyHostFnI64 */
+    void *userdata;         /* pointer form */
+    long long userdata_i64; /* by-value integer form */
+    int is_i64;
+} CCPyFn;
+
+#define py_fn(FN, USERDATA)                                                   \
+    _Generic((USERDATA),                                                      \
+        int: ((CCPyFn){(void *)(CCPyHostFnI64)(FN), NULL,                     \
+                       (long long)(USERDATA), 1}),                            \
+        long: ((CCPyFn){(void *)(CCPyHostFnI64)(FN), NULL,                    \
+                        (long long)(USERDATA), 1}),                           \
+        long long: ((CCPyFn){(void *)(CCPyHostFnI64)(FN), NULL,               \
+                             (long long)(USERDATA), 1}),                      \
+        unsigned int: ((CCPyFn){(void *)(CCPyHostFnI64)(FN), NULL,            \
+                                (long long)(USERDATA), 1}),                   \
+        unsigned long: ((CCPyFn){(void *)(CCPyHostFnI64)(FN), NULL,           \
+                                 (long long)(USERDATA), 1}),                  \
+        unsigned long long: ((CCPyFn){(void *)(CCPyHostFnI64)(FN), NULL,      \
+                                      (long long)(USERDATA), 1}),             \
+        default: ((CCPyFn){(void *)(CCPyHostFn)(FN),                          \
+                           (void *)(uintptr_t)(USERDATA), 0, 0}))
+
+/* Host-side failure without touching cc__py_errbuf. */
+static inline CCPyError cc_py_host_error(const char *msg) {
+    CCPyError e;
+    memset(&e, 0, sizeof(e));
+    e.base = CC_ERROR(CC_ERR_INTERNAL, msg ? msg : "python: py_fn: callback failed");
+    return e;
+}
+
+/* Ok mints for host-fn returns (and anywhere a materialized scalar is enough). */
+static inline CCPyObj cc_py_i64(CCPy *home, long long v) {
+    CCPyObj out;
+    memset(&out, 0, sizeof(out));
+    out.home = home;
+    out.kind = CC__PY_K_NUM;
+    out.num_is_int = 1;
+    out.inum = v;
+    out.num = (double)v;
+    return out;
+}
+static inline CCPyObj cc_py_f64(CCPy *home, double v) {
+    CCPyObj out;
+    memset(&out, 0, sizeof(out));
+    out.home = home;
+    out.kind = CC__PY_K_NUM;
+    out.num_is_int = 0;
+    out.num = v;
+    out.inum = (long long)v;
+    return out;
+}
+static inline CCPyObj cc_py_bool(CCPy *home, int b) {
+    CCPyObj out;
+    memset(&out, 0, sizeof(out));
+    out.home = home;
+    out.kind = CC__PY_K_BOOL;
+    out.b = b ? 1 : 0;
+    return out;
+}
+static inline CCPyObj cc_py_none(CCPy *home) {
+    CCPyObj out;
+    memset(&out, 0, sizeof(out));
+    out.home = home;
+    out.kind = CC__PY_K_NULL;
+    return out;
+}
+
+#ifndef CCResult_double_CCPyError_DEFINED
+#define CCResult_double_CCPyError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_double_CCPyError_DEFINED
+#define CCResult_double_CCPyError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_double_CCPyError, double, CCPyError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_double_CCPyError, double, CCPyError)
+#endif
+#ifndef CCResult_void_CCPyError_DEFINED
+#define CCResult_void_CCPyError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_void_CCPyError_DEFINED
+#define CCResult_void_CCPyError_DEFINED 1
+CC_DECL_RESULT_SPEC_VOID(CCResult_void_CCPyError, CCPyError)
+#endif
+CC_DECL_RESULT_SPEC_VOID(CCResult_void_CCPyError, CCPyError)
+#endif
+#ifndef CCResult_size_t_CCPyError_DEFINED
+#define CCResult_size_t_CCPyError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_size_t_CCPyError_DEFINED
+#define CCResult_size_t_CCPyError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_size_t_CCPyError, size_t, CCPyError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_size_t_CCPyError, size_t, CCPyError)
+#endif
+#ifndef CCResult_int64_t_CCPyError_DEFINED
+#define CCResult_int64_t_CCPyError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_int64_t_CCPyError_DEFINED
+#define CCResult_int64_t_CCPyError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_int64_t_CCPyError, int64_t, CCPyError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_int64_t_CCPyError, int64_t, CCPyError)
+#endif
+#ifndef CCResult_float_CCPyError_DEFINED
+#define CCResult_float_CCPyError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_float_CCPyError_DEFINED
+#define CCResult_float_CCPyError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_float_CCPyError, float, CCPyError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_float_CCPyError, float, CCPyError)
+#endif
+#ifndef CCResult_int_CCPyError_DEFINED
+#define CCResult_int_CCPyError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_int_CCPyError_DEFINED
+#define CCResult_int_CCPyError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_int_CCPyError, int, CCPyError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_int_CCPyError, int, CCPyError)
+#endif
+#ifndef CCResult_long_long_CCPyError_DEFINED
+#define CCResult_long_long_CCPyError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_long_long_CCPyError_DEFINED
+#define CCResult_long_long_CCPyError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_long_long_CCPyError, long long, CCPyError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_long_long_CCPyError, long long, CCPyError)
+#endif
+#ifndef CCResult_CCSlice_CCPyError_DEFINED
+#define CCResult_CCSlice_CCPyError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCSlice_CCPyError_DEFINED
+#define CCResult_CCSlice_CCPyError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCSlice_CCPyError, CCSlice, CCPyError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_CCSlice_CCPyError, CCSlice, CCPyError)
+#endif
+
+/* `PyStatus` (PEP 587): `_type` 0 is success. */
+typedef struct CC__PyStatus {
+    int _type;
+    const char *func;
+    const char *err_msg;
+    int exitcode;
+} CC__PyStatus;
+
+/* ---- dlsym table (stable ABI) ---- */
+
+typedef struct CC__PySyms {
+    void *lib;
+    int (*IsInitialized)(void);
+    void (*InitializeEx)(int);
+    int (*FinalizeEx)(void);
+    void *(*ImportModule)(const char *);
+    void *(*GetAttrString)(void *, const char *);
+    void *(*CallMethod)(void *, const char *, const char *, ...);
+    void *(*Str)(void *);
+    const char *(*AsUTF8AndSize)(void *, intptr_t *);
+    intptr_t (*UnicodeGetLength)(void *);
+    uint32_t *(*UnicodeAsUCS4)(void *, uint32_t *, intptr_t, int);
+    double (*FloatAsDouble)(void *);
+    long long (*LongAsLongLong)(void *);
+    unsigned long long (*LongAsUnsignedLongLong)(void *);
+    void *(*FloatFromDouble)(double);
+    void *(*LongFromLongLong)(long long);
+    void *(*LongFromUnsignedLongLong)(unsigned long long);
+    void *(*LongFromString)(const char *, char **, int);
+    void *(*UnicodeFromStringAndSize)(const char *, intptr_t);
+    void *(*ListNew)(intptr_t);
+    int (*ListSetItem)(void *, intptr_t, void *);
+    void *(*TupleNew)(intptr_t);
+    int (*TupleSetItem)(void *, intptr_t, void *);
+    void *(*CallObject)(void *, void *);
+    void *(*BoolFromLong)(long);
+    void *(*ErrOccurred)(void);
+    void (*ErrFetch)(void **, void **, void **);
+    void (*ErrClear)(void);
+    void (*IncRef)(void *);
+    void (*DecRef)(void *);
+    intptr_t (*SequenceSize)(void *);
+    void *(*SequenceGetItem)(void *, intptr_t);
+    /* Tuple fast paths for the exported-call trampoline.  A `METH_VARARGS`
+     * callee is always handed a tuple, and the sequence protocol charges for
+     * generality it cannot use: `PySequence_Size` dispatches through the type,
+     * and `PySequence_GetItem` returns a NEW reference the trampoline has to
+     * drop again.  These read the tuple directly and borrow. */
+    /* Zero-copy borrow of a contiguous CC buffer.  Limited API since 3.3. */
+    void *(*MemoryViewFromMemory)(char *, intptr_t, int);
+    /* Optional: one-shot typed view over a filled Py_buffer — the fast
+     * py_buf path; absent, the view is built bytes-first and cast. */
+    void *(*MemoryViewFromBuffer)(void *);
+    /* Outbound-call fast path.  `GetAttrString` builds a temporary Python
+     * string for the name on EVERY call — allocate, hash, look up, free —
+     * which dominated the cost of calling into Python.  With the name kept as
+     * an object, the lookup is a dict probe; `Vectorcall` then passes the
+     * arguments as a C array instead of a tuple that must be built and freed. */
+    void *(*GetAttr)(void *, void *);
+    void *(*UnicodeInternFromString)(const char *);
+    void *(*Vectorcall)(void *, void *const *, size_t, void *);
+    /* Buffer-protocol extraction: a contiguous exporter (numpy array, bytes,
+     * array.array) is read with one memcpy instead of one boxed object per
+     * element. */
+    int (*GetBuffer)(void *, void *, int);
+    void (*ReleaseBuffer)(void *);
+    intptr_t (*TupleSize)(void *);
+    void *(*TupleGetItem)(void *, intptr_t);
+    int (*TupleCheck)(void *);
+    void *(*MappingItems)(void *);
+    void (*ErrNormalize)(void **, void **, void **);
+    void *(*DictNew)(void);
+    int (*DictSetItemString)(void *, const char *, void *);
+    void *(*Call)(void *, void *, void *);
+    void *(*ModuleCreate2)(void *, int);
+    void *(*SysGetObject)(const char *);
+    int (*DictSetItem)(void *, void *, void *);
+    int (*ObjectSetAttrString)(void *, const char *, void *);
+    void *(*UnicodeFromString)(const char *);
+    int (*ArgParseTuple)(void *, const char *, ...);
+    void *(*ErrSetString)(void *, const char *);
+    void *(*ModuleGetState)(void *);
+    /* Optional (see cc__py_load): NULL when the runtime predates them.
+     * `Py_NewInterpreterFromConfig` returns `PyStatus` BY VALUE — a 32-byte
+     * struct, so it comes back through a hidden pointer.  Declaring it as
+     * returning `void*` silently reinterprets the first argument as that
+     * pointer, which fails in a way that looks like "unsupported". */
+    CC__PyStatus (*NewInterpreterFromConfig)(void **, const void *);
+    void *(*ModuleDefInit)(void *);
+    void *(*ModuleFromDefAndSpec2)(void *, void *, int);
+    int (*ModuleExecDef)(void *, void *);
+    void (*EndInterpreter)(void *);
+    void *(*ThreadStateSwap)(void *);
+    void *(*ThreadStateGet)(void);
+    void *(*ThreadStateNew)(void *);
+    void (*ThreadStateClear)(void *);
+    void (*ThreadStateDelete)(void *);
+    void (*ThreadStateDeleteCurrent)(void);
+    /* Optional: minting Python callables from C (JS-callback bridging). */
+    void *(*CFunctionNewEx)(void *def, void *self, void *module);
+    void *(*CapsuleNew)(void *ptr, const char *name, void *dtor);
+    void *(*CapsuleGetPointer)(void *capsule, const char *name);
+    /* Optional exact-type probes for marshal fast paths (macros in
+     * full-API builds; function forms when limited-API / exported). */
+    int (*LongCheck)(void *);
+    int (*FloatCheckExact)(void *);
+    /* 3.12+ compact-int digs — avoid PyLong_As* on the common small-int path. */
+    int (*LongIsCompact)(const void *);
+    intptr_t (*LongCompactValue)(const void *);
+    int (*ObjectIsInstance)(void *obj, void *cls);
+    void *(*InterpreterStateGet)(void);
+    void *(*EvalSaveThread)(void);
+    void (*EvalRestoreThread)(void *);
+    /* Optional: runtime selection (venv adoption + introspection). */
+    void (*SetProgramName)(const wchar_t *);
+    wchar_t *(*DecodeLocale)(const char *, size_t *);
+    const char *(*GetVersion)(void);
+} CC__PySyms;
+
+/* `PyInterpreterConfig` (PEP 684).  Eight ints, and the layout is stable
+ * across the 3.12+ line that defines it; `gil` is the last field, where
+ * 2 == `PyInterpreterConfig_OWN_GIL`. */
+typedef struct CC__PyInterpConfig {
+    int use_main_obmalloc;
+    int allow_fork;
+    int allow_exec;
+    int allow_threads;
+    int allow_daemon_threads;
+    int check_multi_interp_extensions;
+    int gil;
+} CC__PyInterpConfig;
+#define CC__PY_OWN_GIL 2
+
+/* Parser-mode tcc rejects `_Thread_local`; it only needs these to parse, and
+ * the real compile of the emitted C gets the qualifier. */
+#if defined(CC_PARSER_MODE)
+#define CC_THREAD_LOCAL
+#else
+#define CC_THREAD_LOCAL _Thread_local
+#endif
+
+/* Process-global symbol table, published only when fully filled.
+ * Load state: 0 idle, 1 busy, 2 ready. */
+static CC__PySyms cc__py;
+static cc_atomic_int cc__py_load_state;
+/* Per-thread: error paths from concurrent workers must not contend. */
+static CC_THREAD_LOCAL char cc__py_errbuf[512];
+/* Scratch arena for the next `cc__py_err` copy. Set at each public entry
+ * from `CCPy.arena` / `CCPyObj.home->arena`. NULL keeps the TLS errbuf
+ * (bootstrap / load failures before a handle exists). Calling thread only. */
+static CCArena *cc__py_err_arena;
+
+/* Runtime selection (cc_py_use / VIRTUAL_ENV / ./.venv): resolved before
+ * the first load, consumed by cc__py_load and the pre-init program-name
+ * hook.  One runtime per process — first load wins; a later conflicting
+ * choice is an articulate error, never a quiet second interpreter. */
+static char cc__py_sel_lib[4096];   /* libpython to dlopen */
+static char cc__py_sel_prog[4096];  /* Py_SetProgramName target (venv adopt) */
+static char cc__py_sel_how[64];     /* provenance, for errors + introspection */
+
+/* A `PyThreadState` belongs to ONE OS thread: CPython keeps the current one
+ * in thread-local storage and derives per-thread bookkeeping from it, so
+ * restoring another thread's state faults inside the interpreter — under
+ * perfect mutual exclusion too, since there is no race to prevent, the state
+ * simply describes the wrong thread.  Serializing CC-side entry is therefore
+ * necessary but not sufficient: each thread needs its OWN thread state per
+ * interpreter, made on first touch and reused after.
+ *
+ * A fiber that parks can resume on a different OS thread, so the lookup runs
+ * at every public entry rather than once per handle. */
+
+typedef struct CC__PyTls {
+    void *interp;
+    void *tstate;
+} CC__PyTls;
+/* This thread's (interpreter → thread state) map.  GROWS — a fixed cap
+ * once made the ninth concurrent interpreter unseedable, after which an
+ * attach silently ran the call in whichever interpreter was current and
+ * a later cache fill minted a SECOND state for the unseeded one, which
+ * Py_EndInterpreter answers with a fatal "not the last thread". */
+static CC_THREAD_LOCAL CC__PyTls *cc__py_tls;
+static CC_THREAD_LOCAL int cc__py_tls_n;
+static CC_THREAD_LOCAL int cc__py_tls_cap;
+/* Which thread state THIS thread currently holds the GIL on. */
+static CC_THREAD_LOCAL void *cc__py_cur_tstate;
+/* The process interpreter's state, so teardown of an isolated one can leave
+ * a valid interpreter current instead of none. */
+static void *cc__py_main_tstate;
+static void *cc__py_main_interp;
+
+static inline int cc__py_tls_push(void *interp, void *tstate) {
+    if (cc__py_tls_n >= cc__py_tls_cap) {
+        int nc = cc__py_tls_cap ? cc__py_tls_cap * 2 : 8;
+        CC__PyTls *np =
+            (CC__PyTls *)realloc(cc__py_tls, (size_t)nc * sizeof(*np));
+        if (!np) {
+            /* An unseeded interpreter is a wrong-interpreter call waiting
+             * to happen — say so at the position that caused it. */
+            fprintf(stderr, "cc: python: out of memory caching an "
+                            "interpreter thread state\n");
+            return -1;
+        }
+        cc__py_tls = np;
+        cc__py_tls_cap = nc;
+    }
+    cc__py_tls[cc__py_tls_n].interp = interp;
+    cc__py_tls[cc__py_tls_n].tstate = tstate;
+    cc__py_tls_n++;
+    return 0;
+}
+
+/* This thread's state for `interp`, made on first touch. NULL if the runtime
+ * cannot make one. */
+static inline void *cc__py_tls_for(void *interp) {
+    int i;
+    if (!interp) return NULL;
+    for (i = 0; i < cc__py_tls_n; i++) {
+        if (cc__py_tls[i].interp == interp) return cc__py_tls[i].tstate;
+    }
+    if (!cc__py.ThreadStateNew) return NULL;
+    {
+        void *ts = cc__py.ThreadStateNew(interp);
+        if (!ts) return NULL;
+        if (cc__py_tls_push(interp, ts) != 0) return NULL;
+        return ts;
+    }
+}
+
+/* Seed this thread's cache with a state CPython already made for it. */
+static inline void cc__py_tls_seed(void *interp, void *tstate) {
+    int i;
+    if (!interp || !tstate) return;
+    for (i = 0; i < cc__py_tls_n; i++) {
+        if (cc__py_tls[i].interp == interp) return;
+    }
+    (void)cc__py_tls_push(interp, tstate);
+}
+
+/* Entering an interpreter is a GIL handoff: leaving one releases its lock
+ * and acquires the target's. */
+static inline void cc__py_attach(CCPy *py) {
+    void *ts;
+    if (!py || !py->interp) return;
+    if (!cc__py.EvalSaveThread || !cc__py.EvalRestoreThread) return;
+    ts = cc__py_tls_for(py->interp);
+    if (!ts) return;
+    if (cc__py_cur_tstate == ts) return;
+    if (cc__py_cur_tstate) (void)cc__py.EvalSaveThread();
+    cc__py.EvalRestoreThread(ts);
+    cc__py_cur_tstate = ts;
+}
+
+/* Release whatever GIL this thread holds (no-op when it holds none).
+ * An async embedding calls this after finishing work on an interpreter
+ * another thread also serves — a held GIL would otherwise block that
+ * thread until this one's NEXT attach happens to hand it off. */
+static inline void cc_py_thread_leave(void) {
+    if (!cc__py_cur_tstate) return;
+    if (cc__py.EvalSaveThread) (void)cc__py.EvalSaveThread();
+    cc__py_cur_tstate = NULL;
+}
+
+/* Retire THIS thread's cached state for `py`'s interpreter — the last
+ * act of a worker thread that attached to it.  Py_EndInterpreter is a
+ * fatal "not the last thread" while any second thread state exists, so
+ * every worker must detach before the owning thread closes the handle.
+ * The creating thread's own state is not this thread's to delete (the
+ * close path ends it with the interpreter); a thread that never
+ * attached is a no-op. */
+static inline void cc_py_thread_detach(CCPy *py) {
+    int i;
+    if (!py || !py->interp) return;
+    for (i = 0; i < cc__py_tls_n; i++) {
+        void *ts;
+        if (cc__py_tls[i].interp != py->interp) continue;
+        ts = cc__py_tls[i].tstate;
+        cc__py_tls[i] = cc__py_tls[--cc__py_tls_n];
+        if (ts == py->tstate) return; /* the creation state — not ours */
+        if (!cc__py.EvalRestoreThread || !cc__py.ThreadStateClear ||
+            !cc__py.ThreadStateDeleteCurrent)
+            return;
+        if (cc__py_cur_tstate != ts) {
+            if (cc__py_cur_tstate && cc__py.EvalSaveThread)
+                (void)cc__py.EvalSaveThread();
+            cc__py.EvalRestoreThread(ts);
+        }
+        cc__py.ThreadStateClear(ts);
+        /* Releases the GIL and leaves no thread current. */
+        cc__py.ThreadStateDeleteCurrent();
+        cc__py_cur_tstate = NULL;
+        return;
+    }
+}
+
+static inline void cc__py_bind_err_arena(CCArena *arena) {
+    cc__py_err_arena = arena;
+}
+static inline void cc__py_bind_err_py(CCPy *py) {
+    cc__py_err_arena = py ? py->arena : NULL;
+    cc__py_attach(py);
+}
+static inline void cc__py_bind_err_obj(CCPyObj *obj) {
+    cc__py_err_arena = (obj && obj->home) ? obj->home->arena : NULL;
+    if (obj) cc__py_attach(obj->home);
+}
+
+static int cc__py_sym(void *lib, const char *name, void *slot) {
+    void *p = dlsym(lib, name);
+    if (!p) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: missing symbol %s", name);
+        return -1;
+    }
+    memcpy(slot, &p, sizeof(p));
+    return 0;
+}
+
+/* Ask an interpreter where ITS runtime lives: one spawn, at selection
+ * time only.  sysconfig is authoritative where directory guessing is
+ * folklore — INSTSONAME names the exact shared object, and a static
+ * build announces itself (libpythonX.Y.a) instead of resolving to the
+ * wrong runtime. */
+static int cc__py_spawn_resolve(const char *exe, char *lib_out, size_t cap) {
+    char cmd[4608];
+    char libdir[2048];
+    char soname[512];
+    char fwprefix[2048];
+    char ver[32];
+    FILE *p;
+    if (strchr(exe, '\'')) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: interpreter path contains a quote: %.360s", exe);
+        return -1;
+    }
+    /* Four lines: LIBDIR, INSTSONAME/LDLIBRARY, PYTHONFRAMEWORKPREFIX,
+     * X.Y.  macOS framework builds put a relative framework path in
+     * LDLIBRARY (Python.framework/Versions/X.Y/Python) that is NOT
+     * relative to LIBDIR — joining those two yields a missing path.
+     * PYTHONFRAMEWORKPREFIX + soname and LIBDIR/libpythonX.Y.dylib are
+     * the real locations; try every candidate and take the first that
+     * exists so Linux (LIBDIR/soname) and Homebrew both resolve. */
+    snprintf(cmd, sizeof(cmd),
+             "'%s' -c \"import sysconfig,sys\n"
+             "print(sysconfig.get_config_var('LIBDIR') or '')\n"
+             "print(sysconfig.get_config_var('INSTSONAME') or "
+             "sysconfig.get_config_var('LDLIBRARY') or '')\n"
+             "print(sysconfig.get_config_var('PYTHONFRAMEWORKPREFIX') or '')\n"
+             "print('%%d.%%d' %% sys.version_info[:2])\" 2>/dev/null",
+             exe);
+    p = popen(cmd, "r");
+    libdir[0] = soname[0] = fwprefix[0] = ver[0] = 0;
+    if (p) {
+        if (fgets(libdir, sizeof(libdir), p)) libdir[strcspn(libdir, "\n")] = 0;
+        if (fgets(soname, sizeof(soname), p)) soname[strcspn(soname, "\n")] = 0;
+        if (fgets(fwprefix, sizeof(fwprefix), p))
+            fwprefix[strcspn(fwprefix, "\n")] = 0;
+        if (fgets(ver, sizeof(ver), p)) ver[strcspn(ver, "\n")] = 0;
+        if (pclose(p) != 0) libdir[0] = 0;
+    }
+    if (!libdir[0] || !soname[0]) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: cannot interrogate '%.360s' (not a working python?)",
+                 exe);
+        return -1;
+    }
+    {
+        size_t sl = strlen(soname);
+        if (sl > 2 && strcmp(soname + sl - 2, ".a") == 0) {
+            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                     "python: '%.240s' was built with a static libpython "
+                     "(%.100s) — embedding needs a shared runtime "
+                     "(--enable-shared)",
+                     exe, soname);
+            return -1;
+        }
+    }
+    {
+        char cands[5][4096];
+        int nc = 0, i;
+        struct stat st;
+        /* Prefer a path that still says "libpython" — macOS frameworks
+         * also expose .../Versions/X.Y/Python, which dlopens fine but is
+         * a worse answer for usePython(libpath) round-trips. */
+        if (soname[0] == '/')
+            snprintf(cands[nc++], sizeof(cands[0]), "%s", soname);
+        if (ver[0]) {
+            snprintf(cands[nc++], sizeof(cands[0]),
+                     "%s/libpython%s.dylib", libdir, ver);
+            snprintf(cands[nc++], sizeof(cands[0]), "%s/libpython%s.so",
+                     libdir, ver);
+        }
+        snprintf(cands[nc++], sizeof(cands[0]), "%s/%s", libdir, soname);
+        if (fwprefix[0])
+            snprintf(cands[nc++], sizeof(cands[0]), "%s/%s", fwprefix, soname);
+        for (i = 0; i < nc; i++) {
+            if (stat(cands[i], &st) == 0) {
+                /* The precision bound (row size - 1) is what keeps
+                 * -Wformat-truncation quiet: with a variable index the
+                 * compiler sizes cands[i] as the whole array. */
+                snprintf(lib_out, cap, "%.4095s", cands[i]);
+                return 0;
+            }
+        }
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: '%.200s' names its runtime as %.240s, which "
+                 "does not exist",
+                 exe, cands[0]);
+        return -1;
+    }
+}
+
+/* Resolve a selection spec — a venv directory (pyvenv.cfg inside), an
+ * interpreter executable, or a libpython path — into sel_lib/sel_prog.
+ * Does not load anything. */
+static int cc__py_sel_resolve(const char *spec, const char *how,
+                              char *lib_out, size_t lib_cap,
+                              char *prog_out, size_t prog_cap) {
+    struct stat st;
+    prog_out[0] = 0;
+    if (!spec || !spec[0] || stat(spec, &st) != 0) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: %.40s does not exist: %.360s", how,
+                 spec && spec[0] ? spec : "(empty)");
+        return -1;
+    }
+    if (S_ISDIR(st.st_mode)) {
+        char cfg[4096];
+        char exe[4096];
+        snprintf(cfg, sizeof(cfg), "%s/pyvenv.cfg", spec);
+        if (stat(cfg, &st) != 0) {
+            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                     "python: %.40s is not a venv (no pyvenv.cfg): %.360s",
+                     how, spec);
+            return -1;
+        }
+        snprintf(exe, sizeof(exe), "%s/bin/python", spec);
+        if (stat(exe, &st) != 0)
+            snprintf(exe, sizeof(exe), "%s/bin/python3", spec);
+        if (stat(exe, &st) != 0) {
+            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                     "python: %.40s venv has no bin/python: %.360s", how, spec);
+            return -1;
+        }
+        if (cc__py_spawn_resolve(exe, lib_out, lib_cap) != 0) return -1;
+        snprintf(prog_out, prog_cap, "%s", exe);
+        return 0;
+    }
+    {
+        size_t n = strlen(spec);
+        int looks_lib = strstr(spec, "libpython") != NULL ||
+                        (n > 3 && strcmp(spec + n - 3, ".so") == 0) ||
+                        strstr(spec, ".so.") != NULL ||
+                        (n > 6 && strcmp(spec + n - 6, ".dylib") == 0);
+        if (looks_lib) {
+            snprintf(lib_out, lib_cap, "%s", spec);
+            return 0;
+        }
+    }
+    /* An interpreter executable: adopt its prefix (venv or not) so the
+     * loaded runtime sees THAT python's world, not the discovery walk's. */
+    if (cc__py_spawn_resolve(spec, lib_out, lib_cap) != 0) return -1;
+    snprintf(prog_out, prog_cap, "%s", spec);
+    return 0;
+}
+
+static int cc__py_load(void);
+
+/* Choose the runtime, from code — beats every environment form.  Before
+ * the first load: resolves and stores.  After: a matching choice is a
+ * no-op, a different one is an error naming what already loaded (one
+ * runtime per process until process-isolated domains). */
+static inline int cc_py_use(const char *spec) {
+    char lib[4096];
+    char prog[4096];
+    cc__py_errbuf[0] = 0;
+    if (cc__py_sel_resolve(spec, "cc_py_use target", lib, sizeof(lib), prog,
+                           sizeof(prog)) != 0)
+        return -1;
+    if (cc__py.lib) {
+        if (strcmp(lib, cc__py_sel_lib) == 0 &&
+            strcmp(prog, cc__py_sel_prog) == 0)
+            return 0; /* same choice, settled */
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: the runtime is already loaded (%.300s%.16s%.32s) — one "
+                 "runtime per process; per-domain runtimes arrive with "
+                 "process-isolated domains",
+                 cc__py_sel_lib[0] ? cc__py_sel_lib : "via discovery",
+                 cc__py_sel_how[0] ? ", chosen by " : "",
+                 cc__py_sel_how);
+        return -1;
+    }
+    snprintf(cc__py_sel_lib, sizeof(cc__py_sel_lib), "%s", lib);
+    snprintf(cc__py_sel_prog, sizeof(cc__py_sel_prog), "%s", prog);
+    snprintf(cc__py_sel_how, sizeof(cc__py_sel_how), "cc_py_use");
+    return 0;
+}
+
+/* Resolve the table into `tmp`; never touch the published `cc__py`
+ * until every required slot is filled — a half-loaded table must not
+ * look like success to a racer or a later caller. */
+static int cc__py_load_fill(CC__PySyms *tmp) {
+    /* Bare sonames first (Linux ldconfig / macOS dyld path); then common
+     * Homebrew framework installs. Override with CC_LIBPYTHON=/path. */
+    static const char *sonames[] = {
+        "libpython3.14.dylib", "libpython3.13.dylib", "libpython3.12.dylib",
+        "libpython3.11.dylib", "libpython3.10.dylib",
+        "libpython3.14.so.1.0", "libpython3.13.so.1.0", "libpython3.12.so.1.0",
+        "libpython3.11.so.1.0", "libpython3.10.so.1.0",
+        "libpython3.so",
+        "/opt/homebrew/opt/python@3.14/Frameworks/Python.framework/Versions/3.14/Python",
+        "/opt/homebrew/opt/python@3.13/Frameworks/Python.framework/Versions/3.13/Python",
+        "/opt/homebrew/opt/python@3.12/Frameworks/Python.framework/Versions/3.12/Python",
+        "/opt/homebrew/opt/python@3.11/Frameworks/Python.framework/Versions/3.11/Python",
+        "/usr/local/opt/python@3.14/Frameworks/Python.framework/Versions/3.14/Python",
+        "/usr/local/opt/python@3.13/Frameworks/Python.framework/Versions/3.13/Python",
+        "/usr/local/opt/python@3.12/Frameworks/Python.framework/Versions/3.12/Python",
+        NULL,
+    };
+    const char *override;
+    int i;
+    memset(tmp, 0, sizeof(*tmp));
+    /* Self-probe first: when this code runs INSIDE a Python process — an
+     * extension module the interpreter imported, or a binary that linked
+     * libpython — the symbols are already here, and loading any other
+     * runtime would put two interpreters in one process.  The probe must
+     * therefore beat even CC_LIBPYTHON. */
+    {
+        void *self = dlopen(NULL, RTLD_NOW | RTLD_GLOBAL);
+        if (self) {
+            if (dlsym(self, "Py_IsInitialized")) tmp->lib = self;
+            else dlclose(self);
+        }
+    }
+    if (tmp->lib) goto have_lib;
+    /* Selection order: code (cc_py_use, resolved already) > CC_LIBPYTHON >
+     * ambient VIRTUAL_ENV > ambient ./.venv > the discovery walk.  Every
+     * explicit or ambient form fails HARD on a broken target: falling
+     * through would run the caller's code against the wrong environment
+     * while looking like success. */
+    if (cc__py_sel_lib[0]) {
+        tmp->lib = dlopen(cc__py_sel_lib, RTLD_NOW | RTLD_GLOBAL);
+        if (!tmp->lib) {
+            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                     "python: dlopen failed for the %.32s runtime %.300s: "
+                     "%.100s",
+                     cc__py_sel_how, cc__py_sel_lib, dlerror());
+            return -1;
+        }
+        goto have_lib;
+    }
+    override = getenv("CC_LIBPYTHON");
+    if (override && override[0]) {
+        tmp->lib = dlopen(override, RTLD_NOW | RTLD_GLOBAL);
+        if (!tmp->lib) {
+            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                     "python: CC_LIBPYTHON dlopen failed: %s", dlerror());
+            return -1;
+        }
+        snprintf(cc__py_sel_lib, sizeof(cc__py_sel_lib), "%s", override);
+        snprintf(cc__py_sel_how, sizeof(cc__py_sel_how), "CC_LIBPYTHON");
+        goto have_lib;
+    }
+    {
+        const char *venv = getenv("VIRTUAL_ENV");
+        const char *how = "VIRTUAL_ENV";
+        char dotvenv[4096];
+        if (!venv || !venv[0]) {
+            struct stat st;
+            snprintf(dotvenv, sizeof(dotvenv), ".venv/pyvenv.cfg");
+            if (stat(dotvenv, &st) == 0) {
+                snprintf(dotvenv, sizeof(dotvenv), ".venv");
+                venv = dotvenv;
+                how = "./.venv";
+            }
+        }
+        if (venv && venv[0]) {
+            if (cc__py_sel_resolve(venv, how, cc__py_sel_lib,
+                                   sizeof(cc__py_sel_lib), cc__py_sel_prog,
+                                   sizeof(cc__py_sel_prog)) != 0)
+                return -1; /* a present venv that fails to resolve is an
+                            * error, not a fall-through */
+            snprintf(cc__py_sel_how, sizeof(cc__py_sel_how), "%s", how);
+            tmp->lib = dlopen(cc__py_sel_lib, RTLD_NOW | RTLD_GLOBAL);
+            if (!tmp->lib) {
+                snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                         "python: dlopen failed for the %.32s runtime %.300s: "
+                         "%.100s",
+                         how, cc__py_sel_lib, dlerror());
+                return -1;
+            }
+            goto have_lib;
+        }
+    }
+    for (i = 0; !tmp->lib && sonames[i]; i++) {
+        tmp->lib = dlopen(sonames[i], RTLD_NOW | RTLD_GLOBAL);
+    }
+    if (!tmp->lib) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: no libpython3 found (tried 3.10-3.13; set "
+                 "CC_LIBPYTHON, or probe cc_py_available() to degrade)");
+        return -1;
+    }
+have_lib:
+#define CC__PY_SYM(field, name) \
+    if (cc__py_sym(tmp->lib, name, &tmp->field) != 0) return -1;
+    CC__PY_SYM(IsInitialized, "Py_IsInitialized")
+    CC__PY_SYM(InitializeEx, "Py_InitializeEx")
+    CC__PY_SYM(FinalizeEx, "Py_FinalizeEx")
+    CC__PY_SYM(ImportModule, "PyImport_ImportModule")
+    CC__PY_SYM(GetAttrString, "PyObject_GetAttrString")
+    CC__PY_SYM(CallMethod, "PyObject_CallMethod")
+    CC__PY_SYM(Str, "PyObject_Str")
+    CC__PY_SYM(AsUTF8AndSize, "PyUnicode_AsUTF8AndSize")
+    CC__PY_SYM(UnicodeGetLength, "PyUnicode_GetLength")
+    CC__PY_SYM(UnicodeAsUCS4, "PyUnicode_AsUCS4")
+    CC__PY_SYM(FloatAsDouble, "PyFloat_AsDouble")
+    CC__PY_SYM(LongAsLongLong, "PyLong_AsLongLong")
+    CC__PY_SYM(LongAsUnsignedLongLong, "PyLong_AsUnsignedLongLong")
+    CC__PY_SYM(FloatFromDouble, "PyFloat_FromDouble")
+    CC__PY_SYM(LongFromLongLong, "PyLong_FromLongLong")
+    CC__PY_SYM(LongFromUnsignedLongLong, "PyLong_FromUnsignedLongLong")
+    CC__PY_SYM(LongFromString, "PyLong_FromString")
+    CC__PY_SYM(UnicodeFromStringAndSize, "PyUnicode_FromStringAndSize")
+    CC__PY_SYM(ListNew, "PyList_New")
+    CC__PY_SYM(ListSetItem, "PyList_SetItem")
+    CC__PY_SYM(TupleNew, "PyTuple_New")
+    CC__PY_SYM(TupleSetItem, "PyTuple_SetItem")
+    CC__PY_SYM(CallObject, "PyObject_CallObject")
+    CC__PY_SYM(BoolFromLong, "PyBool_FromLong")
+    CC__PY_SYM(ErrOccurred, "PyErr_Occurred")
+    CC__PY_SYM(ErrFetch, "PyErr_Fetch")
+    CC__PY_SYM(ErrClear, "PyErr_Clear")
+    CC__PY_SYM(IncRef, "Py_IncRef")
+    CC__PY_SYM(DecRef, "Py_DecRef")
+    CC__PY_SYM(SequenceSize, "PySequence_Size")
+    CC__PY_SYM(SequenceGetItem, "PySequence_GetItem")
+    CC__PY_SYM(MemoryViewFromMemory, "PyMemoryView_FromMemory")
+    CC__PY_SYM(GetAttr, "PyObject_GetAttr")
+    CC__PY_SYM(UnicodeInternFromString, "PyUnicode_InternFromString")
+    CC__PY_SYM(Vectorcall, "PyObject_Vectorcall")
+    CC__PY_SYM(GetBuffer, "PyObject_GetBuffer")
+    CC__PY_SYM(ReleaseBuffer, "PyBuffer_Release")
+    CC__PY_SYM(TupleSize, "PyTuple_Size")
+    CC__PY_SYM(TupleGetItem, "PyTuple_GetItem")
+    CC__PY_SYM(MappingItems, "PyMapping_Items")
+    CC__PY_SYM(ErrNormalize, "PyErr_NormalizeException")
+    CC__PY_SYM(DictNew, "PyDict_New")
+    CC__PY_SYM(DictSetItemString, "PyDict_SetItemString")
+    CC__PY_SYM(Call, "PyObject_Call")
+    CC__PY_SYM(ModuleCreate2, "PyModule_Create2")
+    CC__PY_SYM(SysGetObject, "PySys_GetObject")
+    CC__PY_SYM(DictSetItem, "PyDict_SetItem")
+    CC__PY_SYM(ObjectSetAttrString, "PyObject_SetAttrString")
+    CC__PY_SYM(UnicodeFromString, "PyUnicode_FromString")
+    CC__PY_SYM(ArgParseTuple, "PyArg_ParseTuple")
+    CC__PY_SYM(ErrSetString, "PyErr_SetString")
+    CC__PY_SYM(ModuleGetState, "PyModule_GetState")
+#undef CC__PY_SYM
+    /* Optional: isolation. `Py_NewInterpreterFromConfig` (3.12+) is the only
+     * way to get an interpreter with its OWN GIL, and it is not in the
+     * limited API — so it is resolved by name and its absence is a clean
+     * error at the second `cc_py_new`, not a load failure here. The
+     * thread-state calls are stable ABI but only needed alongside it. */
+#define CC__PY_SYM_OPT(field, name) \
+    tmp->field = (void *)0; *(void **)&tmp->field = dlsym(tmp->lib, name);
+    CC__PY_SYM_OPT(MemoryViewFromBuffer, "PyMemoryView_FromBuffer")
+    CC__PY_SYM_OPT(NewInterpreterFromConfig, "Py_NewInterpreterFromConfig")
+    CC__PY_SYM_OPT(ModuleDefInit, "PyModuleDef_Init")
+    CC__PY_SYM_OPT(ModuleFromDefAndSpec2, "PyModule_FromDefAndSpec2")
+    CC__PY_SYM_OPT(ModuleExecDef, "PyModule_ExecDef")
+    CC__PY_SYM_OPT(EndInterpreter, "Py_EndInterpreter")
+    CC__PY_SYM_OPT(ThreadStateSwap, "PyThreadState_Swap")
+    CC__PY_SYM_OPT(ThreadStateGet, "PyThreadState_Get")
+    CC__PY_SYM_OPT(ThreadStateNew, "PyThreadState_New")
+    CC__PY_SYM_OPT(ThreadStateClear, "PyThreadState_Clear")
+    CC__PY_SYM_OPT(ThreadStateDelete, "PyThreadState_Delete")
+    CC__PY_SYM_OPT(ThreadStateDeleteCurrent, "PyThreadState_DeleteCurrent")
+    CC__PY_SYM_OPT(CFunctionNewEx, "PyCFunction_NewEx")
+    CC__PY_SYM_OPT(CapsuleNew, "PyCapsule_New")
+    CC__PY_SYM_OPT(CapsuleGetPointer, "PyCapsule_GetPointer")
+    CC__PY_SYM_OPT(LongCheck, "PyLong_Check")
+    CC__PY_SYM_OPT(FloatCheckExact, "PyFloat_CheckExact")
+    CC__PY_SYM_OPT(LongIsCompact, "PyUnstable_Long_IsCompact")
+    CC__PY_SYM_OPT(LongCompactValue, "PyUnstable_Long_CompactValue")
+    CC__PY_SYM_OPT(ObjectIsInstance, "PyObject_IsInstance")
+    CC__PY_SYM_OPT(InterpreterStateGet, "PyInterpreterState_Get")
+    CC__PY_SYM_OPT(EvalSaveThread, "PyEval_SaveThread")
+    CC__PY_SYM_OPT(EvalRestoreThread, "PyEval_RestoreThread")
+    CC__PY_SYM_OPT(SetProgramName, "Py_SetProgramName")
+    CC__PY_SYM_OPT(DecodeLocale, "Py_DecodeLocale")
+    CC__PY_SYM_OPT(GetVersion, "Py_GetVersion")
+#undef CC__PY_SYM_OPT
+    return 0;
+}
+
+static int cc__py_load(void) {
+    for (;;) {
+        int st = cc_atomic_load(&cc__py_load_state);
+        int expected;
+        if (st == 2) return 0;
+        if (st == 1) continue; /* another thread is filling; table not ready */
+        expected = 0;
+        if (!cc_atomic_cas(&cc__py_load_state, &expected, 1)) continue;
+        break;
+    }
+    {
+        CC__PySyms tmp;
+        if (cc__py_load_fill(&tmp) != 0) {
+            cc_atomic_store(&cc__py_load_state, 0);
+            return -1;
+        }
+        cc__py = tmp;
+        cc_atomic_store(&cc__py_load_state, 2);
+        return 0;
+    }
+}
+
+/* One line of provenance for tooling: "3.12.3|/lib/libpython3.12.so|how"
+ * (fields empty until known).  The version is Py_GetVersion's first
+ * token once the runtime is up. */
+static inline void cc_py_runtime_desc(char *buf, size_t cap) {
+    char ver[64];
+    ver[0] = 0;
+    if (cc__py.lib && cc__py.GetVersion) {
+        const char *v = cc__py.GetVersion();
+        size_t i = 0;
+        while (v && v[i] && v[i] != ' ' && i < sizeof(ver) - 1) {
+            ver[i] = v[i];
+            i++;
+        }
+        ver[i] = 0;
+    }
+    snprintf(buf, cap, "%s|%s|%s", ver,
+             cc__py.lib && !cc__py_sel_lib[0] ? "(discovered or in-process)"
+                                              : cc__py_sel_lib,
+             cc__py_sel_how);
+}
+
+/* Whether a Python runtime can be loaded at all — the boolean form of the
+ * question `cc_py_new` answers by failing.  A program that degrades
+ * gracefully asks this first, and `!>` on `cc_py_new` then means what it
+ * says:
+ *
+ *     if (!cc_py_available()) { puts("SKIP (no libpython)"); return 0; }
+ *     CCPy py = cc_py_new(false, &a) !>;
+ *
+ * This IS the loader (same soname list, same CC_LIBPYTHON override), so
+ * the probe and the constructor cannot disagree. */
+static inline bool cc_py_available(void) { return cc__py_load() == 0; }
+
+/* Copy a Python str object's bytes into the error arena (empty on any
+ * failure — diagnostics never raise). */
+static CCSlice cc__py_text_into_err_arena(void *s) {
+    const char *p;
+    intptr_t n = 0;
+    char *dst;
+    if (!s || !cc__py_err_arena) return cc_slice_empty();
+    p = cc__py.AsUTF8AndSize(s, &n);
+    if (!p || n < 0) return cc_slice_empty();
+    dst = (char *)cc_arena_alloc(cc__py_err_arena, (size_t)n + 1, 1);
+    if (!dst) return cc_slice_empty();
+    memcpy(dst, p, (size_t)n);
+    dst[n] = 0;
+    return cc_slice_from_buffer(dst, (size_t)n);
+}
+
+static CCSlice cc__py_attr_text(void *obj, const char *attr) {
+    void *a;
+    CCSlice out;
+    if (!obj || !cc__py.GetAttrString) return cc_slice_empty();
+    a = cc__py.GetAttrString(obj, attr);
+    if (!a) { if (cc__py.ErrClear) cc__py.ErrClear(); return cc_slice_empty(); }
+    out = cc__py_text_into_err_arena(a);
+    cc__py.DecRef(a);
+    return out;
+}
+
+/* `"".join(traceback.format_exception(t, v, tb))`, via the C API only. */
+static CCSlice cc__py_format_traceback(void *t, void *v, void *tb) {
+    void *mod, *lines, *sep, *joined;
+    CCSlice out = cc_slice_empty();
+    if (!cc__py_err_arena || !cc__py.ImportModule || !cc__py.CallMethod)
+        return out;
+    mod = cc__py.ImportModule("traceback");
+    if (!mod) { if (cc__py.ErrClear) cc__py.ErrClear(); return out; }
+    lines = cc__py.CallMethod(mod, "format_exception", "OOO", t, v, tb);
+    if (!lines) {
+        if (cc__py.ErrClear) cc__py.ErrClear();
+        cc__py.DecRef(mod);
+        return out;
+    }
+    sep = cc__py.UnicodeFromStringAndSize("", 0);
+    joined = sep ? cc__py.CallMethod(sep, "join", "O", lines) : NULL;
+    if (joined) {
+        out = cc__py_text_into_err_arena(joined);
+        cc__py.DecRef(joined);
+    } else if (cc__py.ErrClear) {
+        cc__py.ErrClear();
+    }
+    if (sep) cc__py.DecRef(sep);
+    cc__py.DecRef(lines);
+    cc__py.DecRef(mod);
+    return out;
+}
+
+/* Capture the pending exception (or `ctx` / prefilled `cc__py_errbuf`)
+ * into a CCPyError. When `cc__py_err_arena` is set, the message is copied
+ * into that arena; otherwise it stays in the process-static buffer. */
+static CCPyError cc__py_err(const char *ctx) {
+    CCPyError e;
+    const char *msg_src;
+    memset(&e, 0, sizeof(e));
+    if (cc__py.lib && cc__py.ErrOccurred && cc__py.ErrOccurred()) {
+        void *t = NULL, *v = NULL, *tb = NULL;
+        cc__py.ErrFetch(&t, &v, &tb);
+        if (cc__py.ErrNormalize) cc__py.ErrNormalize(&t, &v, &tb);
+        {
+            void *s = v ? cc__py.Str(v) : NULL;
+            const char *msg = NULL;
+            intptr_t n = 0;
+            const char *tn = NULL;
+            intptr_t tnl = 0;
+            void *nm = NULL;
+            if (s) msg = cc__py.AsUTF8AndSize(s, &n);
+            /* Fold the type into the message: bridges that surface only
+             * `.base.message` (and empty `str(exc)` like `KeyError()`)
+             * must still name the exception class. */
+            if (t) {
+                nm = cc__py.GetAttrString(t, "__name__");
+                if (nm) tn = cc__py.AsUTF8AndSize(nm, &tnl);
+            }
+            if (tn && tnl > 0 && msg && n > 0)
+                snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                         "python: %s: %.*s: %.*s", ctx, (int)tnl, tn,
+                         (int)n, msg);
+            else if (tn && tnl > 0)
+                snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                         "python: %s: %.*s", ctx, (int)tnl, tn);
+            else
+                snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                         "python: %s: %s", ctx, msg ? msg : "unknown error");
+            if (nm) cc__py.DecRef(nm);
+            if (s) cc__py.DecRef(s);
+        }
+        /* The exception class name, so a handler can tell KeyError from
+         * ValueError without parsing the message. */
+        if (t) e.type_name = cc__py_attr_text(t, "__name__");
+        /* Formatted traceback: what failed AND where, five frames deep in
+         * somebody else's library. Costs one Python call, on the error path
+         * only. */
+        if (tb) e.traceback = cc__py_format_traceback(t, v, tb);
+        if (t) cc__py.DecRef(t);
+        if (v) cc__py.DecRef(v);
+        if (tb) cc__py.DecRef(tb);
+        cc__py.ErrClear();
+    } else if (!cc__py_errbuf[0]) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf), "python: %s failed",
+                 ctx);
+    }
+    msg_src = cc__py_errbuf;
+    /* Real Python exceptions are user-face (CC_ERR_USER), not INTERNAL —
+     * KeyError is not "our bug." Binding/setup failures stay INTERNAL. */
+    {
+        CCErrorKind kind =
+            (e.type_name.ptr && e.type_name.len > 0) ? CC_ERR_USER
+                                                    : CC_ERR_INTERNAL;
+        if (cc__py_err_arena) {
+            size_t n = strlen(msg_src);
+            char *dst = (char *)cc_arena_alloc(cc__py_err_arena, n + 1, 1);
+            if (dst) {
+                memcpy(dst, msg_src, n + 1);
+                e.base = CC_ERROR(kind, dst);
+                return e;
+            }
+        }
+        e.base = CC_ERROR(kind, msg_src);
+    }
+    return e;
+}
+
+/* ---- sequence / mapping extraction ----
+ *
+ * `obj.as_list::[T](&arena)` converts a Python sequence to a typed slice
+ * of T; `obj.as_map::[K, V](&arena, m)` fills an existing Map. Element
+ * conversion is the inbound twin of the outbound marshal arms: Python
+ * numbers become CC scalars, Python strings become arena-backed slices.
+ * A non-sequence, or an element that will not convert, is a CCPyError
+ * naming the index. */
+
+typedef enum {
+    CC__PY_EL_F64 = 0,
+    CC__PY_EL_I64 = 1,
+    CC__PY_EL_INT = 2,
+    CC__PY_EL_SLICE = 3
+} CCPyElemKind;
+
+static size_t cc__py_elem_size(CCPyElemKind k) {
+    switch (k) {
+    case CC__PY_EL_F64: return sizeof(double);
+    case CC__PY_EL_I64: return sizeof(int64_t);
+    case CC__PY_EL_INT: return sizeof(int);
+    default: return sizeof(CCSlice);
+    }
+}
+
+/* Typed element buffers must honor natural alignment.  `alloc_slice_bytes`
+ * uses align 1; on ARM32 a later `*(double*)` / STRD at a 2-byte address
+ * is SIGBUS (QEMU and many native cores). */
+static size_t cc__py_elem_align(CCPyElemKind k) {
+    switch (k) {
+    case CC__PY_EL_F64: return _Alignof(double);
+    case CC__PY_EL_I64: return _Alignof(int64_t);
+    case CC__PY_EL_INT: return _Alignof(int);
+    default: return _Alignof(CCSlice);
+    }
+}
+
+/* Convert one element into `dst`. Returns 0 on success. */
+static int cc__py_elem_store(void *item, CCPyElemKind kind, void *dst,
+                             CCArena *arena) {
+    switch (kind) {
+    case CC__PY_EL_F64: {
+        double d = cc__py.FloatAsDouble(item);
+        if (d == -1.0 && cc__py.ErrOccurred()) return -1;
+        *(double *)dst = d;
+        return 0;
+    }
+    case CC__PY_EL_I64:
+    case CC__PY_EL_INT: {
+        long long v = cc__py.LongAsLongLong(item);
+        if (v == -1 && cc__py.ErrOccurred()) return -1;
+        if (kind == CC__PY_EL_I64) {
+            if (v < (long long)INT64_MIN || v > (long long)INT64_MAX)
+                return -1;
+            *(int64_t *)dst = (int64_t)v;
+            return 0;
+        }
+        /* Same range rule as CC_PY_IN(int, …): refuse, never narrow. */
+        if (v < (long long)INT_MIN || v > (long long)INT_MAX) return -1;
+        *(int *)dst = (int)v;
+        return 0;
+    }
+    default: {
+        void *s = cc__py.Str(item);
+        const char *p;
+        intptr_t n = 0;
+        char *buf;
+        if (!s) return -1;
+        p = cc__py.AsUTF8AndSize(s, &n);
+        if (!p || n < 0) { cc__py.DecRef(s); return -1; }
+        buf = (char *)cc_arena_alloc(arena, (size_t)n + 1, 1);
+        if (!buf) { cc__py.DecRef(s); return -1; }
+        memcpy(buf, p, (size_t)n);
+        buf[n] = 0;
+        *(CCSlice *)dst = cc_slice_from_buffer(buf, (size_t)n);
+        cc__py.DecRef(s);
+        return 0;
+    }
+    }
+}
+
+/* Shared worker: a byte slice holding `count` elements of `kind`. The
+ * typed wrappers below reinterpret it as the matching slice instance. */
+/* Mirror of the stable-ABI `Py_buffer` (the struct every exporter fills). */
+typedef struct CC__PyBuffer {
+    void *buf;
+    void *obj;
+    intptr_t len;       /* total bytes */
+    intptr_t itemsize;
+    int readonly;
+    int ndim;
+    char *format;       /* struct-module code; NULL means "B" */
+    intptr_t *shape;
+    intptr_t *strides;
+    intptr_t *suboffsets;
+    void *internal;
+} CC__PyBuffer;
+
+/* PyBUF_ND (C-contiguous, shape known) | PyBUF_FORMAT. */
+#define CC__PYBUF_CONTIG_FMT 0x000c
+
+/* Does the exporter's element format match what the destination stores?
+ * `format` is a struct-module code, optionally prefixed with byte order —
+ * only native order ('@', '=', or none) is accepted, since the bytes are
+ * copied raw.  Item size is checked by the caller. */
+static inline int cc__py_buf_format_ok(const char *fmt, CCPyElemKind kind) {
+    char c;
+    if (!fmt || !fmt[0]) c = 'B';
+    else {
+        const char *p = fmt;
+        if (*p == '@' || *p == '=') p++;
+        else if (*p == '<' || *p == '>' || *p == '!') return 0;
+        if (!p[0] || p[1]) return 0; /* one code, one element */
+        c = p[0];
+    }
+    switch (kind) {
+    case CC__PY_EL_F64: return c == 'd';
+    case CC__PY_EL_I64: return c == 'q' || c == 'l' || c == 'n';
+    case CC__PY_EL_INT: return c == 'i' || c == 'l';
+    default: return 0;
+    }
+}
+
+/* One-memcpy extraction for a contiguous buffer exporter.  Returns 1 with
+ * `*out` filled, 0 to fall back to the per-element sequence walk (not an
+ * exporter, wrong element type, wrong shape), -1 on arena exhaustion.  The
+ * fallback is the important half: a `list` is not an exporter, and a numpy
+ * array of the WRONG dtype should convert per element rather than be
+ * reinterpreted — raw bytes only move when both sides agree on what they
+ * mean. */
+static inline int cc__py_obj_buffer_fill(CCPyObj *obj, CCArena *arena,
+                                         CCPyElemKind kind, CCSlice *out) {
+    CC__PyBuffer view;
+    size_t esz = cc__py_elem_size(kind);
+    size_t count;
+    CCSlice dst;
+    if (!cc__py.GetBuffer || !cc__py.ReleaseBuffer) return 0;
+    if (kind == CC__PY_EL_SLICE) return 0; /* strings are not raw bytes */
+    memset(&view, 0, sizeof(view));
+    if (cc__py.GetBuffer(obj->o, &view, CC__PYBUF_CONTIG_FMT) != 0) {
+        if (cc__py.ErrClear) cc__py.ErrClear();
+        return 0;
+    }
+    if (view.ndim != 1 || view.itemsize != (intptr_t)esz ||
+        !cc__py_buf_format_ok(view.format, kind) ||
+        view.len < 0 || (view.itemsize && view.len % view.itemsize)) {
+        cc__py.ReleaseBuffer(&view);
+        return 0;
+    }
+    count = (size_t)view.len / esz;
+    dst = cc_arena_alloc_slice(arena, esz, count, cc__py_elem_align(kind));
+    if (!dst.ptr && view.len > 0) {
+        cc__py.ReleaseBuffer(&view);
+        return -1;
+    }
+    if (view.len > 0) memcpy(dst.ptr, view.buf, (size_t)view.len);
+    cc__py.ReleaseBuffer(&view);
+    *out = dst;
+    return 1;
+}
+
+static inline CCResult_CCSlice_CCPyError cc__py_obj_as_list_raw(CCPyObj *obj,
+                                                               CCArena *arena,
+                                                               CCPyElemKind kind) {
+    intptr_t n, i;
+    size_t esz = cc__py_elem_size(kind);
+    CCSlice out;
+    cc__py_bind_err_obj(obj);
+    if (!obj || !obj->o || !arena)
+        return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("as_list"));
+    /* Contiguous exporter of the right element type: one memcpy. */
+    {
+        CCSlice fast;
+        int rc = cc__py_obj_buffer_fill(obj, arena, kind, &fast);
+        if (rc == 1) return cc_ok_CCResult_CCSlice_CCPyError(fast);
+        if (rc < 0) {
+            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                     "python: as_list: arena exhausted");
+            return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("as_list"));
+        }
+    }
+    if (!cc__py.SequenceSize || !cc__py.SequenceGetItem) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: as_list: sequence API unavailable");
+        return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("as_list"));
+    }
+    n = cc__py.SequenceSize(obj->o);
+    if (n < 0) return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("as_list"));
+    out = cc_arena_alloc_slice(arena, esz, (size_t)n, cc__py_elem_align(kind));
+    if (!out.ptr && n > 0) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: as_list: arena exhausted");
+        return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("as_list"));
+    }
+    for (i = 0; i < n; i++) {
+        void *item = cc__py.SequenceGetItem(obj->o, i);
+        int rc;
+        if (!item) return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("as_list"));
+        rc = cc__py_elem_store(item, kind, (char *)out.ptr + (size_t)i * esz, arena);
+        cc__py.DecRef(item);
+        if (rc != 0) {
+            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                     "python: as_list: element %ld does not convert", (long)i);
+            if (cc__py.ErrClear) cc__py.ErrClear();
+            return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("as_list"));
+        }
+    }
+    return cc_ok_CCResult_CCSlice_CCPyError(out);
+}
+
+/* `obj.as_list::[T](&arena)` — the `::[T]` type argument selects the arm. */
+#define cc_py_obj_as_list(T, obj, arena) \
+    cc__py_obj_as_list_raw((obj), (arena), cc__py_elem_kind_of_##T)
+
+#define cc__py_elem_kind_of_double   CC__PY_EL_F64
+#define cc__py_elem_kind_of_float    CC__PY_EL_F64
+#define cc__py_elem_kind_of_int64_t  CC__PY_EL_I64
+#define cc__py_elem_kind_of_int      CC__PY_EL_INT
+#define cc__py_elem_kind_of_CCSlice  CC__PY_EL_SLICE
+
+/* `obj.as_map::[K, V](&arena, m)` — fills `m` from a Python mapping and
+ * yields the pair count. K/V select the element arms. */
+static inline CCResult_size_t_CCPyError cc__py_obj_as_map_raw(
+        CCPyObj *obj, CCArena *arena, void *map,
+        int (*insert)(void *map, void *k, void *v),
+        CCPyElemKind kk, CCPyElemKind vk) {
+    void *items;
+    intptr_t n, i;
+    size_t inserted = 0;
+    cc__py_bind_err_obj(obj);
+    if (!obj || !obj->o || !arena || !map || !insert)
+        return cc_err_CCResult_size_t_CCPyError(cc__py_err("as_map"));
+    if (!cc__py.MappingItems || !cc__py.SequenceSize || !cc__py.SequenceGetItem) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: as_map: mapping API unavailable");
+        return cc_err_CCResult_size_t_CCPyError(cc__py_err("as_map"));
+    }
+    items = cc__py.MappingItems(obj->o);
+    if (!items) return cc_err_CCResult_size_t_CCPyError(cc__py_err("as_map"));
+    n = cc__py.SequenceSize(items);
+    for (i = 0; i < n; i++) {
+        void *pair = cc__py.SequenceGetItem(items, i);
+        void *kobj, *vobj;
+        char kbuf[sizeof(CCSlice)], vbuf[sizeof(CCSlice)];
+        if (!pair) break;
+        kobj = cc__py.SequenceGetItem(pair, 0);
+        vobj = cc__py.SequenceGetItem(pair, 1);
+        if (kobj && vobj &&
+            cc__py_elem_store(kobj, kk, kbuf, arena) == 0 &&
+            cc__py_elem_store(vobj, vk, vbuf, arena) == 0 &&
+            insert(map, kbuf, vbuf) == 0) {
+            inserted++;
+        } else {
+            if (kobj) cc__py.DecRef(kobj);
+            if (vobj) cc__py.DecRef(vobj);
+            cc__py.DecRef(pair);
+            cc__py.DecRef(items);
+            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                     "python: as_map: pair %ld does not convert", (long)i);
+            if (cc__py.ErrClear) cc__py.ErrClear();
+            return cc_err_CCResult_size_t_CCPyError(cc__py_err("as_map"));
+        }
+        cc__py.DecRef(kobj);
+        cc__py.DecRef(vobj);
+        cc__py.DecRef(pair);
+    }
+    cc__py.DecRef(items);
+    return cc_ok_CCResult_size_t_CCPyError(inserted);
+}
+
+#define cc_py_obj_as_map(K, V, obj, arena, m) \
+    cc__py_obj_as_map_raw((obj), (arena), (m), \
+                          cc__py_map_insert_##K##_##V, \
+                          cc__py_elem_kind_of_##K, cc__py_elem_kind_of_##V)
+
+/* ---- the `cc` namespace: modules the host injects ----
+ *
+ * When CC hosts the interpreter it injects modules under a `cc.` namespace,
+ * the way any embedder installs host bindings.  The name is host-scoped on
+ * purpose: `import cc.host` declares a dependency on running under CC, and
+ * nothing here can shadow a package on `sys.path`.
+ *
+ * Registration is per interpreter, not process-wide: `sys.modules` is
+ * per-interpreter, and an isolated interpreter must get its OWN module
+ * instance — sharing one is exactly what a per-interpreter GIL forbids.
+ * That also rules out `PyImport_AppendInittab`, whose importer declines any
+ * dotted name (every stdlib C extension is top-level for this reason).
+ *
+ * These mirror the documented public structs; they are part of the module
+ * API every extension defines statically, not interpreter internals. */
+
+#define CC__PY_METH_VARARGS 0x0001
+#define CC__PY_METH_KEYWORDS 0x0002
+/* `METH_FASTCALL`: CPython hands the arguments as a pointer into its own
+ * value stack with a count, instead of packing them into a tuple it has to
+ * allocate for every call.  Stable since 3.7 and honoured by module creation;
+ * reachable here because this table is our own struct, bound to the runtime by
+ * symbol rather than compiled against `Py_LIMITED_API`.
+ *
+ * Combined with `METH_KEYWORDS` the entry is
+ * `(self, args[], nargs, kwnames)` — keyword values sit at
+ * `args[nargs .. nargs+nkw)`, and `kwnames` is a tuple of the names (or
+ * NULL when none were passed). */
+#define CC__PY_METH_FASTCALL 0x0080
+#define CC__PY_METH_FASTCALL_KEYWORDS \
+    (CC__PY_METH_FASTCALL | CC__PY_METH_KEYWORDS)
+#define CC__PY_API_VERSION 1013
+
+typedef struct CC__PyMethodDef {
+    const char *ml_name;
+    /* The real field is a generic function pointer CPython casts by flag; a
+     * `METH_FASTCALL|METH_KEYWORDS` entry is
+     * `(self, args[], nargs, kwnames)`.  Declared void* so either shape
+     * stores here, cast at the table. */
+    void *ml_meth;
+    int ml_flags;
+    const char *ml_doc;
+} CC__PyMethodDef;
+
+typedef struct CC__PyModuleDef {
+    /* PyModuleDef_Base: PyObject_HEAD (refcnt, type) then m_init/index/copy.
+     * Head is initialized to refcnt 1, type NULL, as PyModuleDef_HEAD_INIT. */
+    void *ob_head[2];
+    void *m_init;
+    intptr_t m_index;
+    void *m_copy;
+    const char *m_name;
+    const char *m_doc;
+    intptr_t m_size;
+    CC__PyMethodDef *m_methods;
+    void *m_slots;
+    void *m_traverse;
+    void *m_clear;
+    void *m_free;
+} CC__PyModuleDef;
+
+/* PyModuleDef_Slot: { int slot; void *value; } — Py_mod_exec is 2. */
+typedef struct CC__PyModuleDef_Slot { int slot; void *value; } CC__PyModuleDef_Slot;
+#define CC__PY_MOD_EXEC 2
+
+/* Cached builtin exception types — raise must not ImportModule on every miss.
+ * Looked up by name because exception types are data symbols the stable-ABI
+ * dlsym table does not carry. */
+static void *cc__py_exc_typeerror;
+static void *cc__py_exc_overflow;
+static void *cc__py_exc_runtime;
+
+static void *cc__py_exc_lookup(const char *cls) {
+    void *builtins = cc__py.ImportModule("builtins");
+    void *exc = builtins ? cc__py.GetAttrString(builtins, cls) : NULL;
+    if (builtins) cc__py.DecRef(builtins);
+    return exc; /* new ref, or NULL */
+}
+
+/* Raise `msg` as an instance of the named builtin exception class and return
+ * NULL, the C-API convention a trampoline uses to report failure. */
+static void *cc__py_raise_as(const char *cls, const char *msg) {
+    void *exc = NULL;
+    int cached = 0;
+    if (cls[0] == 'T' && strcmp(cls, "TypeError") == 0) {
+        if (!cc__py_exc_typeerror)
+            cc__py_exc_typeerror = cc__py_exc_lookup(cls);
+        exc = cc__py_exc_typeerror;
+        cached = 1;
+    } else if (cls[0] == 'O' && strcmp(cls, "OverflowError") == 0) {
+        if (!cc__py_exc_overflow)
+            cc__py_exc_overflow = cc__py_exc_lookup(cls);
+        exc = cc__py_exc_overflow;
+        cached = 1;
+    } else if (cls[0] == 'R' && strcmp(cls, "RuntimeError") == 0) {
+        if (!cc__py_exc_runtime)
+            cc__py_exc_runtime = cc__py_exc_lookup(cls);
+        exc = cc__py_exc_runtime;
+        cached = 1;
+    } else {
+        exc = cc__py_exc_lookup(cls);
+    }
+    if (exc) cc__py.ErrSetString(exc, msg);
+    if (exc && !cached) cc__py.DecRef(exc);
+    return NULL;
+}
+
+/* A CC error crossing into Python keeps its KIND as the exception type —
+ * what a Python caller dispatches on — with the message riding along.
+ * Kinds without a natural builtin stay RuntimeError. */
+static void *cc__py_raise_cc_error(int kind, const char *msg) {
+    const char *cls;
+    switch (kind) {
+    case CC_ERR_INVALID_ARG:   cls = "ValueError";      break;
+    case CC_ERR_NOT_FOUND:     cls = "LookupError";     break;
+    case CC_ERR_TIMEOUT:       cls = "TimeoutError";    break;
+    case CC_ERR_PERMISSION:    cls = "PermissionError"; break;
+    case CC_ERR_OUT_OF_MEMORY: cls = "MemoryError";     break;
+    case CC_ERR_OVERFLOW:      cls = "OverflowError";   break;
+    default:                   cls = "RuntimeError";    break;
+    }
+    return cc__py_raise_as(cls, msg ? msg : "cc error");
+}
+
+/* Raise `msg` as a Python exception and return NULL, the C-API convention a
+ * trampoline uses to report failure. */
+static void *cc__py_raise(const char *msg) {
+    return cc__py_raise_as("RuntimeError", msg ? msg : "cc error");
+}
+
+/* ============================================================
+ * Host-module marshaling: Python values in, CC values out.
+ *
+ * A trampoline runs under the GIL with a Python caller on the stack, so a bad
+ * argument is a Python exception rather than a CC Result — raise and return
+ * NULL, the way any C extension does.
+ *
+ * Dispatch is `_Generic` on the DESTINATION, not a format string derived from
+ * a type spelling.  A format string would need a comptime spelling->char table,
+ * which is a registry: it decides by name, so an alias or a typedef silently
+ * picks the wrong entry, and a type nobody listed fails at the call in Python.
+ * `_Generic` decides by real type, and a destination with no arm cannot compile
+ * — an unsupported parameter type is a compile error at the trampoline instead
+ * of a `TypeError` in someone's script.
+ * ============================================================ */
+
+/* Every `in` helper returns 0 on success, or -1 with a Python exception set.
+ * `what` names the parameter so the raised message points at the argument the
+ * caller got wrong rather than at the callee. */
+static int __attribute__((noinline)) cc__py_in_fail(const char *cls, const char *what,
+                                                     const char *want) {
+    char buf[192];
+    snprintf(buf, sizeof(buf), "argument `%s` expects %s", what, want);
+    cc__py_raise_as(cls, buf);
+    return -1;
+}
+
+/* Cached builtins.int / builtins.float type objects.  PyLong_Check is often
+ * a macro (not dlsym-able); comparing Py_TYPE(o) to these is. */
+static void *cc__py_cls_int;
+static void *cc__py_cls_float;
+
+static void cc__py_cache_num_classes(void) {
+    void *b;
+    if (cc__py_cls_int && cc__py_cls_float) return;
+    if (!cc__py.ImportModule || !cc__py.GetAttrString) return;
+    b = cc__py.ImportModule("builtins");
+    if (!b) return;
+    if (!cc__py_cls_int)
+        cc__py_cls_int = cc__py.GetAttrString(b, "int");
+    if (!cc__py_cls_float)
+        cc__py_cls_float = cc__py.GetAttrString(b, "float");
+    cc__py.DecRef(b);
+}
+
+/* CPython 3.10–3.14: after the refcnt/immortal word comes ob_type. */
+typedef struct { uintptr_t rc; void *ty; } CC__PyObjHead;
+/* Exact float: PyObject_HEAD + ob_fval. Stable across limited/full API. */
+typedef struct { uintptr_t rc; void *ty; double fval; } CC__PyFloatObj;
+
+static inline void *cc__py_obj_type(void *o) {
+    return o ? ((CC__PyObjHead *)o)->ty : NULL;
+}
+
+static inline int cc__py_is_exact_int(void *o) {
+    /* Prefer cached builtins.int (CheckExact).  PyLong_Check via dlsym is
+     * often missing (macro) and, when present, accepts bool. */
+    if (cc__py_cls_int) return cc__py_obj_type(o) == cc__py_cls_int;
+    if (cc__py.LongCheck) return cc__py.LongCheck(o);
+    cc__py_cache_num_classes();
+    return cc__py_cls_int && cc__py_obj_type(o) == cc__py_cls_int;
+}
+
+static inline int cc__py_is_exact_float(void *o) {
+    if (cc__py_cls_float) return cc__py_obj_type(o) == cc__py_cls_float;
+    if (cc__py.FloatCheckExact) return cc__py.FloatCheckExact(o);
+    cc__py_cache_num_classes();
+    return cc__py_cls_float && cc__py_obj_type(o) == cc__py_cls_float;
+}
+
+/* CPython 3.12+ compact long — same dig nanobind uses via
+ * PyUnstable_Long_IsCompact/CompactValue when linked to the full API.
+ * Layout: PyObject_HEAD + lv_tag + digit[0].  Non-compact / pre-3.12
+ * falls through to AsLongLong. */
+typedef struct {
+    uintptr_t rc;
+    void *ty;
+    uintptr_t lv_tag;
+    uint32_t digit0;
+} CC__PyLongObj;
+
+#define CC__PY_LONG_SIGN_MASK 3u
+#define CC__PY_LONG_COMPACT_LIM (2u << 3) /* _PyLong_NON_SIZE_BITS == 3 */
+
+static inline int cc__py_compact_ll(void *o, long long *out) {
+    CC__PyLongObj *l = (CC__PyLongObj *)o;
+    uintptr_t tag = l->lv_tag;
+    intptr_t sign;
+    if (tag >= (uintptr_t)CC__PY_LONG_COMPACT_LIM) return 0;
+    sign = (intptr_t)1 - (intptr_t)(tag & CC__PY_LONG_SIGN_MASK);
+    *out = (long long)(sign * (intptr_t)l->digit0);
+    return 1;
+}
+
+static inline int cc__py_exact_float_val(void *o, double *out) {
+    *out = ((CC__PyFloatObj *)o)->fval;
+    return 0;
+}
+
+static inline int cc__py_in_ll_raw(void *o, const char *what, long long *out) {
+    long long (*as_ll)(void *) = cc__py.LongAsLongLong;
+    void *(*err_occ)(void) = cc__py.ErrOccurred;
+    void (*err_clr)(void) = cc__py.ErrClear;
+    long long v;
+    if (!o) return cc__py_in_fail("TypeError", what, "an integer");
+    /* Exact int: compact dig first; else AsLongLong without ErrOccurred
+     * (small/typical values cannot fail that converter). */
+    if (cc__py_is_exact_int(o)) {
+        if (cc__py_compact_ll(o, out)) return 0;
+        *out = as_ll(o);
+        return 0;
+    }
+    v = as_ll(o);
+    if (v == -1 && err_occ && err_occ()) {
+        if (err_clr) err_clr();
+        return cc__py_in_fail("TypeError", what, "an integer");
+    }
+    *out = v;
+    return 0;
+}
+
+static inline int cc__py_in_ull_raw(void *o, const char *what, unsigned long long *out) {
+    unsigned long long (*as_ull)(void *) = cc__py.LongAsUnsignedLongLong;
+    long long (*as_ll)(void *) = cc__py.LongAsLongLong;
+    void *(*err_occ)(void) = cc__py.ErrOccurred;
+    void (*err_clr)(void) = cc__py.ErrClear;
+    unsigned long long v;
+    long long s;
+    if (!o) return cc__py_in_fail("TypeError", what, "an integer");
+    if (cc__py_is_exact_int(o) && cc__py_compact_ll(o, &s)) {
+        if (s < 0)
+            return cc__py_in_fail("OverflowError", what,
+                                  "a non-negative integer");
+        *out = (unsigned long long)s;
+        return 0;
+    }
+    /* Unsigned converter — not AsLongLong — so values in
+     * (LLONG_MAX, ULLONG_MAX] round-trip into unsigned long long. */
+    v = as_ull(o);
+    if (v == (unsigned long long)-1 && err_occ && err_occ()) {
+        if (err_clr) err_clr();
+        /* Classify: negative → OverflowError; non-int / too large → match
+         * the signed path's TypeError-vs-Overflow posture. */
+        s = as_ll(o);
+        if (s == -1 && err_occ && err_occ()) {
+            if (err_clr) err_clr();
+            return cc__py_in_fail("TypeError", what, "an integer");
+        }
+        if (s < 0)
+            return cc__py_in_fail("OverflowError", what,
+                                  "a non-negative integer");
+        return cc__py_in_fail("OverflowError", what, "an integer in range");
+    }
+    *out = v;
+    return 0;
+}
+
+/* One wrapper per destination type, so `_Generic` dispatches on `&dst`.  The
+ * bounds are the destination's own, checked rather than truncated: a value
+ * that does not fit is an OverflowError, matching the extraction rule the
+ * `.as_*` accessors follow. */
+#define CC__PY_IN_SIGNED(NAME, T, LO, HI)                                      \
+    static int cc__py_in_##NAME(T *dst, void *o, const char *what) {           \
+        long long v;                                                            \
+        if (cc__py_in_ll_raw(o, what, &v) != 0) return -1;                      \
+        if (v < (long long)(LO) || v > (long long)(HI))                         \
+            return cc__py_in_fail("OverflowError", what,                        \
+                                  "an integer in range");                       \
+        *dst = (T)v;                                                            \
+        return 0;                                                               \
+    }
+#define CC__PY_IN_UNSIGNED(NAME, T, HI)                                        \
+    static int cc__py_in_##NAME(T *dst, void *o, const char *what) {           \
+        unsigned long long v;                                                   \
+        if (cc__py_in_ull_raw(o, what, &v) != 0) return -1;                     \
+        if (v > (unsigned long long)(HI))                                       \
+            return cc__py_in_fail("OverflowError", what,                        \
+                                  "an integer in range");                       \
+        *dst = (T)v;                                                            \
+        return 0;                                                               \
+    }
+
+CC__PY_IN_SIGNED(int, int, INT_MIN, INT_MAX)
+CC__PY_IN_SIGNED(long, long, LONG_MIN, LONG_MAX)
+CC__PY_IN_SIGNED(llong, long long, LLONG_MIN, LLONG_MAX)
+CC__PY_IN_UNSIGNED(uint, unsigned int, UINT_MAX)
+CC__PY_IN_UNSIGNED(ulong, unsigned long, ULONG_MAX)
+CC__PY_IN_UNSIGNED(ullong, unsigned long long, ULLONG_MAX)
+
+/* A Python int converts to float exactly as `float(x)` does, so an integer
+ * argument to a `double` parameter is accepted. */
+static inline int cc__py_in_double(double *dst, void *o, const char *what) {
+    double (*as_f)(void *) = cc__py.FloatAsDouble;
+    long long (*as_ll)(void *) = cc__py.LongAsLongLong;
+    void *(*err_occ)(void) = cc__py.ErrOccurred;
+    void (*err_clr)(void) = cc__py.ErrClear;
+    double v;
+    long long iv;
+    if (!o) return cc__py_in_fail("TypeError", what, "a number");
+    /* Exact float: dig ob_fval — no FloatAsDouble, no error TLS. */
+    if (cc__py_is_exact_float(o)) {
+        (void)cc__py_exact_float_val(o, dst);
+        return 0;
+    }
+    /* Exact int → float(x), matching prior acceptance of Python ints. */
+    if (cc__py_is_exact_int(o)) {
+        if (cc__py_compact_ll(o, &iv)) {
+            *dst = (double)iv;
+            return 0;
+        }
+        *dst = (double)as_ll(o);
+        return 0;
+    }
+    v = as_f(o);
+    if (v == -1.0 && err_occ && err_occ()) {
+        if (err_clr) err_clr();
+        return cc__py_in_fail("TypeError", what, "a number");
+    }
+    *dst = v;
+    return 0;
+}
+
+static int cc__py_in_float(float *dst, void *o, const char *what) {
+    double v;
+    if (cc__py_in_double(&v, o, what) != 0) return -1;
+    *dst = (float)v;
+    return 0;
+}
+
+static int cc__py_in_bool(_Bool *dst, void *o, const char *what) {
+    long long v;
+    if (cc__py_in_ll_raw(o, what, &v) != 0) return -1;
+    *dst = (v != 0);
+    return 0;
+}
+
+/* `str` arrives as a slice over CPython's own UTF-8 buffer, which lives as
+ * long as the argument object does — the whole call, since the args tuple
+ * holds it.  A trampoline that keeps the bytes past its return must copy. */
+static int cc__py_in_slice(CCSlice *dst, void *o, const char *what) {
+    intptr_t n = 0;
+    const char *p;
+    if (!o) return cc__py_in_fail("TypeError", what, "a str");
+    p = cc__py.AsUTF8AndSize(o, &n);
+    if (!p) {
+        cc__py.ErrClear();
+        return cc__py_in_fail("TypeError", what, "a str");
+    }
+    /* Untracked on purpose: the bytes are CPython's, not an arena's, and the
+     * slice must not claim a provenance epoch it does not own. */
+    *dst = cc_slice_from_buffer((char *)p, (size_t)n);
+    return 0;
+}
+
+/* Call-scoped borrow of a Python `str` object.  Prefer this over `CCSlice`
+ * when the callee wants Unicode scalars: `s.codepoints(arena)` fills a
+ * `uint32_t[:]` via Stable-ABI UCS4 and never round-trips UTF-8. */
+typedef struct CCPyStr {
+    void *o;
+} CCPyStr;
+
+static int cc__py_in_pystr(CCPyStr *dst, void *o, const char *what) {
+    intptr_t n;
+    if (!o || !dst) return cc__py_in_fail("TypeError", what, "a str");
+    if (!cc__py.UnicodeGetLength) return cc__py_in_fail("TypeError", what, "a str");
+    n = cc__py.UnicodeGetLength(o);
+    if (n < 0) {
+        cc__py.ErrClear();
+        return cc__py_in_fail("TypeError", what, "a str");
+    }
+    dst->o = o;
+    return 0;
+}
+
+#ifndef CCResult_CCSlice_uint32_t_CCError_DEFINED
+#define CCResult_CCSlice_uint32_t_CCError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCSlice_uint32_t_CCError_DEFINED
+#define CCResult_CCSlice_uint32_t_CCError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCSlice_uint32_t_CCError, CCSlice_uint32_t, CCError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_CCSlice_uint32_t_CCError, CCSlice_uint32_t, CCError)
+#endif
+
+/* UFCS: `s.codepoints(arena)` — object first, arena last. */
+static CCResult_CCSlice_uint32_t_CCError
+cc_py_str_codepoints(CCPyStr *s, CCArena *arena) {
+    CCSlice_uint32_t out;
+    intptr_t n;
+    uint32_t *buf;
+    CCSlice base;
+    void *o = s ? s->o : NULL;
+    memset(&out, 0, sizeof(out));
+    if (!arena) {
+        return cc_err_CCResult_CCSlice_uint32_t_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "codepoints without arena"));
+    }
+    if (!o || !cc__py.UnicodeGetLength || !cc__py.UnicodeAsUCS4) {
+        return cc_err_CCResult_CCSlice_uint32_t_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "codepoints: not a str"));
+    }
+    n = cc__py.UnicodeGetLength(o);
+    if (n < 0) {
+        cc__py.ErrClear();
+        return cc_err_CCResult_CCSlice_uint32_t_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "codepoints: not a str"));
+    }
+    if (n == 0) return cc_ok_CCResult_CCSlice_uint32_t_CCError(out);
+    base = cc_arena_alloc_slice(arena, sizeof(uint32_t), (size_t)n,
+                                _Alignof(uint32_t));
+    if (!base.ptr) {
+        return cc_err_CCResult_CCSlice_uint32_t_CCError(CC_ERROR(CC_ERR_OUT_OF_MEMORY, "codepoints"));
+    }
+    buf = (uint32_t *)base.ptr;
+    if (!cc__py.UnicodeAsUCS4(o, buf, n, 0)) {
+        cc__py.ErrClear();
+        return cc_err_CCResult_CCSlice_uint32_t_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "codepoints: UCS4 export failed"));
+    }
+    out.base = base;
+    return cc_ok_CCResult_CCSlice_uint32_t_CCError(out);
+}
+
+static CCResult_CCSlice_uint32_t_CCError
+CCPyStr_codepoints(CCPyStr *s, CCArena *arena) {
+    return cc_py_str_codepoints(s, arena);
+}
+
+/* A `const char*` parameter truncates at an embedded NUL, the same asymmetry
+ * the outbound direction has; a slice carries arbitrary bytes. */
+static int cc__py_in_cstr(const char **dst, void *o, const char *what) {
+    CCSlice s;
+    if (cc__py_in_slice(&s, o, what) != 0) return -1;
+    *dst = s.ptr;
+    return 0;
+}
+
+/* ---- typed slices (double[:] / float[:] / int[:] …) for module export ----
+ *
+ * Mirror of js.cch's CC__JS_TS_ARM: a contiguous buffer exporter whose
+ * element format matches (numpy ndarray, array.array, memoryview) borrows
+ * zero-copy and writable for the call; a list or mismatched dtype converts
+ * per element into call scratch.  Returns materialize a fresh typed
+ * memoryview over an owned copy (list fallback when the capsule/buffer
+ * APIs are absent). */
+/* Call-scratch for typed-slice convert: size-class CCArenaPool (same
+ * shape as closure envs).  The pool freelist is the recycle path —
+ * begin() pushes live slots back instead of free(), so a warm path
+ * never hits malloc.  Oversized buffers still malloc/free. */
+#define CC__PY_TS_SCRATCH_SLOTS 16
+enum { CC__PY_TS_NCLASS = 6 };
+static const size_t cc__py_ts_class_size[CC__PY_TS_NCLASS] = {
+    64, 256, 1024, 4096, 16384, 65536
+};
+
+typedef struct {
+    void *p;
+    int cls; /* index into class table, or -1 for malloc overflow */
+} CC__PyTsSlot;
+
+typedef struct {
+    CCArenaPool pool[CC__PY_TS_NCLASS];
+    int ready;
+} CC__PyTsPools;
+
+static CC_THREAD_LOCAL CC__PyTsPools cc__py_ts_pools;
+static CC_THREAD_LOCAL CC__PyTsSlot cc__py_ts_bufs[CC__PY_TS_SCRATCH_SLOTS];
+static CC_THREAD_LOCAL int cc__py_ts_nbufs;
+
+static int cc__py_ts_class_for(size_t n) {
+    int i;
+    for (i = 0; i < CC__PY_TS_NCLASS; i++) {
+        if (n <= cc__py_ts_class_size[i]) return i;
+    }
+    return -1;
+}
+
+static int cc__py_ts_pools_ensure(void) {
+    int i;
+    if (cc__py_ts_pools.ready) return 1;
+    for (i = 0; i < CC__PY_TS_NCLASS; i++) {
+        if (cc_arena_pool(&cc__py_ts_pools.pool[i],
+                          cc__py_ts_class_size[i]) != 0) {
+            while (i-- > 0) cc_arena_pool_destroy(&cc__py_ts_pools.pool[i]);
+            return 0;
+        }
+    }
+    cc__py_ts_pools.ready = 1;
+    return 1;
+}
+
+static void cc__py_ts_scratch_begin(void) {
+    int i;
+    for (i = 0; i < cc__py_ts_nbufs; i++) {
+        CC__PyTsSlot s = cc__py_ts_bufs[i];
+        if (s.cls < 0) free(s.p);
+        else cc_arena_pool_free(&cc__py_ts_pools.pool[s.cls], s.p);
+    }
+    cc__py_ts_nbufs = 0;
+}
+
+static void *cc__py_ts_scratch(size_t n) {
+    void *p;
+    int cls;
+    if (n == 0) n = 1;
+    if (cc__py_ts_nbufs >= CC__PY_TS_SCRATCH_SLOTS) return NULL;
+    cls = cc__py_ts_class_for(n);
+    if (cls < 0) {
+        p = malloc(n);
+    } else if (!cc__py_ts_pools_ensure()) {
+        p = malloc(n);
+        cls = -1;
+    } else {
+        p = cc_arena_pool_alloc(&cc__py_ts_pools.pool[cls]);
+    }
+    if (!p) return NULL;
+    cc__py_ts_bufs[cc__py_ts_nbufs].p = p;
+    cc__py_ts_bufs[cc__py_ts_nbufs].cls = cls;
+    cc__py_ts_nbufs++;
+    return p;
+}
+
+static int cc__py_ts_format_ok(const char *fmt, int esz, int isf, int iss) {
+    char c;
+    if (!fmt || !fmt[0]) return 0;
+    {
+        const char *p = fmt;
+        if (*p == '@' || *p == '=') p++;
+        else if (*p == '<' || *p == '>' || *p == '!') return 0;
+        if (!p[0] || p[1]) return 0;
+        c = p[0];
+    }
+    if (isf) return (esz == 8 && c == 'd') || (esz == 4 && c == 'f');
+    if (iss) {
+        return (esz == 8 && (c == 'q' || c == 'l' || c == 'n')) ||
+               (esz == 4 && (c == 'i' || c == 'l')) ||
+               (esz == 2 && c == 'h') || (esz == 1 && c == 'b');
+    }
+    return (esz == 8 && (c == 'Q' || c == 'L')) ||
+           (esz == 4 && (c == 'I' || c == 'L')) ||
+           (esz == 2 && c == 'H') || (esz == 1 && c == 'B');
+}
+
+static int cc__py_ts_store_elem(void *item, void *dst, int esz, int isf,
+                                int iss) {
+    if (isf) {
+        double d = cc__py.FloatAsDouble(item);
+        if (d == -1.0 && cc__py.ErrOccurred()) return -1;
+        if (esz == 4) *(float *)dst = (float)d;
+        else *(double *)dst = d;
+        return 0;
+    }
+    if (iss) {
+        long long v = cc__py.LongAsLongLong(item);
+        if (v == -1 && cc__py.ErrOccurred()) return -1;
+        if (esz == 8) *(long long *)dst = v;
+        else if (esz == 4) {
+            if (v < (long long)INT_MIN || v > (long long)INT_MAX) return -2;
+            *(int *)dst = (int)v;
+        } else if (esz == 2) {
+            if (v < -32768 || v > 32767) return -2;
+            *(short *)dst = (short)v;
+        } else {
+            if (v < -128 || v > 127) return -2;
+            *(signed char *)dst = (signed char)v;
+        }
+        return 0;
+    }
+    {
+        unsigned long long v = cc__py.LongAsUnsignedLongLong(item);
+        if (v == (unsigned long long)-1 && cc__py.ErrOccurred()) return -1;
+        if (esz == 8) *(unsigned long long *)dst = v;
+        else if (esz == 4) {
+            if (v > UINT_MAX) return -2;
+            *(unsigned int *)dst = (unsigned int)v;
+        } else if (esz == 2) {
+            if (v > 65535u) return -2;
+            *(unsigned short *)dst = (unsigned short)v;
+        } else {
+            if (v > 255u) return -2;
+            *(unsigned char *)dst = (unsigned char)v;
+        }
+        return 0;
+    }
+}
+
+/* Borrow matching buffer, else convert sequence into call scratch. */
+static int cc__py_inq_tslice(void *o, CCSlice *out, int esz, int isf, int iss) {
+    CC__PyBuffer view;
+    intptr_t n, i;
+    unsigned char *buf;
+    if (!o || !out || esz <= 0) return -1;
+    if (cc__py.GetBuffer && cc__py.ReleaseBuffer) {
+        memset(&view, 0, sizeof(view));
+        if (cc__py.GetBuffer(o, &view, CC__PYBUF_CONTIG_FMT) == 0) {
+            if (view.ndim == 1 && view.itemsize == (intptr_t)esz &&
+                cc__py_ts_format_ok(view.format, esz, isf, iss) &&
+                view.len >= 0 && view.itemsize &&
+                (view.len % view.itemsize) == 0) {
+                size_t count = (size_t)view.len / (size_t)esz;
+                *out = cc_slice_from_buffer(view.buf, count);
+                cc__py.ReleaseBuffer(&view);
+                return 0; /* writable borrow while `o` stays alive */
+            }
+            cc__py.ReleaseBuffer(&view);
+        } else if (cc__py.ErrClear) {
+            cc__py.ErrClear();
+        }
+    }
+    if (!cc__py.SequenceSize || !cc__py.SequenceGetItem) return -1;
+    n = cc__py.SequenceSize(o);
+    if (n < 0) {
+        if (cc__py.ErrClear) cc__py.ErrClear();
+        return -1;
+    }
+    if ((size_t)n > (size_t)-1 / (size_t)esz) return -1;
+    buf = (unsigned char *)cc__py_ts_scratch((size_t)n * (size_t)esz);
+    if (!buf) return -1;
+    for (i = 0; i < n; i++) {
+        void *item = cc__py.SequenceGetItem(o, i);
+        int rc;
+        if (!item) {
+            if (cc__py.ErrClear) cc__py.ErrClear();
+            return -1;
+        }
+        rc = cc__py_ts_store_elem(item, buf + (size_t)i * (size_t)esz, esz, isf,
+                                  iss);
+        cc__py.DecRef(item);
+        if (rc != 0) {
+            if (cc__py.ErrClear) cc__py.ErrClear();
+            return rc;
+        }
+    }
+    *out = cc_slice_from_buffer(buf, (size_t)n);
+    return 0;
+}
+
+typedef struct CC__PyTsliceOwned {
+    intptr_t shape;
+    char fmt[2];
+    /* element bytes follow */
+} CC__PyTsliceOwned;
+
+static void cc__py_tslice_cap_dtor(void *capsule) {
+    void *p = cc__py.CapsuleGetPointer
+                  ? cc__py.CapsuleGetPointer(capsule, "cc.tslice")
+                  : NULL;
+    free(p);
+}
+
+static void *cc__py_out_tslice_list(CCSlice s, int esz, int isf, int iss) {
+    void *list;
+    size_t i;
+    const unsigned char *base = (const unsigned char *)s.ptr;
+    list = cc__py.ListNew((intptr_t)s.len);
+    if (!list) return NULL;
+    for (i = 0; i < s.len; i++) {
+        const void *e = base ? base + i * (size_t)esz : NULL;
+        void *ev = NULL;
+        if (!e) {
+            cc__py.DecRef(list);
+            return NULL;
+        }
+        if (isf) {
+            ev = cc__py.FloatFromDouble(esz == 4 ? (double)*(const float *)e
+                                                 : *(const double *)e);
+        } else if (iss) {
+            long long x = esz == 1   ? (long long)*(const signed char *)e
+                          : esz == 2 ? (long long)*(const short *)e
+                          : esz == 4 ? (long long)*(const int *)e
+                                     : *(const long long *)e;
+            ev = cc__py.LongFromLongLong(x);
+        } else {
+            unsigned long long x =
+                esz == 1   ? (unsigned long long)*(const unsigned char *)e
+                : esz == 2 ? (unsigned long long)*(const unsigned short *)e
+                : esz == 4 ? (unsigned long long)*(const unsigned int *)e
+                           : *(const unsigned long long *)e;
+            ev = cc__py.LongFromUnsignedLongLong(x);
+        }
+        if (!ev || cc__py.ListSetItem(list, (intptr_t)i, ev) != 0) {
+            cc__py.DecRef(list);
+            return NULL;
+        }
+    }
+    return list;
+}
+
+/* Fresh typed memoryview over an owned copy — numpy.asarray wraps it. */
+static void *cc__py_out_tslice(CCSlice s, int esz, int isf, int iss) {
+    size_t bytes = s.len * (size_t)esz;
+    CC__PyTsliceOwned *own = NULL;
+    void *cap = NULL;
+    void *mv = NULL;
+    CC__PyBuffer pb;
+    char fmtc;
+    if (esz <= 0) return NULL;
+    fmtc = isf ? (esz == 4 ? 'f' : 'd')
+               : esz == 1 ? (iss ? 'b' : 'B')
+               : esz == 2 ? (iss ? 'h' : 'H')
+               : esz == 4 ? (iss ? 'i' : 'I')
+                          : (iss ? 'q' : 'Q');
+    if (cc__py.MemoryViewFromBuffer && cc__py.CapsuleNew &&
+        cc__py.CapsuleGetPointer) {
+        own = (CC__PyTsliceOwned *)malloc(sizeof(*own) + bytes);
+        if (!own && bytes) return NULL;
+        if (!own) {
+            /* empty: still need a header for shape/format */
+            own = (CC__PyTsliceOwned *)malloc(sizeof(*own));
+            if (!own) return NULL;
+        }
+        own->shape = (intptr_t)s.len;
+        own->fmt[0] = fmtc;
+        own->fmt[1] = 0;
+        if (bytes && s.ptr) memcpy(own + 1, s.ptr, bytes);
+        else if (bytes) memset(own + 1, 0, bytes);
+        cap = cc__py.CapsuleNew(own, "cc.tslice",
+                                (void *)cc__py_tslice_cap_dtor);
+        if (!cap) {
+            free(own);
+            return NULL;
+        }
+        memset(&pb, 0, sizeof(pb));
+        pb.buf = bytes ? (void *)(own + 1) : (void *)own;
+        pb.obj = cap;
+        pb.len = (intptr_t)bytes;
+        pb.itemsize = esz;
+        pb.readonly = 0;
+        pb.ndim = 1;
+        pb.format = own->fmt;
+        pb.shape = &own->shape;
+        mv = cc__py.MemoryViewFromBuffer(&pb);
+        if (!mv) {
+            cc__py.DecRef(cap);
+            if (cc__py.ErrClear) cc__py.ErrClear();
+            return cc__py_out_tslice_list(s, esz, isf, iss);
+        }
+        return mv;
+    }
+    return cc__py_out_tslice_list(s, esz, isf, iss);
+}
+
+#define CC__PY_TS_ARM(NAME, T)                                                 \
+    static int cc__py_in_ts_##NAME(NAME *dst, void *o, const char *what) {     \
+        int rc = cc__py_inq_tslice(o, &dst->base, (int)sizeof(T),              \
+                                   _Generic((T)0, float: 1, double: 1,          \
+                                            default: 0),                        \
+                                   (((T)-1) < ((T)1) ? 1 : 0));                 \
+        if (rc == 0) return 0;                                                 \
+        return cc__py_in_fail("TypeError", what,                               \
+                              rc == -2 ? "sequence elements in range"          \
+                                       : "a 1-D buffer or sequence of "        \
+                                         "matching elements");                 \
+    }                                                                          \
+    static void *cc__py_out_ts_##NAME(NAME v) {                                \
+        return cc__py_out_tslice(v.base, (int)sizeof(T),                       \
+                                 _Generic((T)0, float: 1, double: 1,            \
+                                          default: 0),                         \
+                                 (((T)-1) < ((T)1) ? 1 : 0));                  \
+    }
+
+CC__PY_TS_ARM(CCSlice_short, short)
+CC__PY_TS_ARM(CCSlice_int, int)
+CC__PY_TS_ARM(CCSlice_long, long)
+CC__PY_TS_ARM(CCSlice_long_long, long long)
+CC__PY_TS_ARM(CCSlice_int16_t, int16_t)
+CC__PY_TS_ARM(CCSlice_int32_t, int32_t)
+CC__PY_TS_ARM(CCSlice_int64_t, int64_t)
+CC__PY_TS_ARM(CCSlice_float, float)
+CC__PY_TS_ARM(CCSlice_double, double)
+#undef CC__PY_TS_ARM
+
+/* A `_Generic` selection is an integer constant expression, so "does this type
+ * convert" is decidable in a constant context — which is where the diagnostic
+ * belongs.  A bare `default:` arm is not enough: passing an incompatible
+ * pointer is only a warning on most compilers, so the build would get all the
+ * way to an undefined-reference at link, reporting the failure far from the
+ * call and saying nothing about why.  `cc_static_assert` is a hard error
+ * everywhere, and its NAME is the message. */
+#define CC__PY_IN_SUPPORTED(lv)                             \
+    _Generic(&(lv),                                         \
+        int *: 1,                                           \
+        long *: 1,                                          \
+        long long *: 1,                                     \
+        unsigned int *: 1,                                  \
+        unsigned long *: 1,                                 \
+        unsigned long long *: 1,                            \
+        double *: 1,                                        \
+        float *: 1,                                         \
+        _Bool *: 1,                                         \
+        CCSlice *: 1,                                       \
+        CCSlice_short *: 1,                                 \
+        CCSlice_int *: 1,                                   \
+        CCSlice_long *: 1,                                  \
+        CCSlice_long_long *: 1,                             \
+        CCSlice_int16_t *: 1,                               \
+        CCSlice_int32_t *: 1,                               \
+        CCSlice_int64_t *: 1,                               \
+        CCSlice_float *: 1,                                 \
+        CCSlice_double *: 1,                                \
+        CCPyStr *: 1,                                       \
+        const char **: 1,                                   \
+        char **: 1,                                         \
+        default: 0)
+
+/* Keeps the selection well-formed so the bitfield above is the error the user
+ * reads.  Declared, never defined: the constant check stops the build first. */
+struct cc__py_parameter_type_has_no_python_conversion;
+extern int cc__py_in_unsupported(
+        struct cc__py_parameter_type_has_no_python_conversion *dst,
+        void *o, const char *what);
+
+/* Unmarshal Python object `o` into the existing lvalue `lv`.  Yields 0 / -1. */
+#define CC_PY_IN(lv, o)                                     \
+    (cc_static_assert(CC__PY_IN_SUPPORTED(lv),              \
+                      cc__py_parameter_type_has_no_python_conversion), \
+     _Generic(&(lv),                                        \
+        int *: cc__py_in_int,                               \
+        long *: cc__py_in_long,                             \
+        long long *: cc__py_in_llong,                       \
+        unsigned int *: cc__py_in_uint,                     \
+        unsigned long *: cc__py_in_ulong,                   \
+        unsigned long long *: cc__py_in_ullong,             \
+        double *: cc__py_in_double,                         \
+        float *: cc__py_in_float,                           \
+        _Bool *: cc__py_in_bool,                            \
+        CCSlice *: cc__py_in_slice,                         \
+        CCSlice_short *: cc__py_in_ts_CCSlice_short,        \
+        CCSlice_int *: cc__py_in_ts_CCSlice_int,            \
+        CCSlice_long *: cc__py_in_ts_CCSlice_long,          \
+        CCSlice_long_long *: cc__py_in_ts_CCSlice_long_long,\
+        CCSlice_int16_t *: cc__py_in_ts_CCSlice_int16_t,    \
+        CCSlice_int32_t *: cc__py_in_ts_CCSlice_int32_t,    \
+        CCSlice_int64_t *: cc__py_in_ts_CCSlice_int64_t,    \
+        CCSlice_float *: cc__py_in_ts_CCSlice_float,        \
+        CCSlice_double *: cc__py_in_ts_CCSlice_double,      \
+        CCPyStr *: cc__py_in_pystr,                         \
+        const char **: cc__py_in_cstr,                      \
+        char **: cc__py_in_cstr,                            \
+        default: cc__py_in_unsupported)(&(lv), (o), #lv))
+
+/* The return direction, same posture: `_Generic` on the value, a new reference
+ * out, NULL with an exception set on failure. */
+static void *cc__py_out_ll(long long v) { return cc__py.LongFromLongLong(v); }
+static void *cc__py_out_ull(unsigned long long v) {
+    return cc__py.LongFromUnsignedLongLong(v);
+}
+static void *cc__py_out_dbl(double v) { return cc__py.FloatFromDouble(v); }
+static void *cc__py_out_bool(_Bool v) { return cc__py.BoolFromLong(v ? 1 : 0); }
+static void *cc__py_out_slice(CCSlice s) {
+    return cc__py.UnicodeFromStringAndSize(s.ptr ? s.ptr : "", (intptr_t)s.len);
+}
+static void *cc__py_out_cstr(const char *s) {
+    return cc__py.UnicodeFromStringAndSize(s ? s : "", (intptr_t)(s ? strlen(s) : 0));
+}
+
+#define CC__PY_OUT_SUPPORTED(v)                             \
+    _Generic((v),                                           \
+        int: 1,                                             \
+        long: 1,                                            \
+        long long: 1,                                       \
+        unsigned int: 1,                                    \
+        unsigned long: 1,                                   \
+        unsigned long long: 1,                              \
+        double: 1,                                          \
+        float: 1,                                           \
+        _Bool: 1,                                           \
+        CCSlice: 1,                                         \
+        CCSlice_short: 1,                                   \
+        CCSlice_int: 1,                                     \
+        CCSlice_long: 1,                                    \
+        CCSlice_long_long: 1,                               \
+        CCSlice_int16_t: 1,                                 \
+        CCSlice_int32_t: 1,                                 \
+        CCSlice_int64_t: 1,                                 \
+        CCSlice_float: 1,                                   \
+        CCSlice_double: 1,                                  \
+        const char *: 1,                                    \
+        char *: 1,                                          \
+        default: 0)
+
+struct cc__py_return_type_has_no_python_conversion;
+extern void *cc__py_out_unsupported(
+        struct cc__py_return_type_has_no_python_conversion *v);
+
+#define CC_PY_OUT(v)                                        \
+    (cc_static_assert(CC__PY_OUT_SUPPORTED(v),              \
+                      cc__py_return_type_has_no_python_conversion), \
+     _Generic((v),                                          \
+        int: cc__py_out_ll,                                 \
+        long: cc__py_out_ll,                                \
+        long long: cc__py_out_ll,                           \
+        unsigned int: cc__py_out_ull,                       \
+        unsigned long: cc__py_out_ull,                      \
+        unsigned long long: cc__py_out_ull,                 \
+        double: cc__py_out_dbl,                             \
+        float: cc__py_out_dbl,                              \
+        _Bool: cc__py_out_bool,                             \
+        CCSlice: cc__py_out_slice,                          \
+        CCSlice_short: cc__py_out_ts_CCSlice_short,         \
+        CCSlice_int: cc__py_out_ts_CCSlice_int,             \
+        CCSlice_long: cc__py_out_ts_CCSlice_long,           \
+        CCSlice_long_long: cc__py_out_ts_CCSlice_long_long, \
+        CCSlice_int16_t: cc__py_out_ts_CCSlice_int16_t,     \
+        CCSlice_int32_t: cc__py_out_ts_CCSlice_int32_t,     \
+        CCSlice_int64_t: cc__py_out_ts_CCSlice_int64_t,     \
+        CCSlice_float: cc__py_out_ts_CCSlice_float,         \
+        CCSlice_double: cc__py_out_ts_CCSlice_double,       \
+        const char *: cc__py_out_cstr,                      \
+        char *: cc__py_out_cstr,                            \
+        default: cc__py_out_unsupported)(v))
+
+/* Arity is checked once, before any argument is read, so a zero-parameter
+ * export rejects extra arguments too — a per-argument check would never run
+ * for one and would silently accept them.  0 ok, -1 raised. */
+static int cc__py_arity_ok(void *args, int want, const char *fname) {
+    /* `METH_VARARGS` always hands over a tuple, so the sequence protocol is
+     * generality this path never uses. */
+    intptr_t n = !args ? 0
+                       : (cc__py.TupleSize ? cc__py.TupleSize(args)
+                                           : cc__py.SequenceSize(args));
+    if (n == (intptr_t)want) return 0;
+    {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "%s() takes exactly %d argument%s (%d given)",
+                 fname, want, want == 1 ? "" : "s", (int)(n < 0 ? 0 : n));
+        cc__py.ErrClear();
+        cc__py_raise_as("TypeError", buf);
+    }
+    return -1;
+}
+
+/* Read positional argument `i`.  The reference is borrowed for the length of
+ * the call: the args tuple holds it, and the tuple outlives the trampoline. */
+/* Arity for a positional-only fastcall entry (legacy / no kwnames). */
+static int cc__py_arity_ok_fast(intptr_t nargs, int want, const char *fname) {
+    if (nargs == (intptr_t)want) return 0;
+    {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "%s() takes exactly %d argument%s (%d given)",
+                 fname, want, want == 1 ? "" : "s", (int)(nargs < 0 ? 0 : nargs));
+        cc__py.ErrClear();
+        cc__py_raise_as("TypeError", buf);
+    }
+    return -1;
+}
+
+/* Bind positionals + keywords into `out[want]` (borrowed refs).  `names`
+ * are the reflected parameter names (receiver excluded).  A NULL `optional`
+ * means every slot is required; otherwise `optional[j] != 0` leaves a missing
+ * slot as NULL for the trampoline to fill from a C default.  0 ok, -1 raised. */
+static int cc__py_bind_fast(void *const *args, intptr_t nargs, void *kwnames,
+                            int want, const char *const *names,
+                            const unsigned char *optional, void **out,
+                            const char *fname) {
+    intptr_t nkw = 0;
+    intptr_t i;
+    int j;
+    if (want < 0) want = 0;
+    if (nargs < 0) nargs = 0;
+    /* Hot path: all positionals, no keywords — copy and return. */
+    if (!kwnames && nargs == (intptr_t)want) {
+        for (j = 0; j < want; j++) out[j] = (void *)args[j];
+        return 0;
+    }
+    if (kwnames && cc__py.TupleSize) {
+        nkw = cc__py.TupleSize(kwnames);
+        if (nkw < 0) {
+            cc__py.ErrClear();
+            nkw = 0;
+        }
+    }
+    if (nargs > (intptr_t)want) {
+        char buf[160];
+        snprintf(buf, sizeof(buf),
+                 "%s() takes %d positional argument%s but %d were given", fname,
+                 want, want == 1 ? "" : "s", (int)nargs);
+        cc__py.ErrClear();
+        cc__py_raise_as("TypeError", buf);
+        return -1;
+    }
+    for (j = 0; j < want; j++) out[j] = NULL;
+    for (i = 0; i < nargs; i++) out[i] = args[i];
+    for (i = 0; i < nkw; i++) {
+        void *kn = cc__py.TupleGetItem ? cc__py.TupleGetItem(kwnames, i) : NULL;
+        intptr_t knlen = 0;
+        const char *ks;
+        int slot = -1;
+        char buf[192];
+        if (!kn) {
+            cc__py.ErrClear();
+            cc__py_raise_as("TypeError", fname);
+            return -1;
+        }
+        ks = cc__py.AsUTF8AndSize(kn, &knlen);
+        if (!ks) {
+            cc__py.ErrClear();
+            cc__py_raise_as("TypeError", fname);
+            return -1;
+        }
+        for (j = 0; j < want; j++) {
+            if (names[j] && strcmp(names[j], ks) == 0) {
+                slot = j;
+                break;
+            }
+        }
+        if (slot < 0) {
+            snprintf(buf, sizeof(buf),
+                     "%s() got an unexpected keyword argument '%s'", fname, ks);
+            cc__py.ErrClear();
+            cc__py_raise_as("TypeError", buf);
+            return -1;
+        }
+        if (out[slot]) {
+            snprintf(buf, sizeof(buf),
+                     "%s() got multiple values for argument '%s'", fname, ks);
+            cc__py.ErrClear();
+            cc__py_raise_as("TypeError", buf);
+            return -1;
+        }
+        out[slot] = args[nargs + i];
+    }
+    for (j = 0; j < want; j++) {
+        if (!out[j] && !(optional && optional[j])) {
+            char buf[192];
+            snprintf(buf, sizeof(buf), "%s() missing required argument '%s'",
+                     fname, names[j] ? names[j] : "?");
+            cc__py.ErrClear();
+            cc__py_raise_as("TypeError", buf);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void *cc__py_arg_at(void *args, int i, const char *fname) {
+    void *o;
+    if (cc__py.TupleGetItem) {
+        /* Already borrowed: no incref to undo.  The sequence path returns a
+         * new reference, so it had to DecRef straight back to borrowed —
+         * a refcount round-trip per argument, per call. */
+        o = cc__py.TupleGetItem(args, (intptr_t)i);
+        if (!o) { cc__py.ErrClear(); return cc__py_raise_as("TypeError", fname); }
+        return o;
+    }
+    o = cc__py.SequenceGetItem(args, (intptr_t)i);
+    if (!o) { cc__py.ErrClear(); return cc__py_raise_as("TypeError", fname); }
+    cc__py.DecRef(o);
+    return o;
+}
+
+/* `None` is a data symbol, so it is fetched the same way exception classes
+ * are — by name, out of `builtins`.  Returns a new reference. */
+static void *cc__py_none(void) {
+    /* `None` is one immortal object for the whole process, not per
+     * interpreter, so the lookup is cached: importing `builtins` and reading
+     * the attribute on every call made a void export pay a module import and
+     * a dict lookup to return nothing. */
+    static void *cached = NULL;
+    void *n = cached;
+    if (!n) {
+        void *b = cc__py.ImportModule("builtins");
+        n = b ? cc__py.GetAttrString(b, "None") : NULL;
+        if (b) cc__py.DecRef(b);
+        if (!n) return cc__py_raise("cc.host: None unavailable");
+        /* The cached reference is never dropped — it names an immortal
+         * object, and the cache outlives any one interpreter. */
+        cached = n;
+    }
+    /* The caller owns what it returns to Python. */
+    cc__py.IncRef(n);
+    return n;
+}
+
+/* Host state lives in PER-MODULE state, not in a capture: each interpreter
+ * gets its own module instance and therefore its own state, which is what a
+ * per-interpreter GIL requires anyway.  The module is the receiver — an
+ * exported function reaches host state through `self`, the same shape as
+ * `recv.method(args)`.
+ *
+ * `host` is the handle that created this instance, or NULL when the module
+ * is loaded without a CC host.  A module that cannot work without one fails
+ * its init, which Python reports as an ordinary ImportError. */
+typedef struct CCHostState {
+    CCArena *arena;   /* the host's arena, or NULL with no CC host */
+    long long counter;
+} CCHostState;
+
+/* `cc.host` exposes CCHostState: every method of the type becomes a function
+ * of the module, and the receiver is the module's own state.  That is the same
+ * rule the language already has — declaring a function whose first parameter
+ * is `T` IS declaring a method of `T` — so nothing here is a second way to
+ * say what a member is. */
+static long long cc_host_add(CCHostState *self, long long a, long long b) {
+    (void)self;
+    return a + b;
+}
+static long long cc_host_bump(CCHostState *self, long long by) {
+    self->counter += by;
+    return self->counter;
+}
+static void cc_host_reset(CCHostState *self) { self->counter = 0; }
+
+/* Module methods are reminted so `self` is a capsule holding the state
+ * pointer — no TLS and no PyModule_GetState on the hot path. */
+#define CC__PY_MODSTATE_CAP "cc-py.modstate"
+
+static void *cc__py_capsule_ty; /* type of capsules we mint; for fast self */
+
+static inline void *cc__py_callable_state(void *self) {
+    if (!self) return NULL;
+    /* Hot: reminted method — self is our capsule; pointer at HEAD+1 word. */
+    if (cc__py_capsule_ty && cc__py_obj_type(self) == cc__py_capsule_ty)
+        return ((void **)self)[2];
+    if (cc__py.CapsuleGetPointer) {
+        void *st = cc__py.CapsuleGetPointer(self, CC__PY_MODSTATE_CAP);
+        if (st) {
+            if (!cc__py_capsule_ty)
+                cc__py_capsule_ty = cc__py_obj_type(self);
+            return st;
+        }
+        if (cc__py.ErrOccurred) cc__py.ErrClear();
+    }
+    return cc__py.ModuleGetState ? cc__py.ModuleGetState(self) : NULL;
+}
+
+/* Replace each m_methods entry with a CFunction whose m_self is a capsule
+ * around `state`.  Overwrites the auto-bound attrs; 0 ok, -1 soft-fail
+ * (caller keeps module-as-self trampolines). */
+static int cc__py_bind_mod_methods(void *mod, void *state,
+                                   CC__PyMethodDef *methods) {
+    CC__PyMethodDef *m;
+    if (!mod || !state || !methods) return -1;
+    if (!cc__py.CFunctionNewEx || !cc__py.CapsuleNew ||
+        !cc__py.ObjectSetAttrString)
+        return -1;
+    /* Warm type/exception caches once so the first call is not a cold miss. */
+    cc__py_cache_num_classes();
+    if (!cc__py_exc_typeerror)
+        cc__py_exc_typeerror = cc__py_exc_lookup("TypeError");
+    if (!cc__py_exc_overflow)
+        cc__py_exc_overflow = cc__py_exc_lookup("OverflowError");
+    if (!cc__py_exc_runtime)
+        cc__py_exc_runtime = cc__py_exc_lookup("RuntimeError");
+    for (m = methods; m->ml_name; m++) {
+        void *cap = cc__py.CapsuleNew(state, CC__PY_MODSTATE_CAP, NULL);
+        void *fn;
+        if (cap && !cc__py_capsule_ty)
+            cc__py_capsule_ty = cc__py_obj_type(cap);
+        fn = cap ? cc__py.CFunctionNewEx(m, cap, mod) : NULL;
+        if (cap) cc__py.DecRef(cap);
+        if (!fn) {
+            if (cc__py.ErrClear) cc__py.ErrClear();
+            return -1;
+        }
+        if (cc__py.ObjectSetAttrString(mod, m->ml_name, fn) != 0) {
+            cc__py.DecRef(fn);
+            if (cc__py.ErrClear) cc__py.ErrClear();
+            return -1;
+        }
+        cc__py.DecRef(fn);
+    }
+    return 0;
+}
+
+/* ---- arity-specialized enter (shared state+bind; loads stay specialized) ----
+ *
+ * enter_N inlines into each stub (state + bind only); loads stay
+ * monomorphic CC_PY_IN.  Flat params (no CC__PyDisp in generated text) so
+ * fragment validation does not need that type in its prelude. */
+
+#define CC__PY_DISP_MAX 8
+
+#define CC__PY_DEF_ENTER(N)                                                    \
+    static inline int cc__py_enter_##N(                                        \
+        void *mod, void *const *args, intptr_t nargs, void *kwnames,           \
+        const char *fname, const char *const *names,                           \
+        const unsigned char *optional, int needs_ts, void **out_self,          \
+        void **bound) {                                                        \
+        void *st = cc__py_callable_state(mod);                                   \
+        if (!st) {                                                             \
+            cc__py_raise("cc: module state unavailable");                      \
+            return -1;                                                         \
+        }                                                                      \
+        if (needs_ts) cc__py_ts_scratch_begin();                               \
+        if (cc__py_bind_fast(args, nargs, kwnames, N, names, optional, bound,  \
+                             fname) != 0)                                      \
+            return -1;                                                         \
+        *out_self = st;                                                        \
+        return 0;                                                              \
+    }
+
+CC__PY_DEF_ENTER(0)
+CC__PY_DEF_ENTER(1)
+CC__PY_DEF_ENTER(2)
+CC__PY_DEF_ENTER(3)
+CC__PY_DEF_ENTER(4)
+CC__PY_DEF_ENTER(5)
+CC__PY_DEF_ENTER(6)
+CC__PY_DEF_ENTER(7)
+CC__PY_DEF_ENTER(8)
+#undef CC__PY_DEF_ENTER
+
+
+/* One trampoline per method.  These are hand-written on purpose: `cc.host` is
+ * a built-in module, and its method table lives in this header, so generated
+ * definitions would have to be spliced ahead of the header's own text — which
+ * no emit anchor can do.  Generation belongs in the TU that owns the type
+ * being exposed, where the table is generated alongside the trampolines.
+ *
+ * What is shared either way is everything below the shape: `CC_PY_IN` /
+ * `CC_PY_OUT` decide by real type rather than by a format string, arity is
+ * checked once, and the receiver is the module state — the same reading of
+ * "first parameter is the receiver" that reflection reports. */
+static void *cc__py_tramp_add(void *mod__, void *const *args__, intptr_t nargs__,
+                              void *kwnames__) {
+    static const char *const names__[] = { "a", "b" };
+    void *bound__[2];
+    CCHostState *self = (CCHostState *)cc__py_callable_state(mod__);
+    long long a, b;
+    if (!self) return cc__py_raise("cc.host: module state unavailable");
+    if (!self->arena) return cc__py_raise("cc.host: requires a CC host");
+    if (cc__py_bind_fast(args__, nargs__, kwnames__, 2, names__, NULL, bound__,
+                         "add") != 0)
+        return NULL;
+    if (CC_PY_IN(a, bound__[0]) != 0) return NULL;
+    if (CC_PY_IN(b, bound__[1]) != 0) return NULL;
+    {
+        long long v = cc_host_add(self, a, b);
+        return CC_PY_OUT(v);
+    }
+}
+
+static void *cc__py_tramp_bump(void *mod__, void *const *args__, intptr_t nargs__,
+                               void *kwnames__) {
+    static const char *const names__[] = { "by" };
+    void *bound__[1];
+    CCHostState *self = (CCHostState *)cc__py_callable_state(mod__);
+    long long by;
+    if (!self) return cc__py_raise("cc.host: module state unavailable");
+    if (!self->arena) return cc__py_raise("cc.host: requires a CC host");
+    if (cc__py_bind_fast(args__, nargs__, kwnames__, 1, names__, NULL, bound__,
+                         "bump") != 0)
+        return NULL;
+    if (CC_PY_IN(by, bound__[0]) != 0) return NULL;
+    {
+        long long v = cc_host_bump(self, by);
+        return CC_PY_OUT(v);
+    }
+}
+
+static void *cc__py_tramp_reset(void *mod__, void *const *args__, intptr_t nargs__,
+                                void *kwnames__) {
+    CCHostState *self = (CCHostState *)cc__py_callable_state(mod__);
+    (void)args__;
+    if (!self) return cc__py_raise("cc.host: module state unavailable");
+    if (!self->arena) return cc__py_raise("cc.host: requires a CC host");
+    if (cc__py_bind_fast(args__, nargs__, kwnames__, 0, NULL, NULL, NULL,
+                         "reset") != 0)
+        return NULL;
+    cc_host_reset(self);
+    return cc__py_none();
+}
+
+static CC__PyMethodDef cc__py_host_methods[] = {
+    { "add", (void *)cc__py_tramp_add, CC__PY_METH_FASTCALL_KEYWORDS,
+      "add two integers in CC" },
+    { "bump", (void *)cc__py_tramp_bump, CC__PY_METH_FASTCALL_KEYWORDS,
+      "advance host state" },
+    { "reset", (void *)cc__py_tramp_reset, CC__PY_METH_FASTCALL_KEYWORDS,
+      "clear host state" },
+    { NULL, NULL, 0, NULL }
+};
+
+/* TEMPLATE, never registered directly: a PyModuleDef is itself a PyObject,
+ * and a single-phase-init one may not be shared across interpreters — its
+ * refcount and cached state belong to whichever interpreter touched it.
+ * Each interpreter gets its own copy. */
+
+/* One def per interpreter, kept alive for the interpreter's lifetime — CPython
+ * keeps the pointer, so these are deliberately never freed. */
+static CC__PyModuleDef *cc__py_def_new(const char *qualname, const char *doc,
+                                       intptr_t state_size,
+                                       CC__PyMethodDef *methods) {
+    CC__PyModuleDef *d = (CC__PyModuleDef *)calloc(1, sizeof(*d));
+    if (!d) return NULL;
+    d->ob_head[0] = (void *)(intptr_t)1;   /* PyModuleDef_HEAD_INIT */
+    d->m_name = qualname;
+    d->m_doc = doc;
+    d->m_size = state_size;
+    d->m_methods = methods;
+    return d;
+}
+
+/* Multiclass grouping for `PyInit_$module`: one exported class stays
+ * FLAT (the module IS the type — today's shape); several nest each
+ * class as a child-module attribute — `import counters;
+ * counters.counter.bump(4)` — mirroring the JS namespaces.  A NULL
+ * anywhere propagates with the Python error already set, so the import
+ * machinery reports the real failure; the FLAT sentinel is distinct
+ * from failure so a broken parent can never silently flatten. */
+#define CC__PY_GROUP_FLAT ((void *)(uintptr_t)1)
+
+static inline void *cc__py_group_begin(const char *name, int count) {
+    /* First code to run in PyInit_<module>: the table loads here (the
+     * factory would load it, but the parent module is built first). */
+    if (cc__py_load() != 0) return NULL;
+    if (count <= 1) return CC__PY_GROUP_FLAT;
+    {
+        CC__PyModuleDef *def =
+            cc__py_def_new(name, "cc multiclass module", 0, NULL);
+        return def ? cc__py.ModuleCreate2(def, CC__PY_API_VERSION) : NULL;
+    }
+}
+
+/* A multi-phase factory returns the module DEF for the import
+ * machinery to execute; a grouped child must be a REALIZED module, so
+ * the def is executed here through a hand-built ModuleSpec — the same
+ * per-module state allocation and seeding the machinery would do. */
+static inline void *cc__py_group_realize(void *maybe_def, const char *name) {
+    void *machinery, *speccls, *nameo, *none, *b, *spec = NULL, *m;
+    if (!cc__py.ModuleDefInit) return maybe_def; /* single-phase module */
+    if (!maybe_def) return NULL;
+    if (!cc__py.ModuleFromDefAndSpec2 || !cc__py.ModuleExecDef)
+        return cc__py_raise("cc: multiclass python modules need "
+                            "PyModule_FromDefAndSpec2");
+    b = cc__py.ImportModule("builtins");
+    none = b ? cc__py.GetAttrString(b, "None") : NULL;
+    if (b) cc__py.DecRef(b);
+    machinery = cc__py.ImportModule("importlib.machinery");
+    speccls = machinery ? cc__py.GetAttrString(machinery, "ModuleSpec") : NULL;
+    if (machinery) cc__py.DecRef(machinery);
+    nameo = cc__py.UnicodeFromString(name);
+    if (speccls && nameo && none) {
+        void *targs = cc__py.TupleNew(2);
+        if (targs) {
+            cc__py.IncRef(nameo);
+            cc__py.IncRef(none);
+            if (cc__py.TupleSetItem(targs, 0, nameo) == 0 &&
+                cc__py.TupleSetItem(targs, 1, none) == 0)
+                spec = cc__py.CallObject(speccls, targs);
+            cc__py.DecRef(targs);
+        }
+    }
+    if (speccls) cc__py.DecRef(speccls);
+    if (nameo) cc__py.DecRef(nameo);
+    if (none) cc__py.DecRef(none);
+    if (!spec) return NULL;
+    m = cc__py.ModuleFromDefAndSpec2(maybe_def, spec, CC__PY_API_VERSION);
+    cc__py.DecRef(spec);
+    if (!m) return NULL;
+    if (cc__py.ModuleExecDef(m, maybe_def) != 0) {
+        cc__py.DecRef(m);
+        return NULL;
+    }
+    return m;
+}
+
+static inline void *cc__py_group_add(void *m, const char *name, void *child) {
+    if (!m) return NULL; /* failed begin/earlier add; error already set */
+    if (m == CC__PY_GROUP_FLAT) return child; /* the def; machinery executes */
+    child = cc__py_group_realize(child, name);
+    if (!child) {
+        cc__py.DecRef(m);
+        return NULL;
+    }
+    if (cc__py.ObjectSetAttrString(m, name, child) != 0) {
+        cc__py.DecRef(child);
+        cc__py.DecRef(m);
+        return NULL;
+    }
+    cc__py.DecRef(child); /* the parent holds it now */
+    return m;
+}
+
+/* Make `cc` a package in THIS interpreter, or find the one already there.
+ * Returns a BORROWED reference, NULL on failure. */
+static void *cc__py_ensure_cc_package(void) {
+    void *mods = cc__py.SysGetObject("modules"); /* borrowed */
+    void *pkg = NULL, *path = NULL, *key = NULL;
+    if (!mods || !cc__py.ModuleCreate2) return NULL;
+    key = cc__py.UnicodeFromString("cc");
+    if (!key) return NULL;
+    /* `sys.modules` is per interpreter, so a second `expose` in the same one
+     * must reuse the package rather than replace it and orphan its children. */
+    pkg = cc__py.GetAttrString(mods, "get");
+    if (pkg) {
+        void *args = cc__py.TupleNew(1);
+        void *got = NULL;
+        if (args) {
+            cc__py.IncRef(key);
+            if (cc__py.TupleSetItem(args, 0, key) == 0) got = cc__py.CallObject(pkg, args);
+            cc__py.DecRef(args);
+        }
+        cc__py.DecRef(pkg);
+        pkg = NULL;
+        if (got) {
+            void *has = cc__py.GetAttrString(got, "__path__");
+            if (has) {
+                cc__py.DecRef(has);
+                cc__py.DecRef(got);
+                cc__py.DecRef(key);
+                return got;   /* borrowed: sys.modules holds it */
+            }
+            cc__py.ErrClear();
+            cc__py.DecRef(got);
+        } else {
+            cc__py.ErrClear();
+        }
+    }
+    {
+        CC__PyModuleDef *pkg_def =
+            cc__py_def_new("cc", "CC host namespace", 0, NULL);
+        if (pkg_def) pkg = cc__py.ModuleCreate2(pkg_def, CC__PY_API_VERSION);
+    }
+    if (pkg) {
+        path = cc__py.ListNew(0);
+        if (!path || cc__py.ObjectSetAttrString(pkg, "__path__", path) != 0 ||
+            cc__py.DictSetItem(mods, key, pkg) != 0) {
+            if (path) cc__py.DecRef(path);
+            cc__py.DecRef(pkg);
+            cc__py.DecRef(key);
+            cc__py.ErrClear();
+            return NULL;
+        }
+        cc__py.DecRef(path);
+        cc__py.DecRef(pkg);   /* sys.modules holds it now */
+    }
+    cc__py.DecRef(key);
+    return pkg;
+}
+
+/* Install `cc.<name>` in THIS interpreter, with `state_size` bytes of
+ * per-module state seeded from `proto`.
+ *
+ * Registration is per interpreter because `sys.modules` is: each interpreter
+ * builds its own instance and therefore its own state, which is exactly what a
+ * per-interpreter GIL requires.  `proto` is copied, not aliased — two
+ * interpreters must not share one state. */
+static int cc__py_register_module(const char *name, CC__PyMethodDef *methods,
+                                  intptr_t state_size, const void *proto) {
+    void *mods = cc__py.SysGetObject("modules"); /* borrowed */
+    void *pkg = cc__py_ensure_cc_package();      /* borrowed */
+    void *sub = NULL, *key = NULL;
+    char *qual = NULL;
+    int rc = -1;
+    if (!mods || !pkg || !name || !name[0]) return -1;
+
+    qual = (char *)malloc(strlen(name) + 4);
+    if (!qual) return -1;
+    memcpy(qual, "cc.", 3);
+    strcpy(qual + 3, name);
+
+    {   /* The def outlives this call; `qual` is its `m_name`. */
+        CC__PyModuleDef *sub_def =
+            cc__py_def_new(qual, "CC host module", state_size, methods);
+        if (!sub_def) goto done;
+        sub = cc__py.ModuleCreate2(sub_def, CC__PY_API_VERSION);
+    }
+    if (!sub) goto done;
+    if (state_size > 0 && proto) {
+        void *st = cc__py.ModuleGetState(sub);
+        if (!st) goto done;
+        memcpy(st, proto, (size_t)state_size);
+        /* Remint methods so trampoline `self` is a state capsule. */
+        (void)cc__py_bind_mod_methods(sub, st, methods);
+    } else if (state_size > 0) {
+        void *st = cc__py.ModuleGetState(sub);
+        if (st) (void)cc__py_bind_mod_methods(sub, st, methods);
+    }
+    key = cc__py.UnicodeFromString(qual);
+    if (!key || cc__py.DictSetItem(mods, key, sub) != 0) goto done;
+    if (cc__py.ObjectSetAttrString(pkg, name, sub) != 0) goto done;
+    rc = 0;
+done:
+    if (key) cc__py.DecRef(key);
+    if (sub) cc__py.DecRef(sub);
+    if (rc != 0) { free(qual); cc__py.ErrClear(); }
+    return rc;
+}
+
+/* Install the built-in `cc.host` module in THIS interpreter. */
+static int cc__py_install_namespace(CCArena *host_arena) {
+    CCHostState seed;
+    memset(&seed, 0, sizeof(seed));
+    seed.arena = host_arena;
+    return cc__py_register_module("host", cc__py_host_methods,
+                                  (intptr_t)sizeof(CCHostState), &seed);
+}
+
+/* Parity: identical to npm/cc-python/broker.py — do not edit by hand;
+ * refresh from that file. Used when CC_PY_BROKER is unset and the
+ * tree-relative path is not found (cache-write like JS's broker). */
+static const char cc__py_proc_broker_text[] =
+    "# cc-python isolated-domain broker: a FULL CPython per domain, speaking\n"
+    "# line-JSON on dedicated wire fds (3 in / 4 out; stdio stays the\n"
+    "# user's) — the same wire discipline as cc-node's broker.cjs, mirrored.\n"
+    "# Dependency-free (stdlib only); numpy is the USER's, imported on\n"
+    "# request like any module.\n"
+    "#\n"
+    "# Protocol (one JSON object per line; every request carries \"id\":n and\n"
+    "# the reply echoes it — the parent pairs replies by id, never by order,\n"
+    "# so a stray line on the channel can only be ignored, not misassigned):\n"
+    "#   -> {\"op\":\"import\",\"name\":m}            <- {\"h\":id} | {\"v\":plain} | {\"e\":msg}\n"
+    "#   -> {\"op\":\"get\",\"h\":id,\"name\":a}        <- value/handle/error\n"
+    "#   -> {\"op\":\"call\",\"h\":id,\"args\":[...]}   <- value/handle/error\n"
+    "#      (\"callp\" adds \"path\":[...] and optional \"kw\":{name:enc,...} —\n"
+    "#       keyword arguments, f(*args, **kw))\n"
+    "#   -> {\"op\":\"str\",\"h\":id}                 <- {\"v\":\"...\"}\n"
+    "#   -> {\"op\":\"release\",\"h\":id}             <- {\"v\":n}   (remaining live)\n"
+    "#   -> {\"op\":\"stats\"}                      <- {\"v\":n}\n"
+    "#   -> {\"op\":\"close\"}                      <- {\"v\":true}, then exit\n"
+    "#\n"
+    "# Values: finite numbers / str / bool / None / lists / dicts cross by\n"
+    "# value; non-finite floats tag as {\"nf\":\"inf\"|\"-inf\"|\"nan\"}; typed\n"
+    "# buffers as {\"ta\":kind,\"b64\":...} (numpy arrays when numpy is loadable\n"
+    "# in this child, else array.array); everything else is a handle.  A JS\n"
+    "# function argument arrives as {\"$f\":id}: calling it sends\n"
+    "# {\"cb\":true,\"cbid\":id,\"args\":[...]} and BLOCKS on the reply line\n"
+    "# {\"cbr\":...} (or {\"e\":...}).  The parent may take arbitrarily long\n"
+    "# (awaiting its own promises) before replying, and may have already\n"
+    "# pipelined later ops onto the wire — those are parked until the cbr\n"
+    "# lands, then drained in order.  EOF on the request fd is revocation:\n"
+    "# drop everything, exit.\n"
+    "import base64\n"
+    "import json\n"
+    "import math\n"
+    "import os\n"
+    "import sys\n"
+    "\n"
+    "_handles = {}\n"
+    "_next = [1]\n"
+    "# The wire lives on dedicated fds so user code owns stdin/stdout —\n"
+    "# print() reaches the real stdout and can never collide with a protocol\n"
+    "# reply.  Requests arrive on fd 3, replies leave on fd 4 (overridable\n"
+    "# for a parent that cannot pin fd numbers).\n"
+    "_in = os.fdopen(int(os.environ.get('CC_WIRE_IN', '3')), 'r',\n"
+    "                encoding='utf-8')\n"
+    "_out = os.fdopen(int(os.environ.get('CC_WIRE_OUT', '4')), 'w',\n"
+    "                 encoding='utf-8')\n"
+    "# Ops that arrived on stdin while a callback was blocked on its cbr.\n"
+    "_parked = []\n"
+    "# Big buffers spill through shared memory (tmpfs on Linux) instead of\n"
+    "# base64: one memcpy per side, no inflation, no JSON bloat.  The dir\n"
+    "# comes from the parent (its private 0700 bridge dir); files are 0600,\n"
+    "# exclusive-create, consumed-and-unlinked per message.\n"
+    "_shm_dir = os.environ.get('CC_PY_SHM_DIR') or (\n"
+    "    '/dev/shm' if os.path.isdir('/dev/shm') else None)\n"
+    "_shm_seq = [0]\n"
+    "_SPILL = 1 << 16\n"
+    "\n"
+    "\n"
+    "def _shm_write(raw):\n"
+    "    _shm_seq[0] += 1\n"
+    "    path = os.path.join(_shm_dir, 'ccpy-c%d-%d' % (os.getpid(), _shm_seq[0]))\n"
+    "    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)\n"
+    "    with os.fdopen(fd, 'wb') as f:\n"
+    "        f.write(raw)\n"
+    "    return path\n"
+    "\n"
+    "\n"
+    "def _put(v):\n"
+    "    h = _next[0]\n"
+    "    _next[0] += 1\n"
+    "    _handles[h] = v\n"
+    "    return h\n"
+    "\n"
+    "\n"
+    "def _np():\n"
+    "    try:\n"
+    "        import numpy\n"
+    "        return numpy\n"
+    "    except Exception:\n"
+    "        return None\n"
+    "\n"
+    "\n"
+    "_TA = {\n"
+    "    'f64': ('d', 'float64'), 'f32': ('f', 'float32'),\n"
+    "    'i32': ('i', 'int32'), 'i64': ('q', 'int64'),\n"
+    "    'u8': ('B', 'uint8'),\n"
+    "}\n"
+    "_TA_BY_DTYPE = {dt: k for k, (_, dt) in _TA.items()}\n"
+    "\n"
+    "\n"
+    "def _decode(v):\n"
+    "    if isinstance(v, dict):\n"
+    "        if '$h' in v:\n"
+    "            return _handles[v['$h']]\n"
+    "        if '$f' in v:\n"
+    "            fid = v['$f']\n"
+    "            def cb(*args):\n"
+    "                _send({'cb': True, 'cbid': fid,\n"
+    "                       'args': [_encode_val(a) for a in args]})\n"
+    "                # Strict cbr wait — but Promise.all on the parent can\n"
+    "                # pipeline later ops ahead of the reply.  Park those.\n"
+    "                while True:\n"
+    "                    line = _in.readline()\n"
+    "                    if not line:\n"
+    "                        raise RuntimeError('bridge is closed')\n"
+    "                    r = json.loads(line)\n"
+    "                    if 'cbr' in r or ('e' in r and 'op' not in r):\n"
+    "                        if 'e' in r:\n"
+    "                            raise RuntimeError(r['e'])\n"
+    "                        return _decode(r.get('cbr'))\n"
+    "                    _parked.append(r)\n"
+    "            return cb\n"
+    "        if '$nf' in v:\n"
+    "            return {'inf': math.inf, '-inf': -math.inf}.get(v['$nf'],\n"
+    "                                                            math.nan)\n"
+    "        if '$ta' in v:\n"
+    "            raw = base64.b64decode(v['b64'])\n"
+    "            np = _np()\n"
+    "            if np is not None:\n"
+    "                return np.frombuffer(raw, dtype=_TA[v['$ta']][1]).copy()\n"
+    "            import array\n"
+    "            a = array.array(_TA[v['$ta']][0])\n"
+    "            a.frombytes(raw)\n"
+    "            return a\n"
+    "        if '$shm' in v:\n"
+    "            path = v['$shm']\n"
+    "            try:\n"
+    "                np = _np()\n"
+    "                if np is not None:\n"
+    "                    return np.fromfile(path, dtype=_TA[v['t']][1])\n"
+    "                import array\n"
+    "                a = array.array(_TA[v['t']][0])\n"
+    "                with open(path, 'rb') as f:\n"
+    "                    a.frombytes(f.read())\n"
+    "                return a\n"
+    "            finally:\n"
+    "                try:\n"
+    "                    os.unlink(path)\n"
+    "                except OSError:\n"
+    "                    pass\n"
+    "        return {k: _decode(x) for k, x in v.items()}\n"
+    "    if isinstance(v, list):\n"
+    "        return [_decode(x) for x in v]\n"
+    "    return v\n"
+    "\n"
+    "\n"
+    "def _plain(v, depth=0):\n"
+    "    if depth > 16:\n"
+    "        return False\n"
+    "    if v is None or isinstance(v, (bool, str)):\n"
+    "        return True\n"
+    "    if isinstance(v, float):\n"
+    "        return True  # non-finite handled at encode\n"
+    "    if isinstance(v, int):\n"
+    "        return -(2**53) < v < 2**53\n"
+    "    if isinstance(v, (list, tuple)):\n"
+    "        return all(_plain(x, depth + 1) for x in v)\n"
+    "    if isinstance(v, dict):\n"
+    "        return all(isinstance(k, str) and not k.startswith('$') and\n"
+    "                   _plain(x, depth + 1) for k, x in v.items())\n"
+    "    return False\n"
+    "\n"
+    "\n"
+    "def _encode_val(v):\n"
+    "    \"\"\"Wire-encode a value nested inside a cb/cbr payload.\n"
+    "\n"
+    "    Unlike `_encode` (top-level reply shape), this returns the naked\n"
+    "    JSON value or a tagged form — callables and other live objects\n"
+    "    cross as {\"$h\": id}, never as a raw Python object (json.dumps\n"
+    "    would raise).  1-D buffers cross as {\"$ta\":...}/{\"$shm\":...}\n"
+    "    so JS callbacks see typed arrays, not opaque handles.\"\"\"\n"
+    "    if isinstance(v, float) and not math.isfinite(v):\n"
+    "        return {'$nf': 'inf' if v == math.inf\n"
+    "                else '-inf' if v == -math.inf else 'nan'}\n"
+    "    if isinstance(v, (list, tuple)):\n"
+    "        return [_encode_val(x) for x in v]\n"
+    "    if isinstance(v, dict):\n"
+    "        return {k: _encode_val(x) for k, x in v.items()}\n"
+    "    if v is None or isinstance(v, (bool, int, str)):\n"
+    "        return v\n"
+    "    if isinstance(v, float):\n"
+    "        return v\n"
+    "    np = _np()\n"
+    "    if np is not None and isinstance(v, np.ndarray) and v.ndim == 1:\n"
+    "        key = _TA_BY_DTYPE.get(str(v.dtype))\n"
+    "        if key is not None:\n"
+    "            raw = np.ascontiguousarray(v).tobytes()\n"
+    "            if len(raw) > _SPILL and _shm_dir:\n"
+    "                return {'$shm': _shm_write(raw), 't': key}\n"
+    "            return {'$ta': key,\n"
+    "                    'b64': base64.b64encode(raw).decode('ascii')}\n"
+    "    try:\n"
+    "        import array as _array\n"
+    "        if isinstance(v, _array.array):\n"
+    "            key = None\n"
+    "            for k, (tc, _) in _TA.items():\n"
+    "                if tc == v.typecode:\n"
+    "                    key = k\n"
+    "                    break\n"
+    "            if key is not None:\n"
+    "                raw = v.tobytes()\n"
+    "                if len(raw) > _SPILL and _shm_dir:\n"
+    "                    return {'$shm': _shm_write(raw), 't': key}\n"
+    "                return {'$ta': key,\n"
+    "                        'b64': base64.b64encode(raw).decode('ascii')}\n"
+    "    except Exception:\n"
+    "        pass\n"
+    "    return {'$h': _put(v)}\n"
+    "\n"
+    "\n"
+    "def _encode(v):\n"
+    "    np = _np()\n"
+    "    if np is not None and isinstance(v, np.generic):\n"
+    "        v = v.item()  # numpy scalar -> python scalar\n"
+    "    if np is not None and isinstance(v, np.ndarray):\n"
+    "        key = _TA_BY_DTYPE.get(str(v.dtype))\n"
+    "        # Inline small arrays; large ones stay handles (the shm lease\n"
+    "        # tier lifts this — for now crossing bulk data costs a copy and\n"
+    "        # says so in the docs).\n"
+    "        if key is not None and v.nbytes <= 1 << 16 and v.ndim == 1:\n"
+    "            return {'ta': key,\n"
+    "                    'b64': base64.b64encode(v.tobytes()).decode('ascii')}\n"
+    "        return {'h': _put(v)}\n"
+    "    if _plain(v):\n"
+    "        return {'v': _encode_val(v)}\n"
+    "    return {'h': _put(v)}\n"
+    "\n"
+    "\n"
+    "def _send(obj):\n"
+    "    _out.write(json.dumps(obj))\n"
+    "    _out.write('\\n')\n"
+    "    _out.flush()\n"
+    "\n"
+    "\n"
+    "def _run(v):\n"
+    "    # A coroutine result runs to completion here — the child is serial\n"
+    "    # per request; PARALLELISM is domains, each a whole process.\n"
+    "    import inspect\n"
+    "    if inspect.iscoroutine(v):\n"
+    "        import asyncio\n"
+    "        return asyncio.run(v)\n"
+    "    return v\n"
+    "\n"
+    "\n"
+    "def _walk(req):\n"
+    "    v = _handles[req['h']]\n"
+    "    for name in req.get('path', []):\n"
+    "        v = getattr(v, name)\n"
+    "    return v\n"
+    "\n"
+    "\n"
+    "def _dispatch(req):\n"
+    "    op = req['op']\n"
+    "    if op == 'import':\n"
+    "        import importlib\n"
+    "        return _encode(importlib.import_module(req['name']))\n"
+    "    if op == 'getp':\n"
+    "        return _encode(_walk(req))\n"
+    "    if op == 'callp':\n"
+    "        f = _walk(req)\n"
+    "        args = [_decode(a) for a in req.get('args', [])]\n"
+    "        kw = {k: _decode(v) for k, v in (req.get('kw') or {}).items()}\n"
+    "        return _encode(_run(f(*args, **kw)))\n"
+    "    if op == 'ta':\n"
+    "        # Materialize a buffer-shaped value back to the parent: small\n"
+    "        # inline, big through the shm spill.\n"
+    "        v = _walk(req)\n"
+    "        np = _np()\n"
+    "        if np is not None and isinstance(v, np.ndarray):\n"
+    "            v = np.ascontiguousarray(v)\n"
+    "            key = _TA_BY_DTYPE.get(str(v.dtype))\n"
+    "            if key is None:\n"
+    "                return {'e': 'cc-python broker: unsupported dtype ' +\n"
+    "                             str(v.dtype)}\n"
+    "            raw = v.tobytes()\n"
+    "        else:\n"
+    "            import array\n"
+    "            if not isinstance(v, array.array):\n"
+    "                return {'e': 'cc-python broker: not a buffer-shaped value'}\n"
+    "            key = None\n"
+    "            for k, (tc, _) in _TA.items():\n"
+    "                if tc == v.typecode:\n"
+    "                    key = k\n"
+    "                    break\n"
+    "            if key is None:\n"
+    "                return {'e': 'cc-python broker: unsupported typecode ' +\n"
+    "                             v.typecode}\n"
+    "            raw = v.tobytes()\n"
+    "        if _shm_dir and len(raw) > _SPILL:\n"
+    "            return {'shm': _shm_write(raw), 't': key}\n"
+    "        return {'ta': key, 'b64': base64.b64encode(raw).decode('ascii')}\n"
+    "    if op == 'str':\n"
+    "        return {'v': str(_walk(req))}\n"
+    "    if op == 'release':\n"
+    "        _handles.pop(req['h'], None)\n"
+    "        return {'v': len(_handles)}\n"
+    "    if op == 'stats':\n"
+    "        return {'v': len(_handles)}\n"
+    "    if op == 'close':\n"
+    "        return {'v': True}\n"
+    "    return {'e': 'cc-python broker: unknown op ' + repr(op)}\n"
+    "\n"
+    "\n"
+    "def _next_req():\n"
+    "    if _parked:\n"
+    "        return _parked.pop(0)\n"
+    "    for line in _in:\n"
+    "        line = line.strip()\n"
+    "        if not line:\n"
+    "            continue\n"
+    "        try:\n"
+    "            return json.loads(line)\n"
+    "        except Exception as e:\n"
+    "            _send({'e': 'cc-python broker: bad request: %s' % e})\n"
+    "            continue\n"
+    "    return None\n"
+    "\n"
+    "\n"
+    "def main():\n"
+    "    while True:\n"
+    "        req = _next_req()\n"
+    "        if req is None:\n"
+    "            break\n"
+    "        try:\n"
+    "            resp = _dispatch(req)\n"
+    "        except Exception as e:\n"
+    "            resp = {'e': '%s: %s' % (type(e).__name__, e)}\n"
+    "        # Replies pair by request id — the parent discards any line\n"
+    "        # without the id it is waiting on (this channel is shared with\n"
+    "        # whatever user code prints).\n"
+    "        if isinstance(req, dict) and 'id' in req:\n"
+    "            resp['id'] = req['id']\n"
+    "        _send(resp)\n"
+    "        if isinstance(req, dict) and req.get('op') == 'close':\n"
+    "            break\n"
+    "\n"
+    "\n"
+    "if __name__ == '__main__':\n"
+    "    main()\n"
+;
+/* ---- process-isolated domains (cc_py_new(true)) --------------------
+ *
+ * A python child per handle on the npm/cc-python broker.py wire — the
+ * same spawn/read/write discipline as CCJsDom's isolated tier.  Values
+ * are remote handles (or materialized scalars), never PyObject*.  The
+ * in-process path (tier INPROC) is unchanged. */
+
+
+
+typedef struct CC__PyIsoBuf {
+    char *p;
+    size_t len, cap;
+    int oom;
+} CC__PyIsoBuf;
+
+typedef struct CC__PyIsoResp {
+    long long id;
+    int kind; /* CC__PY_K_* or -1 */
+    long long h;
+    double num;
+    long long inum;
+    int num_is_int;
+    int b;
+    CCSlice text;
+    CCSlice e; /* error message */
+    int has_e;
+    int has_v;
+    int has_h;
+    int has_cb; /* nested host-callback request from the child */
+    long long cb_fid;
+    CCSlice cb_args; /* raw JSON array text of encoded args */
+} CC__PyIsoResp;
+
+static void cc__py_iso_bput(CC__PyIsoBuf *b, const char *s, size_t n) {
+    if (b->oom) return;
+    if (b->len + n + 1 > b->cap) {
+        size_t nc = b->cap ? b->cap * 2 : 256;
+        char *np;
+        while (nc < b->len + n + 1) nc *= 2;
+        np = (char *)realloc(b->p, nc);
+        if (!np) { b->oom = 1; return; }
+        b->p = np;
+        b->cap = nc;
+    }
+    memcpy(b->p + b->len, s, n);
+    b->len += n;
+    b->p[b->len] = 0;
+}
+
+static void cc__py_iso_bputs(CC__PyIsoBuf *b, const char *s) {
+    if (s) cc__py_iso_bput(b, s, strlen(s));
+}
+
+static void cc__py_iso_bnum_ll(CC__PyIsoBuf *b, long long v) {
+    char t[32];
+    snprintf(t, sizeof(t), "%lld", v);
+    cc__py_iso_bputs(b, t);
+}
+
+static void cc__py_iso_bnum_f(CC__PyIsoBuf *b, double v) {
+    char t[64];
+    if (v != v) { cc__py_iso_bputs(b, "{\"$nf\":\"nan\"}"); return; }
+    if (v > 0 && v > 1e300 && v == v * 0.5) {
+        cc__py_iso_bputs(b, "{\"$nf\":\"inf\"}");
+        return;
+    }
+    if (v < 0 && v < -1e300 && v == v * 0.5) {
+        cc__py_iso_bputs(b, "{\"$nf\":\"-inf\"}");
+        return;
+    }
+    snprintf(t, sizeof(t), "%.17g", v);
+    cc__py_iso_bputs(b, t);
+}
+
+static void cc__py_iso_bjson_str(CC__PyIsoBuf *b, const char *s, size_t n) {
+    size_t i;
+    cc__py_iso_bput(b, "\"", 1);
+    for (i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == '"' || c == '\\') {
+            char e[3] = {'\\', (char)c, 0};
+            cc__py_iso_bput(b, e, 2);
+        } else if (c == '\n') cc__py_iso_bput(b, "\\n", 2);
+        else if (c == '\r') cc__py_iso_bput(b, "\\r", 2);
+        else if (c == '\t') cc__py_iso_bput(b, "\\t", 2);
+        else if (c < 0x20) {
+            char e[8];
+            snprintf(e, sizeof(e), "\\u%04x", c);
+            cc__py_iso_bputs(b, e);
+        } else
+            cc__py_iso_bput(b, (const char *)&s[i], 1);
+    }
+    cc__py_iso_bput(b, "\"", 1);
+}
+
+static unsigned long cc__py_iso_hash(const char *s) {
+    unsigned long h = 5381;
+    if (!s) return h;
+    while (*s) h = h * 33 + (unsigned char)*s++;
+    return h;
+}
+
+static int cc__py_iso_mkdirs(const char *path) {
+    char buf[384];
+    size_t i;
+    snprintf(buf, sizeof(buf), "%.376s", path);
+    for (i = 1; buf[i]; i++) {
+        if (buf[i] != '/') continue;
+        buf[i] = 0;
+        (void)mkdir(buf, 0755);
+        buf[i] = '/';
+    }
+    return mkdir(path, 0755) == 0 || errno == EEXIST ? 0 : -1;
+}
+
+static int cc__py_iso_cache_dir(char *out, size_t cap) {
+    const char *base = getenv("CC_PY_BROKER_CACHE");
+    const char *home;
+    if (base && base[0]) snprintf(out, cap, "%.360s", base);
+    else if ((home = getenv("HOME")) && home[0])
+        snprintf(out, cap, "%.320s/.cache/concurrent-c/py-broker", home);
+    else snprintf(out, cap, "/tmp/cc-py-broker");
+    return cc__py_iso_mkdirs(out);
+}
+
+static int cc__py_iso_write(const char *path, const char *text) {
+    char tmp[448];
+    FILE *f;
+    struct stat st;
+    if (stat(path, &st) == 0) return 0;
+    snprintf(tmp, sizeof(tmp), "%.420s.tmp%ld", path, (long)getpid());
+    f = fopen(tmp, "w");
+    if (!f) return -1;
+    fputs(text, f);
+    if (fclose(f) != 0) { remove(tmp); return -1; }
+    if (rename(tmp, path) != 0) { remove(tmp); return -1; }
+    return 0;
+}
+
+static int cc__py_iso_locate_broker(char *out, size_t cap) {
+    const char *ovr = getenv("CC_PY_BROKER");
+    struct stat st;
+    static const char *cands[] = {
+        "npm/cc-python/broker.py",
+        "./npm/cc-python/broker.py",
+        NULL
+    };
+    int i;
+    if (ovr && ovr[0]) {
+        snprintf(out, cap, "%.440s", ovr);
+        return 0;
+    }
+    for (i = 0; cands[i]; i++) {
+        if (stat(cands[i], &st) == 0 && S_ISREG(st.st_mode)) {
+            snprintf(out, cap, "%.440s", cands[i]);
+            return 0;
+        }
+    }
+    {
+        char dir[384];
+        unsigned long tag;
+        if (cc__py_iso_cache_dir(dir, sizeof(dir)) != 0) return -1;
+        tag = cc__py_iso_hash(cc__py_proc_broker_text);
+        snprintf(out, cap, "%.360s/cc_py_broker_%08lx.py", dir, tag);
+        if (cc__py_iso_write(out, cc__py_proc_broker_text) != 0) return -1;
+        return 0;
+    }
+}
+
+static const char *cc__py_iso_ws(const char *p, const char *end) {
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n'))
+        p++;
+    return p;
+}
+
+static const char *cc__py_iso_scan_str(const char *p, const char *end) {
+    if (p >= end || *p != '"') return NULL;
+    p++;
+    while (p < end) {
+        if (*p == '\\') { p += 2; continue; }
+        if (*p == '"') return p + 1;
+        p++;
+    }
+    return NULL;
+}
+
+static const char *cc__py_iso_scan_val(const char *p, const char *end) {
+    int depth;
+    p = cc__py_iso_ws(p, end);
+    if (p >= end) return NULL;
+    if (*p == '"') return cc__py_iso_scan_str(p, end);
+    if (*p == '{' || *p == '[') {
+        depth = 0;
+        while (p < end) {
+            if (*p == '"') {
+                p = cc__py_iso_scan_str(p, end);
+                if (!p) return NULL;
+                continue;
+            }
+            if (*p == '{' || *p == '[') depth++;
+            else if (*p == '}' || *p == ']') {
+                depth--;
+                p++;
+                if (depth == 0) return p;
+                continue;
+            }
+            p++;
+        }
+        return NULL;
+    }
+    while (p < end && *p != ',' && *p != '}' && *p != ']' &&
+           *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
+        p++;
+    return p;
+}
+
+static CCSlice cc__py_iso_copy(CCArena *a, const char *p, size_t n) {
+    CCSlice s;
+    char *dst;
+    memset(&s, 0, sizeof(s));
+    if (!a) return s;
+    dst = (char *)cc_arena_alloc(a, n + 1, 1);
+    if (!dst) return s;
+    if (n) memcpy(dst, p, n);
+    dst[n] = 0;
+    s.ptr = dst;
+    s.len = n;
+    return s;
+}
+
+static int cc__py_iso_unescape(CCArena *a, const char *p, const char *end,
+                               CCSlice *out) {
+    const char *s, *e;
+    size_t n, i, o;
+    char *dst;
+    if (p >= end || *p != '"') return -1;
+    s = p + 1;
+    e = cc__py_iso_scan_str(p, end);
+    if (!e) return -1;
+    e--; /* points at closing quote */
+    n = (size_t)(e - s);
+    dst = (char *)cc_arena_alloc(a, n + 1, 1);
+    if (!dst) return -1;
+    for (i = 0, o = 0; i < n; i++) {
+        if (s[i] == '\\' && i + 1 < n) {
+            char c = s[++i];
+            if (c == 'n') dst[o++] = '\n';
+            else if (c == 'r') dst[o++] = '\r';
+            else if (c == 't') dst[o++] = '\t';
+            else if (c == 'u' && i + 4 < n) {
+                unsigned v = 0;
+                int k;
+                for (k = 1; k <= 4; k++) {
+                    char h = s[i + k];
+                    v <<= 4;
+                    if (h >= '0' && h <= '9') v |= (unsigned)(h - '0');
+                    else if (h >= 'a' && h <= 'f') v |= (unsigned)(h - 'a' + 10);
+                    else if (h >= 'A' && h <= 'F') v |= (unsigned)(h - 'A' + 10);
+                    else return -1;
+                }
+                i += 4;
+                if (v < 128) dst[o++] = (char)v;
+                else dst[o++] = '?';
+            } else dst[o++] = c;
+        } else dst[o++] = s[i];
+    }
+    dst[o] = 0;
+    out->ptr = dst;
+    out->len = o;
+    return 0;
+}
+
+static int cc__py_iso_classify(CCArena *a, const char *p, const char *end,
+                              CC__PyIsoResp *r) {
+    p = cc__py_iso_ws(p, end);
+    if (p >= end) return -1;
+    if (*p == '"') {
+        r->kind = CC__PY_K_STR;
+        return cc__py_iso_unescape(a, p, end, &r->text);
+    }
+    if (*p == 't' || *p == 'f') {
+        r->kind = CC__PY_K_BOOL;
+        r->b = *p == 't';
+        return 0;
+    }
+    if (*p == 'n') {
+        r->kind = CC__PY_K_NULL;
+        return 0;
+    }
+    if (*p == '{' || *p == '[') {
+        /* Nested tagged forms inside v, or plain containers. */
+        const char *s = cc__py_iso_ws(p, end);
+        if (s + 6 < end && memcmp(s, "{\"$nf\"", 6) == 0) {
+            r->kind = CC__PY_K_NUM;
+            if (strstr(s, "\"nan\"")) r->num = 0.0 / 0.0;
+            else if (strstr(s, "\"-inf\"")) r->num = -1.0 / 0.0;
+            else r->num = 1.0 / 0.0;
+            return 0;
+        }
+        if (s + 5 < end && (memcmp(s, "{\"$h\"", 5) == 0 ||
+                            memcmp(s, "{\"$ta\"", 6) == 0 ||
+                            memcmp(s, "{\"$shm\"", 7) == 0 ||
+                            memcmp(s, "{\"$f\"", 5) == 0)) {
+            /* Nested handle/ta/callback inside a value — treat as raw;
+             * top-level replies use "h"/"ta", not these. */
+            r->kind = CC__PY_K_RAW;
+            r->text = cc__py_iso_copy(a, p, (size_t)(end - p));
+            return r->text.ptr ? 0 : -1;
+        }
+        r->kind = CC__PY_K_RAW;
+        r->text = cc__py_iso_copy(a, p, (size_t)(end - p));
+        return r->text.ptr ? 0 : -1;
+    }
+    {
+        char t[64];
+        char *tail = NULL;
+        size_t n = (size_t)(end - p);
+        long long iv;
+        if (n >= sizeof(t)) return -1;
+        memcpy(t, p, n);
+        t[n] = 0;
+        r->kind = CC__PY_K_NUM;
+        errno = 0;
+        iv = strtoll(t, &tail, 10);
+        if (tail && *tail == 0 && errno == 0) {
+            r->num_is_int = 1;
+            r->inum = iv;
+            r->num = (double)iv;
+            return 0;
+        }
+        r->num = strtod(t, &tail);
+        return tail && *tail == 0 ? 0 : -1;
+    }
+}
+
+static int cc__py_iso_parse(CCArena *a, const char *line, size_t len,
+                            CC__PyIsoResp *r) {
+    const char *p = line, *end = line + len;
+    memset(r, 0, sizeof(*r));
+    r->kind = -1;
+    p = cc__py_iso_ws(p, end);
+    if (p >= end || *p != '{') return -1;
+    p++;
+    for (;;) {
+        const char *ks, *ke, *vs, *ve;
+        p = cc__py_iso_ws(p, end);
+        if (p < end && *p == '}') return 0;
+        if (p >= end || *p != '"') return -1;
+        ks = p + 1;
+        p = cc__py_iso_scan_str(p, end);
+        if (!p) return -1;
+        ke = p - 1;
+        p = cc__py_iso_ws(p, end);
+        if (p >= end || *p != ':') return -1;
+        vs = p + 1;
+        ve = cc__py_iso_scan_val(vs, end);
+        if (!ve) return -1;
+        {
+            size_t kn = (size_t)(ke - ks);
+            const char *v = cc__py_iso_ws(vs, end);
+            if (kn == 2 && memcmp(ks, "id", 2) == 0) {
+                char t[32];
+                size_t n = (size_t)(ve - v);
+                if (n >= sizeof(t)) return -1;
+                memcpy(t, v, n);
+                t[n] = 0;
+                r->id = strtoll(t, NULL, 10);
+            } else if (kn == 1 && ks[0] == 'e') {
+                r->has_e = 1;
+                if (cc__py_iso_unescape(a, v, ve, &r->e) != 0) return -1;
+            } else if (kn == 1 && ks[0] == 'h') {
+                char t[32];
+                size_t n = (size_t)(ve - v);
+                if (n >= sizeof(t)) return -1;
+                memcpy(t, v, n);
+                t[n] = 0;
+                r->has_h = 1;
+                r->h = strtoll(t, NULL, 10);
+                r->kind = CC__PY_K_HANDLE;
+            } else if (kn == 1 && ks[0] == 'v') {
+                r->has_v = 1;
+                if (cc__py_iso_classify(a, v, ve, r) != 0) return -1;
+            } else if (kn == 2 && memcmp(ks, "ta", 2) == 0) {
+                /* Typed arrays: MVP refuses materialization. */
+                r->kind = CC__PY_K_RAW;
+                r->text = cc__py_iso_copy(a, line, len);
+            } else if (kn == 3 && memcmp(ks, "shm", 3) == 0) {
+                r->kind = CC__PY_K_RAW;
+                r->text = cc__py_iso_copy(a, line, len);
+            } else if (kn == 2 && memcmp(ks, "cb", 2) == 0) {
+                /* {"cb": true, "cbid": fid, "args": [...]} — nested host fn. */
+                r->has_cb = 1;
+            } else if (kn == 4 && memcmp(ks, "cbid", 4) == 0) {
+                char t[32];
+                size_t n = (size_t)(ve - v);
+                if (n >= sizeof(t)) return -1;
+                memcpy(t, v, n);
+                t[n] = 0;
+                r->cb_fid = strtoll(t, NULL, 10);
+            } else if (kn == 4 && memcmp(ks, "args", 4) == 0) {
+                r->cb_args = cc__py_iso_copy(a, v, (size_t)(ve - v));
+                if (!r->cb_args.ptr) return -1;
+            }
+        }
+        p = cc__py_iso_ws(ve, end);
+        if (p < end && *p == ',') { p++; continue; }
+        if (p < end && *p == '}') return 0;
+        return -1;
+    }
+}
+
+static int cc__py_iso_send_all(CCPy *d, const char *buf, size_t len) {
+#if defined(MSG_NOSIGNAL)
+    const int flags = MSG_NOSIGNAL;
+#else
+    const int flags = 0;
+#endif
+    while (len > 0) {
+        ssize_t n = send(d->fd, buf, len, flags);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        buf += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int cc__py_iso_read_line(CCPy *d, const char **out, size_t *out_len) {
+    if (d->rb_off) {
+        memmove(d->rb, d->rb + d->rb_off, d->rb_len - d->rb_off);
+        d->rb_len -= d->rb_off;
+        d->rb_off = 0;
+    }
+    for (;;) {
+        char *nl = d->rb_len ? (char *)memchr(d->rb, '\n', d->rb_len) : NULL;
+        ssize_t n;
+        if (nl) {
+            size_t line_len = (size_t)(nl - d->rb);
+            *out = d->rb;
+            *out_len = line_len;
+            *nl = 0;
+            d->rb_off = line_len + 1;
+            return 0;
+        }
+        if (d->rb_len + 65536 + 1 > d->rb_cap) {
+            size_t nc = d->rb_cap ? d->rb_cap * 2 : 131072;
+            char *np;
+            while (nc < d->rb_len + 65536 + 1) nc *= 2;
+            np = (char *)realloc(d->rb, nc);
+            if (!np) return -1;
+            d->rb = np;
+            d->rb_cap = nc;
+        }
+        n = recv(d->fd, d->rb + d->rb_len, 65536, 0);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (n == 0) return -1;
+        d->rb_len += (size_t)n;
+    }
+}
+
+static void cc__py_iso_reap(CCPy *d) {
+    if (d->pid > 0) {
+        int st;
+        (void)waitpid((pid_t)d->pid, &st, 0);
+        d->pid = 0;
+    }
+}
+
+static void cc__py_iso_drop(CCPy *d) {
+    if (d->fd >= 0) {
+        close(d->fd);
+        d->fd = -1;
+    }
+    free(d->rb);
+    d->rb = NULL;
+    d->rb_len = d->rb_cap = d->rb_off = 0;
+}
+
+static int cc__py_iso_alive(CCPy *d, const char *op) {
+    if (!d || !d->ready || d->tier != CC__PY_TIER_PROC) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: %s: domain is closed", op ? op : "op");
+        return 0;
+    }
+    if (d->crashed || d->fd < 0) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: %s: isolated domain crashed (the python child "
+                 "exited)",
+                 op ? op : "op");
+        return 0;
+    }
+    return 1;
+}
+
+
+/* Encode a host-callback return for the Python broker cbr line.  Scalars
+ * and remote handles only — nested containers refuse by name. */
+static int cc__py_iso_encode_cbr_val(CC__PyIsoBuf *b, CCPy *d,
+                                     const CCPyObj *v) {
+    if (!v || v->kind == CC__PY_K_NULL) {
+        cc__py_iso_bputs(b, "null");
+        return 0;
+    }
+    if (v->kind == CC__PY_K_BOOL) {
+        cc__py_iso_bputs(b, v->b ? "true" : "false");
+        return 0;
+    }
+    if (v->kind == CC__PY_K_NUM) {
+        if (v->num_is_int) cc__py_iso_bnum_ll(b, v->inum);
+        else cc__py_iso_bnum_f(b, v->num);
+        return 0;
+    }
+    if (v->kind == CC__PY_K_STR) {
+        cc__py_iso_bjson_str(b, (const char *)v->text.ptr, v->text.len);
+        return 0;
+    }
+    if (v->kind == CC__PY_K_HANDLE) {
+        if (!v->home || v->home != d) {
+            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                     "python: py_fn: handle from a different domain");
+            return -1;
+        }
+        cc__py_iso_bputs(b, "{\"$h\":");
+        cc__py_iso_bnum_ll(b, v->h);
+        cc__py_iso_bputs(b, "}");
+        return 0;
+    }
+    snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+             "python: py_fn: unsupported callback return on the isolated "
+             "wire");
+    return -1;
+}
+
+static int cc__py_iso_send_cbr(CCPy *d, const CCPyObj *v, const char *err) {
+    CC__PyIsoBuf b = {0};
+    int rc;
+    if (err) {
+        cc__py_iso_bputs(&b, "{\"e\":");
+        cc__py_iso_bjson_str(&b, err, strlen(err));
+        cc__py_iso_bputs(&b, "}\n");
+    } else {
+        cc__py_iso_bputs(&b, "{\"cbr\":");
+        if (cc__py_iso_encode_cbr_val(&b, d, v) != 0) {
+            free(b.p);
+            return -1;
+        }
+        cc__py_iso_bputs(&b, "}\n");
+    }
+    if (b.oom) {
+        free(b.p);
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: py_fn: out of memory answering callback");
+        return -1;
+    }
+    rc = cc__py_iso_send_all(d, b.p, b.len);
+    free(b.p);
+    return rc;
+}
+
+/* Decode one JSON value from [start,end) into a CCPyObj (scalars / $h). */
+static int cc__py_iso_decode_cb_arg(CCPy *d, CCArena *a, const char *p,
+                                    const char *end, CCPyObj *out) {
+    CC__PyIsoResp tmp;
+    memset(out, 0, sizeof(*out));
+    out->home = d;
+    p = cc__py_iso_ws(p, end);
+    if (p >= end) return -1;
+    if (p + 5 <= end && memcmp(p, "{\"$h\"", 5) == 0) {
+        const char *c = strchr(p, ':');
+        if (!c) return -1;
+        out->kind = CC__PY_K_HANDLE;
+        out->h = strtoll(c + 1, NULL, 10);
+        return 0;
+    }
+    memset(&tmp, 0, sizeof(tmp));
+    if (cc__py_iso_classify(a, p, end, &tmp) != 0) return -1;
+    if (tmp.kind == CC__PY_K_NUM) {
+        out->kind = CC__PY_K_NUM;
+        out->num = tmp.num;
+        out->inum = tmp.inum;
+        out->num_is_int = tmp.num_is_int;
+        return 0;
+    }
+    if (tmp.kind == CC__PY_K_STR) {
+        out->kind = CC__PY_K_STR;
+        out->text = tmp.text;
+        return 0;
+    }
+    if (tmp.kind == CC__PY_K_BOOL) {
+        out->kind = CC__PY_K_BOOL;
+        out->b = tmp.b;
+        return 0;
+    }
+    if (tmp.kind == CC__PY_K_NULL) {
+        out->kind = CC__PY_K_NULL;
+        return 0;
+    }
+    snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+             "python: py_fn: unsupported callback argument on the "
+             "isolated wire");
+    return -1;
+}
+
+static int cc__py_iso_parse_cb_args(CCPy *d, CCSlice raw, CCPyObj *args,
+                                    int *argc) {
+    const char *p, *end;
+    int n = 0;
+    *argc = 0;
+    if (!raw.ptr) return 0;
+    p = (const char *)raw.ptr;
+    end = p + raw.len;
+    p = cc__py_iso_ws(p, end);
+    if (p >= end || *p != '[') return -1;
+    p++;
+    for (;;) {
+        const char *vs, *ve;
+        p = cc__py_iso_ws(p, end);
+        if (p < end && *p == ']') { *argc = n; return 0; }
+        if (n >= CC__PY_MAX_CALL_ARGS) {
+            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                     "python: py_fn: too many callback arguments");
+            return -1;
+        }
+        vs = p;
+        ve = cc__py_iso_scan_val(vs, end);
+        if (!ve) return -1;
+        if (cc__py_iso_decode_cb_arg(d, d->arena, vs, ve, &args[n]) != 0)
+            return -1;
+        n++;
+        p = cc__py_iso_ws(ve, end);
+        if (p < end && *p == ',') { p++; continue; }
+        if (p < end && *p == ']') { *argc = n; return 0; }
+        return -1;
+    }
+}
+
+static int cc__py_iso_serve_cb(CCPy *d, const CC__PyIsoResp *cbmsg,
+                               const char *op) {
+    CCPyObj args[CC__PY_MAX_CALL_ARGS];
+    CCResult_CCPyObj_CCPyError rr;
+    CCPyObj out;
+    long long fid = cbmsg->cb_fid;
+    int argc = 0;
+    void *fn = NULL;
+    void *userdata = NULL;
+    long long userdata_i64 = 0;
+    int is_i64 = 0;
+    memset(args, 0, sizeof(args));
+    memset(&rr, 0, sizeof(rr));
+    if (cc__py_iso_parse_cb_args(d, cbmsg->cb_args, args, &argc) != 0) {
+        if (cc__py_iso_send_cbr(d, NULL, cc__py_errbuf) != 0) {
+            d->crashed = 1;
+            cc__py_iso_drop(d);
+            cc__py_iso_reap(d);
+            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                     "python: %.40s: isolated domain crashed while answering "
+                     "a callback", op ? op : "call");
+            return -1;
+        }
+        return 0;
+    }
+    if (fid >= 0 && (size_t)fid < d->cbs_cap && d->cbs && d->cbs[fid].fn) {
+        fn = d->cbs[fid].fn;
+        userdata = d->cbs[fid].userdata;
+        userdata_i64 = d->cbs[fid].userdata_i64;
+        is_i64 = d->cbs[fid].is_i64;
+    }
+    if (!fn) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: py_fn: unknown callback");
+        if (cc__py_iso_send_cbr(d, NULL, cc__py_errbuf) != 0) {
+            d->crashed = 1;
+            cc__py_iso_drop(d);
+            cc__py_iso_reap(d);
+            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                     "python: %.40s: isolated domain crashed while answering "
+                     "a callback", op ? op : "call");
+            return -1;
+        }
+        return 0;
+    }
+    d->cb_depth++;
+    if (is_i64)
+        rr = ((CCPyHostFnI64)fn)(userdata_i64, args, argc);
+    else
+        rr = ((CCPyHostFn)fn)(userdata, args, argc);
+    d->cb_depth--;
+    if (!rr.ok) {
+        const char *e = rr.u.error.base.message
+                            ? rr.u.error.base.message
+                            : "python: py_fn: callback failed";
+        if (cc__py_iso_send_cbr(d, NULL, e) != 0) {
+            d->crashed = 1;
+            cc__py_iso_drop(d);
+            cc__py_iso_reap(d);
+            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                     "python: %.40s: isolated domain crashed while answering "
+                     "a callback", op ? op : "call");
+            return -1;
+        }
+        return 0;
+    }
+    out = rr.u.value;
+    if (cc__py_iso_send_cbr(d, &out, NULL) != 0) {
+        d->crashed = 1;
+        cc__py_iso_drop(d);
+        cc__py_iso_reap(d);
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: %.40s: isolated domain crashed while answering "
+                 "a callback", op ? op : "call");
+        return -1;
+    }
+    return 0;
+}
+
+static int cc__py_iso_req(CCPy *d, CC__PyIsoBuf *req, const char *op,
+                          long long id, CC__PyIsoResp *resp) {
+    const char *line = NULL;
+    size_t line_len = 0;
+    cc__py_iso_bput(req, "\n", 1);
+    if (req->oom) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: %s: out of memory building request", op);
+        return -1;
+    }
+    if (cc__py_iso_send_all(d, req->p, req->len) != 0) {
+        d->crashed = 1;
+        cc__py_iso_drop(d);
+        cc__py_iso_reap(d);
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: %s: isolated domain crashed (write failed)", op);
+        return -1;
+    }
+    for (;;) {
+        if (cc__py_iso_read_line(d, &line, &line_len) != 0) {
+            d->crashed = 1;
+            cc__py_iso_drop(d);
+            cc__py_iso_reap(d);
+            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                     "python: %s: isolated domain crashed (the python "
+                     "child exited)",
+                     op);
+            return -1;
+        }
+        if (cc__py_iso_parse(d->arena, line, line_len, resp) != 0) {
+            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                     "python: %s: protocol violation (unparseable reply)",
+                     op);
+            return -1;
+        }
+        if (resp->has_cb) {
+            if (cc__py_iso_serve_cb(d, resp, op) != 0) return -1;
+            continue;
+        }
+        if (resp->id != id) continue; /* stray line — ignore */
+        if (resp->has_e) {
+            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                     "python: %s: %.*s", op,
+                     (int)resp->e.len, (const char *)resp->e.ptr);
+            return -1;
+        }
+        return 0;
+    }
+}
+
+static CCPyObj cc__py_iso_val_from(CCPy *d, const CC__PyIsoResp *r) {
+    CCPyObj v;
+    memset(&v, 0, sizeof(v));
+    v.home = d;
+    if (r->has_h || r->kind == CC__PY_K_HANDLE) {
+        v.kind = CC__PY_K_HANDLE;
+        v.h = r->h;
+        return v;
+    }
+    if (r->kind == CC__PY_K_NUM) {
+        v.kind = CC__PY_K_NUM;
+        v.num = r->num;
+        v.inum = r->inum;
+        v.num_is_int = r->num_is_int;
+        return v;
+    }
+    if (r->kind == CC__PY_K_STR) {
+        v.kind = CC__PY_K_STR;
+        v.text = r->text;
+        return v;
+    }
+    if (r->kind == CC__PY_K_BOOL) {
+        v.kind = CC__PY_K_BOOL;
+        v.b = r->b;
+        return v;
+    }
+    if (r->kind == CC__PY_K_NULL) {
+        v.kind = CC__PY_K_NULL;
+        return v;
+    }
+    /* RAW / ta: keep as raw text so as_* can refuse by name. */
+    v.kind = CC__PY_K_RAW;
+    v.text = r->text;
+    return v;
+}
+
+/* Resolve python executable for the child. */
+static const char *cc__py_iso_exe(const char *override_exe) {
+    const char *exe = override_exe;
+    if (exe && exe[0]) return exe;
+    exe = getenv("CC_PYTHON_BIN");
+    if (exe && exe[0]) return exe;
+    if (cc__py_sel_prog[0]) return cc__py_sel_prog;
+    {
+        const char *ve = getenv("VIRTUAL_ENV");
+        static char vbuf[512];
+        struct stat st;
+        if (ve && ve[0]) {
+            snprintf(vbuf, sizeof(vbuf), "%.480s/bin/python3", ve);
+            if (stat(vbuf, &st) == 0) return vbuf;
+            snprintf(vbuf, sizeof(vbuf), "%.480s/bin/python", ve);
+            if (stat(vbuf, &st) == 0) return vbuf;
+        }
+    }
+    return "python3";
+}
+
+static inline bool cc_py_proc_available(void) {
+    const char *exe = getenv("CC_PYTHON_BIN");
+    if (exe && exe[0]) return true;
+    if (cc__py_sel_prog[0]) return true;
+    return system("command -v python3 >/dev/null 2>&1") == 0;
+}
+
+static inline CCResult_CCPy_CCPyError
+cc__py_proc_new_exe(CCArena *arena, const char *python_exe) {
+    char broker[448];
+    int sv[2] = {-1, -1};
+    long long pid;
+    CCPy py;
+    const char *exe = cc__py_iso_exe(python_exe);
+    cc__py_errbuf[0] = 0;
+    cc__py_bind_err_arena(arena);
+    if (!arena) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: cc_py_new requires arena");
+        return cc_err_CCResult_CCPy_CCPyError(cc__py_err("cc_py_new"));
+    }
+    if (cc__py_iso_locate_broker(broker, sizeof(broker)) != 0) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: isolated: cannot locate broker.py (set "
+                 "CC_PY_BROKER or run from the concurrent-c tree)");
+        return cc_err_CCResult_CCPy_CCPyError(cc__py_err("cc_py_new"));
+    }
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: isolated: socketpair failed");
+        return cc_err_CCResult_CCPy_CCPyError(cc__py_err("cc_py_new"));
+    }
+#if defined(SO_NOSIGPIPE)
+    {
+        int one = 1;
+        (void)setsockopt(sv[0], SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+    }
+#endif
+    pid = (long long)fork();
+    if (pid < 0) {
+        close(sv[0]);
+        close(sv[1]);
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: isolated: fork failed");
+        return cc_err_CCResult_CCPy_CCPyError(cc__py_err("cc_py_new"));
+    }
+    if (pid == 0) {
+        char *argv2[3];
+        int t;
+        close(sv[0]);
+        t = fcntl(sv[1], F_DUPFD, 5);
+        if (t < 0) _exit(127);
+        if (dup2(t, 3) < 0 || dup2(t, 4) < 0) _exit(127);
+        close(t);
+        if (sv[1] > 4) close(sv[1]);
+        argv2[0] = (char *)(uintptr_t)exe;
+        argv2[1] = broker;
+        argv2[2] = NULL;
+        execvp(exe, argv2);
+        _exit(127);
+    }
+    close(sv[1]);
+    memset(&py, 0, sizeof(py));
+    py.ready = 1;
+    py.arena = arena;
+    py.tier = CC__PY_TIER_PROC;
+    py.fd = sv[0];
+    py.pid = pid;
+    py.next_id = 1;
+    {
+        CC__PyIsoBuf req = {0};
+        CC__PyIsoResp resp;
+        long long id = py.next_id++;
+        int rc;
+        cc__py_iso_bputs(&req, "{\"id\":");
+        cc__py_iso_bnum_ll(&req, id);
+        cc__py_iso_bputs(&req, ",\"op\":\"stats\"}");
+        rc = cc__py_iso_req(&py, &req, "isolated_new", id, &resp);
+        free(req.p);
+        if (rc != 0) {
+            cc__py_iso_drop(&py);
+            cc__py_iso_reap(&py);
+            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                     "python: isolated: cannot start '%.200s' (is "
+                     "python3 installed? set CC_PYTHON_BIN or "
+                     "CC_PY_BROKER)",
+                     exe);
+            return cc_err_CCResult_CCPy_CCPyError(cc__py_err("cc_py_new"));
+        }
+    }
+    return cc_ok_CCResult_CCPy_CCPyError(py);
+}
+
+static void cc__py_iso_close(CCPy *py) {
+    if (!py || py->tier != CC__PY_TIER_PROC) return;
+    cc__py_fn_kill_boxes(py);
+    if (py->fd < 0) {
+        cc__py_iso_reap(py);
+        py->ready = 0;
+        return;
+    }
+    {
+        CC__PyIsoBuf req = {0};
+        long long id = py->next_id++;
+        cc__py_iso_bputs(&req, "{\"id\":");
+        cc__py_iso_bnum_ll(&req, id);
+        cc__py_iso_bputs(&req, ",\"op\":\"close\"}\n");
+        if (!req.oom) (void)cc__py_iso_send_all(py, req.p, req.len);
+        free(req.p);
+    }
+    {
+        const char *line;
+        size_t n;
+        while (cc__py_iso_read_line(py, &line, &n) == 0) {}
+    }
+    cc__py_iso_drop(py);
+    cc__py_iso_reap(py);
+    py->ready = 0;
+    py->arena = NULL;
+    py->crashed = 0;
+}
+
+static CCResult_CCPyObj_CCPyError
+cc__py_iso_import(CCPy *py, const char *module) {
+    CC__PyIsoBuf req = {0};
+    CC__PyIsoResp resp;
+    long long id;
+    int rc;
+    CCResult_CCPyObj_CCPyError out;
+    cc__py_bind_err_py(py);
+    if (!cc__py_iso_alive(py, "import"))
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err("import"));
+    id = py->next_id++;
+    cc__py_iso_bputs(&req, "{\"id\":");
+    cc__py_iso_bnum_ll(&req, id);
+    cc__py_iso_bputs(&req, ",\"op\":\"import\",\"name\":");
+    cc__py_iso_bjson_str(&req, module, module ? strlen(module) : 0);
+    cc__py_iso_bputs(&req, "}");
+    rc = cc__py_iso_req(py, &req, "import", id, &resp);
+    free(req.p);
+    if (rc != 0)
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err("import"));
+    memset(&out, 0, sizeof(out));
+    out.ok = true;
+    out.u.value = cc__py_iso_val_from(py, &resp);
+    return out;
+}
+
+static CCResult_CCPyObj_CCPyError
+cc__py_iso_get(CCPyObj *obj, const char *name) {
+    CC__PyIsoBuf req = {0};
+    CC__PyIsoResp resp;
+    long long id;
+    int rc;
+    CCResult_CCPyObj_CCPyError out;
+    CCPy *py = obj ? obj->home : NULL;
+    cc__py_bind_err_obj(obj);
+    if (!obj || obj->kind != CC__PY_K_HANDLE || !py)
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(name));
+    if (!cc__py_iso_alive(py, name ? name : "get"))
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(name));
+    id = py->next_id++;
+    cc__py_iso_bputs(&req, "{\"id\":");
+    cc__py_iso_bnum_ll(&req, id);
+    cc__py_iso_bputs(&req, ",\"op\":\"getp\",\"h\":");
+    cc__py_iso_bnum_ll(&req, obj->h);
+    cc__py_iso_bputs(&req, ",\"path\":[");
+    cc__py_iso_bjson_str(&req, name, name ? strlen(name) : 0);
+    cc__py_iso_bputs(&req, "]}");
+    rc = cc__py_iso_req(py, &req, name ? name : "get", id, &resp);
+    free(req.p);
+    if (rc != 0)
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(name));
+    memset(&out, 0, sizeof(out));
+    out.ok = true;
+    out.u.value = cc__py_iso_val_from(py, &resp);
+    return out;
+}
+
+
+static CCResult_CCPyObj_CCPyError
+cc__py_iso_call_path(CCPyObj *obj, const char *method, const char *args_json) {
+    CC__PyIsoBuf req = {0};
+    CC__PyIsoResp resp;
+    long long id;
+    int rc, is_invoke;
+    CCResult_CCPyObj_CCPyError out;
+    CCPy *py = obj ? obj->home : NULL;
+    cc__py_bind_err_obj(obj);
+    if (!obj || !py || obj->kind != CC__PY_K_HANDLE)
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(method));
+    if (!cc__py_iso_alive(py, method ? method : "call"))
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(method));
+    is_invoke = method && strcmp(method, "invoke") == 0;
+    id = py->next_id++;
+    cc__py_iso_bputs(&req, "{\"id\":");
+    cc__py_iso_bnum_ll(&req, id);
+    cc__py_iso_bputs(&req, ",\"op\":\"callp\",\"h\":");
+    cc__py_iso_bnum_ll(&req, obj->h);
+    cc__py_iso_bputs(&req, ",\"path\":[");
+    if (!is_invoke)
+        cc__py_iso_bjson_str(&req, method, method ? strlen(method) : 0);
+    cc__py_iso_bputs(&req, "],\"args\":");
+    cc__py_iso_bputs(&req, args_json ? args_json : "[]");
+    cc__py_iso_bputs(&req, "}");
+    rc = cc__py_iso_req(py, &req, method ? method : "call", id, &resp);
+    free(req.p);
+    if (rc != 0)
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(method));
+    memset(&out, 0, sizeof(out));
+    out.ok = true;
+    out.u.value = cc__py_iso_val_from(py, &resp);
+    return out;
+}
+
+static CCResult_CCPyObj_CCPyError
+cc__py_iso_call0(CCPyObj *obj, const char *m) {
+    return cc__py_iso_call_path(obj, m, "[]");
+}
+
+static CCResult_CCPyObj_CCPyError
+cc__py_iso_call_f(CCPyObj *obj, const char *m, double v) {
+    CC__PyIsoBuf b = {0};
+    CCResult_CCPyObj_CCPyError r;
+    cc__py_iso_bputs(&b, "[");
+    cc__py_iso_bnum_f(&b, v);
+    cc__py_iso_bputs(&b, "]");
+    if (b.oom) {
+        free(b.p);
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: %s: out of memory", m ? m : "call");
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(m));
+    }
+    r = cc__py_iso_call_path(obj, m, b.p);
+    free(b.p);
+    return r;
+}
+
+static CCResult_CCPyObj_CCPyError
+cc__py_iso_call_i(CCPyObj *obj, const char *m, long long v) {
+    CC__PyIsoBuf b = {0};
+    CCResult_CCPyObj_CCPyError r;
+    cc__py_iso_bputs(&b, "[");
+    cc__py_iso_bnum_ll(&b, v);
+    cc__py_iso_bputs(&b, "]");
+    if (b.oom) {
+        free(b.p);
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: %s: out of memory", m ? m : "call");
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(m));
+    }
+    r = cc__py_iso_call_path(obj, m, b.p);
+    free(b.p);
+    return r;
+}
+
+static CCResult_CCPyObj_CCPyError
+cc__py_iso_call_s(CCPyObj *obj, const char *m, CCSlice s) {
+    CC__PyIsoBuf b = {0};
+    CCResult_CCPyObj_CCPyError r;
+    cc__py_iso_bputs(&b, "[");
+    cc__py_iso_bjson_str(&b, (const char *)s.ptr, s.len);
+    cc__py_iso_bputs(&b, "]");
+    if (b.oom) {
+        free(b.p);
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: %s: out of memory", m ? m : "call");
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(m));
+    }
+    r = cc__py_iso_call_path(obj, m, b.p);
+    free(b.p);
+    return r;
+}
+
+static void cc__py_iso_release(CCPyObj *obj) {
+    CCPy *py;
+    if (!obj) return;
+    py = obj->home;
+    if (obj->kind == CC__PY_K_HANDLE && py && py->ready &&
+        py->tier == CC__PY_TIER_PROC && !py->crashed && py->fd >= 0) {
+        CC__PyIsoBuf req = {0};
+        CC__PyIsoResp resp;
+        long long id = py->next_id++;
+        cc__py_iso_bputs(&req, "{\"id\":");
+        cc__py_iso_bnum_ll(&req, id);
+        cc__py_iso_bputs(&req, ",\"op\":\"release\",\"h\":");
+        cc__py_iso_bnum_ll(&req, obj->h);
+        cc__py_iso_bputs(&req, "}");
+        (void)cc__py_iso_req(py, &req, "release", id, &resp);
+        free(req.p);
+    }
+    obj->kind = CC__PY_K_LOCAL;
+    obj->h = 0;
+    obj->o = NULL;
+    obj->home = NULL;
+    obj->text.ptr = NULL;
+    obj->text.len = 0;
+}
+
+static CCResult_CCPyObj_CCPyError
+cc__py_iso_str(CCPyObj *obj) {
+    CC__PyIsoBuf req = {0};
+    CC__PyIsoResp resp;
+    long long id;
+    int rc;
+    CCResult_CCPyObj_CCPyError out;
+    CCPy *py = obj ? obj->home : NULL;
+    cc__py_bind_err_obj(obj);
+    if (!obj || obj->kind != CC__PY_K_HANDLE || !py)
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err("as_slice"));
+    if (!cc__py_iso_alive(py, "as_slice"))
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err("as_slice"));
+    id = py->next_id++;
+    cc__py_iso_bputs(&req, "{\"id\":");
+    cc__py_iso_bnum_ll(&req, id);
+    cc__py_iso_bputs(&req, ",\"op\":\"str\",\"h\":");
+    cc__py_iso_bnum_ll(&req, obj->h);
+    cc__py_iso_bputs(&req, ",\"path\":[]}");
+    rc = cc__py_iso_req(py, &req, "as_slice", id, &resp);
+    free(req.p);
+    if (rc != 0)
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err("as_slice"));
+    memset(&out, 0, sizeof(out));
+    out.ok = true;
+    out.u.value = cc__py_iso_val_from(py, &resp);
+    return out;
+}
+
+/* ---- lifecycle ---- */
+
+/* Has this process handed out the interpreter that `Py_Initialize` makes?
+ * The first `cc_py_new` takes it; every later one needs a real isolated
+ * interpreter, which not every runtime can provide. */
+static int cc__py_main_taken;
+
+/* `cc_py_new(isolated, &arena)` yields an interpreter — the same
+ * constructor shape as `cc_js_new`: the transport is the flag, arena
+ * last.  `arena` is the handle scratch: error messages and default
+ * `.as_slice()` backing; explicit `.as_slice_into(&dst)` can override
+ * the destination.
+ *
+ * `false` (in-process): the first call takes the `Py_Initialize` main
+ * interpreter; every later call creates a 3.12+ own-GIL subinterpreter
+ * (and fails cleanly where the runtime cannot, rather than quietly
+ * aliasing the first).  To share an interpreter, pass the handle.
+ * Python multiplies in-process where V8 cannot, so `false` already
+ * gives N parallel domains.
+ *
+ * `true` (process-isolated): a python child per handle on the
+ * broker.py wire (remote handles, never PyObject*).  Never a silent
+ * alias of `false`. */
+static inline CCResult_CCPy_CCPyError cc_py_new(_Bool isolated, CCArena *arena) {
+    CCPy py;
+    memset(&py, 0, sizeof(py));
+    cc__py_errbuf[0] = '\0';
+    cc__py_bind_err_arena(arena);
+    if (isolated) return cc__py_proc_new_exe(arena, NULL);
+    if (!arena) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: cc_py_new requires arena");
+        return cc_err_CCResult_CCPy_CCPyError(cc__py_err("cc_py_new"));
+    }
+    if (cc__py_load() != 0)
+        return cc_err_CCResult_CCPy_CCPyError(cc__py_err("cc_py_new"));
+    if (!cc__py.IsInitialized()) {
+        /* Venv/interpreter adoption: hand CPython the selected python's
+         * path BEFORE init and its own machinery finds pyvenv.cfg, the
+         * right prefix, the right site-packages — no path surgery.  The
+         * wchar copy must outlive the interpreter (per the API), so it
+         * is deliberately never freed. */
+        if (cc__py_sel_prog[0]) {
+            if (!cc__py.SetProgramName || !cc__py.DecodeLocale) {
+                snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                         "python: this runtime cannot adopt %.360s (needs "
+                         "Py_SetProgramName + Py_DecodeLocale)",
+                         cc__py_sel_prog);
+                return cc_err_CCResult_CCPy_CCPyError(cc__py_err("cc_py_new"));
+            }
+            {
+                static wchar_t *cc__py_progw;
+                if (!cc__py_progw)
+                    cc__py_progw = cc__py.DecodeLocale(cc__py_sel_prog, NULL);
+                if (!cc__py_progw) {
+                    snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                             "python: cannot decode program path %.360s",
+                             cc__py_sel_prog);
+                    return cc_err_CCResult_CCPy_CCPyError(
+                        cc__py_err("cc_py_new"));
+                }
+                cc__py.SetProgramName(cc__py_progw);
+            }
+        }
+        cc__py.InitializeEx(0);
+    }
+
+    if (!cc__py_main_taken) {
+        cc__py_main_taken = 1;
+        py.ready = 1;
+        py.arena = arena;
+        py.tier = CC__PY_TIER_INPROC;
+        py.fd = -1;
+        py.owns_interp = 0;
+        py.isolated = 0;
+        if (cc__py_main_tstate) {
+            /* Re-take after a close reclaimed it: a sibling interpreter
+             * may be current, so make the process state current first —
+             * ThreadStateGet would otherwise hand back the WRONG one. */
+            if (cc__py_cur_tstate != cc__py_main_tstate) {
+                if (cc__py_cur_tstate && cc__py.EvalSaveThread)
+                    cc__py.EvalSaveThread();
+                if (cc__py.EvalRestoreThread)
+                    cc__py.EvalRestoreThread(cc__py_main_tstate);
+                cc__py_cur_tstate = cc__py_main_tstate;
+            }
+            py.tstate = cc__py_main_tstate;
+            py.interp = cc__py_main_interp;
+        } else {
+            if (cc__py.ThreadStateGet) py.tstate = cc__py.ThreadStateGet();
+            if (cc__py.InterpreterStateGet)
+                py.interp = cc__py.InterpreterStateGet();
+            /* Py_Initialize leaves this state current, holding the GIL. */
+            cc__py_cur_tstate = py.tstate;
+            cc__py_main_tstate = py.tstate;
+            cc__py_main_interp = py.interp;
+        }
+        cc__py_tls_seed(py.interp, py.tstate);
+        (void)cc__py_install_namespace(arena);
+        return cc_ok_CCResult_CCPy_CCPyError(py);
+    }
+
+    /* A second interpreter must be genuinely isolated to be worth having. */
+    if (!cc__py.NewInterpreterFromConfig || !cc__py.ThreadStateSwap) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: this runtime cannot create a second interpreter "
+                 "(needs Py_NewInterpreterFromConfig, CPython 3.12+); "
+                 "pass the existing handle to share one");
+        return cc_err_CCResult_CCPy_CCPyError(cc__py_err("cc_py_new"));
+    }
+    {
+        CC__PyInterpConfig cfg;
+        void *tstate = NULL;
+        void *saved = cc__py_cur_tstate;
+        CC__PyStatus status;
+        memset(&cfg, 0, sizeof(cfg));
+        /* OWN_GIL requires its own allocator state (use_main_obmalloc 0) and
+         * refuses extensions that have not opted in to per-interpreter GIL. */
+        cfg.allow_threads = 1;
+        cfg.check_multi_interp_extensions = 1;
+        cfg.gil = CC__PY_OWN_GIL;
+        status = cc__py.NewInterpreterFromConfig(&tstate, &cfg);
+        if (!tstate || status._type != 0) {
+            /* On failure CPython leaves no thread current; go back. */
+            if (saved && cc__py.EvalRestoreThread) {
+                cc__py.EvalRestoreThread(saved);
+                cc__py_cur_tstate = saved;
+            }
+            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                     "python: could not create an isolated interpreter: %s",
+                     status.err_msg ? status.err_msg
+                                    : "per-interpreter GIL refused");
+            return cc_err_CCResult_CCPy_CCPyError(cc__py_err("cc_py_new"));
+        }
+        py.ready = 1;
+        py.arena = arena;
+        py.tier = CC__PY_TIER_INPROC;
+        py.fd = -1;
+        py.tstate = tstate;
+        py.owns_interp = 1;
+        py.isolated = 1;
+        if (cc__py.InterpreterStateGet) py.interp = cc__py.InterpreterStateGet();
+        /* The new interpreter is current and holds its own GIL, with the
+         * state CPython just made for THIS thread. */
+        cc__py_cur_tstate = tstate;
+        cc__py_tls_seed(py.interp, tstate);
+        /* Its own module instance: sharing one across interpreters is what a
+         * per-interpreter GIL forbids. */
+        (void)cc__py_install_namespace(arena);
+        return cc_ok_CCResult_CCPy_CCPyError(py);
+    }
+}
+
+/* An isolated interpreter this handle created is ended here — it owns real
+ * resources and nothing else will reclaim it before process exit. The process
+ * interpreter is left alive: re-initializing CPython after FinalizeEx is
+ * unreliable, and process exit reclaims it. Idempotent. */
+static inline void cc_py_close(CCPy *py) {
+    if (!py) return;
+    if (py->tier == CC__PY_TIER_PROC) {
+        cc__py_iso_close(py);
+        return;
+    }
+    if (py->owns_interp && py->tstate && cc__py.EndInterpreter &&
+        cc__py.ThreadStateSwap) {
+        /* End it from inside: swap in, end, then leave no thread current. */
+        if (cc__py_cur_tstate != py->tstate) {
+            if (cc__py_cur_tstate && cc__py.EvalSaveThread) cc__py.EvalSaveThread();
+            if (cc__py.EvalRestoreThread) cc__py.EvalRestoreThread(py->tstate);
+        }
+        cc__py.EndInterpreter(py->tstate);
+        cc__py_cur_tstate = NULL;
+        /* Drop this thread's cache entry: the interpreter it named is gone. */
+        {
+            int i;
+            for (i = 0; i < cc__py_tls_n; i++) {
+                if (cc__py_tls[i].interp == py->interp) {
+                    cc__py_tls[i] = cc__py_tls[--cc__py_tls_n];
+                    break;
+                }
+            }
+        }
+        /* Leave the process interpreter current: a later call — including a
+         * release of some other handle's object — needs a thread state. */
+        if (cc__py_main_tstate && cc__py_main_tstate != py->tstate &&
+            cc__py.EvalRestoreThread) {
+            void *back = cc__py_tls_for(cc__py_main_interp);
+            if (!back) back = cc__py_main_tstate;
+            cc__py.EvalRestoreThread(back);
+            cc__py_cur_tstate = back;
+        }
+    }
+    if (py->sys_getrefcount && cc__py.DecRef && !py->owns_interp)
+        cc__py.DecRef(py->sys_getrefcount);
+    /* Closing the process interpreter's handle RECLAIMS it: the next
+     * cc_py_new re-takes it (state intact, never finalized) instead of
+     * paying for an isolated interpreter it did not ask for — sequential
+     * create/close churn stays on one interpreter. */
+    if (!py->owns_interp && py->ready && py->interp &&
+        py->interp == cc__py_main_interp)
+        cc__py_main_taken = 0;
+    py->sys_getrefcount = NULL;
+    cc__py_fn_kill_boxes(py);
+    py->ready = 0;
+    py->arena = NULL;
+    py->tstate = NULL;
+    py->interp = NULL;
+    py->owns_interp = 0;
+    py->isolated = 0;
+    py->tier = CC__PY_TIER_INPROC;
+    py->fd = -1;
+}
+
+static inline void cc_py_obj_release(CCPyObj *obj) {
+    if (!obj) return;
+    if (obj->home && obj->home->tier == CC__PY_TIER_PROC) {
+        cc__py_iso_release(obj);
+        return;
+    }
+    /* A reference that outlives its home releases as a no-op: the
+     * interpreter that owned it has already reclaimed everything, and
+     * touching the refcount now would be a use-after-free.  A live home
+     * is attached first, so the decrement lands in the right interpreter. */
+    if (obj->o && cc__py.lib && obj->home && obj->home->ready) {
+        cc__py_attach(obj->home);
+        cc__py.DecRef(obj->o);
+    }
+    obj->o = NULL;
+    obj->home = NULL;
+    obj->kind = CC__PY_K_LOCAL;
+}
+
+/* ---- import / attributes / calls ---- */
+
+static inline CCResult_CCPyObj_CCPyError cc__py_obj_or_err(CCPy *home,
+                                                           void *o,
+                                                           const char *ctx) {
+    CCPyObj obj;
+    memset(&obj, 0, sizeof(obj));
+    if (!o) return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(ctx));
+    obj.kind = CC__PY_K_LOCAL;
+    obj.o = o;
+    obj.home = home;
+    return cc_ok_CCResult_CCPyObj_CCPyError(obj);
+}
+
+/* ---- running Python source ----
+ *
+ * `py.exec(src)` runs statements and `py.eval(expr)` yields the value of
+ * an expression, both in the interpreter's `__main__` namespace — so a
+ * function defined by one call is callable by the next, and by
+ * `py.import("__main__")`.  Routed through `builtins.exec` / `eval`
+ * rather than `PyRun_*`, which is outside the limited ABI. */
+
+/* NUL-terminated copy of `s` in the handle scratch (Python's C API takes
+ * C strings; a slice need not be terminated). */
+static const char *cc__py_cstr(CCPy *py, CCSlice s) {
+    char *buf;
+    if (!py || !py->arena) return NULL;
+    buf = (char *)cc_arena_alloc(py->arena, s.len + 1, 1);
+    if (!buf) return NULL;
+    if (s.len && s.ptr) memcpy(buf, s.ptr, s.len);
+    buf[s.len] = 0;
+    return buf;
+}
+
+/* The `__main__` module dict — the namespace exec/eval share. */
+static void *cc__py_main_globals(void) {
+    void *m, *d;
+    if (!cc__py.ImportModule || !cc__py.GetAttrString) return NULL;
+    m = cc__py.ImportModule("__main__");
+    if (!m) { if (cc__py.ErrClear) cc__py.ErrClear(); return NULL; }
+    d = cc__py.GetAttrString(m, "__dict__");
+    cc__py.DecRef(m);
+    if (!d && cc__py.ErrClear) cc__py.ErrClear();
+    return d; /* borrowed-through-owned: caller DecRefs */
+}
+
+static inline CCResult_void_CCPyError cc_py_exec(CCPy *py, CCSlice code) {
+    const char *src;
+    void *b, *g, *r = NULL;
+    cc__py_bind_err_py(py);
+    if (!py || !py->ready)
+        return cc_err_CCResult_void_CCPyError(cc__py_err("exec"));
+    if (py->tier == CC__PY_TIER_PROC) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: exec: not yet supported on process-isolated "
+                 "domains");
+        return cc_err_CCResult_void_CCPyError(cc__py_err("exec"));
+    }
+    src = cc__py_cstr(py, code);
+    if (!src) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: exec: arena exhausted");
+        return cc_err_CCResult_void_CCPyError(cc__py_err("exec"));
+    }
+    b = cc__py.ImportModule("builtins");
+    g = cc__py_main_globals();
+    if (b && g) r = cc__py.CallMethod(b, "exec", "sO", src, g);
+    if (g) cc__py.DecRef(g);
+    if (b) cc__py.DecRef(b);
+    if (!r) return cc_err_CCResult_void_CCPyError(cc__py_err("exec"));
+    cc__py.DecRef(r);
+    return cc_ok_CCResult_void_CCPyError();
+}
+
+/* Source text accepts a bare string literal: the macro lifts `char *`
+ * through a slice view and passes `CCSlice` through unchanged — the
+ * function above stays the callee (a macro's own name does not
+ * re-expand inside its expansion). */
+static inline CCSlice cc__py_src_slice(CCSlice s) { return s; }
+static inline CCSlice cc__py_src_cstr(const char *s) {
+    CCSlice v;
+    v.ptr = (void *)(uintptr_t)s;
+    v.len = s ? strlen(s) : 0;
+    return v;
+}
+#define cc__py_src(x) _Generic((x),                         \
+        char *: cc__py_src_cstr,                            \
+        const char *: cc__py_src_cstr,                      \
+        CCSlice: cc__py_src_slice)(x)
+#define cc_py_exec(py, src) cc_py_exec((py), cc__py_src(src))
+
+/* Internal: `py.eval(...)` resolves through the CCPy dynamic sink so the
+ * declared destination joins resolution (`double v = py.eval(...) !>`),
+ * exactly like the JS twin — a public snake twin here would outrank the
+ * sink and pin every eval to CCPyObj. */
+static inline CCResult_CCPyObj_CCPyError cc__py_eval(CCPy *py, CCSlice expr) {
+    const char *src;
+    void *b, *g, *r = NULL;
+    cc__py_bind_err_py(py);
+    if (!py || !py->ready)
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err("eval"));
+    if (py->tier == CC__PY_TIER_PROC) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: eval: not yet supported on process-isolated "
+                 "domains");
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err("eval"));
+    }
+    src = cc__py_cstr(py, expr);
+    if (!src) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: eval: arena exhausted");
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err("eval"));
+    }
+    b = cc__py.ImportModule("builtins");
+    g = cc__py_main_globals();
+    if (b && g) r = cc__py.CallMethod(b, "eval", "sO", src, g);
+    if (g) cc__py.DecRef(g);
+    if (b) cc__py.DecRef(b);
+    if (!r) return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err("eval"));
+    return cc__py_obj_or_err(py, r, "eval");
+}
+
+
+static CCResult_CCPyObj_CCPyError
+cc__py_iso_call_o(CCPyObj *obj, const char *m, CCPyObj *arg);
+
+static inline CCResult_CCPyObj_CCPyError cc_py_import(CCPy *py,
+                                                      const char *module) {
+    cc__py_bind_err_py(py);
+    if (!py || !py->ready)
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err("import"));
+    if (py->tier == CC__PY_TIER_PROC)
+        return cc__py_iso_import(py, module);
+    return cc__py_obj_or_err(py, cc__py.ImportModule(module), module);
+}
+
+static inline CCResult_CCPyObj_CCPyError cc_py_obj_get(CCPyObj *obj,
+                                                       const char *name) {
+    cc__py_bind_err_obj(obj);
+    if (!obj)
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(name));
+    if (obj->home && obj->home->tier == CC__PY_TIER_PROC)
+        return cc__py_iso_get(obj, name);
+    if (!obj->o)
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(name));
+    return cc__py_obj_or_err(obj->home, cc__py.GetAttrString(obj->o, name),
+                             name);
+}
+
+static inline CCResult_CCPyObj_CCPyError cc_py_obj_call0(CCPyObj *obj,
+                                                         const char *m) {
+    cc__py_bind_err_obj(obj);
+    if (!obj)
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(m));
+    if (obj->home && obj->home->tier == CC__PY_TIER_PROC)
+        return cc__py_iso_call0(obj, m);
+    if (!obj->o)
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(m));
+    return cc__py_obj_or_err(obj->home, cc__py.CallMethod(obj->o, m, NULL), m);
+}
+
+static inline CCResult_CCPyObj_CCPyError cc_py_obj_call_f(CCPyObj *obj,
+                                                          const char *m,
+                                                          double v) {
+    cc__py_bind_err_obj(obj);
+    if (!obj)
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(m));
+    if (obj->home && obj->home->tier == CC__PY_TIER_PROC)
+        return cc__py_iso_call_f(obj, m, v);
+    if (!obj->o)
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(m));
+    return cc__py_obj_or_err(obj->home, cc__py.CallMethod(obj->o, m, "d", v),
+                             m);
+}
+
+static inline CCResult_CCPyObj_CCPyError cc_py_obj_call_i(CCPyObj *obj,
+                                                          const char *m,
+                                                          long long v) {
+    cc__py_bind_err_obj(obj);
+    if (!obj)
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(m));
+    if (obj->home && obj->home->tier == CC__PY_TIER_PROC)
+        return cc__py_iso_call_i(obj, m, v);
+    if (!obj->o)
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(m));
+    return cc__py_obj_or_err(obj->home, cc__py.CallMethod(obj->o, m, "L", v),
+                             m);
+}
+
+static inline CCResult_CCPyObj_CCPyError cc_py_obj_call_s(CCPyObj *obj,
+                                                          const char *m,
+                                                          CCSlice s) {
+    void *u;
+    void *r;
+    cc__py_bind_err_obj(obj);
+    if (!obj)
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(m));
+    if (obj->home && obj->home->tier == CC__PY_TIER_PROC)
+        return cc__py_iso_call_s(obj, m, s);
+    if (!obj->o)
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(m));
+    u = cc__py.UnicodeFromStringAndSize((const char *)s.ptr, (intptr_t)s.len);
+    if (!u) return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(m));
+    r = cc__py.CallMethod(obj->o, m, "O", u);
+    cc__py.DecRef(u);
+    return cc__py_obj_or_err(obj->home, r, m);
+}
+
+static inline CCResult_CCPyObj_CCPyError cc_py_obj_call_o(CCPyObj *obj,
+                                                          const char *m,
+                                                          CCPyObj *arg) {
+    cc__py_bind_err_obj(obj);
+    if (!obj || !arg)
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(m));
+    if (obj->home && obj->home->tier == CC__PY_TIER_PROC)
+        return cc__py_iso_call_o(obj, m, arg);
+    if (!obj->o || !arg->o)
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(m));
+    if (arg->home != obj->home) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: %s: object argument from a different interpreter "
+                 "(same home required)",
+                 m ? m : "call");
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(m));
+    }
+    return cc__py_obj_or_err(obj->home,
+                             cc__py.CallMethod(obj->o, m, "O", arg->o), m);
+}
+
+/* `obj.clone_into(&target)` — rebuild `obj` in another same-process
+ * inproc interpreter.  Same home: a new owned local ref (IncRef). Cross
+ * home: pickle.dumps under the source attach, then pickle.loads under
+ * the target attach; the pickle bytes cross as a C buffer / memoryview,
+ * never as a shared PyObject*.  Process-isolated domains refuse. */
+static inline CCResult_CCPyObj_CCPyError cc_py_obj_clone_into(CCPyObj *obj,
+                                                              CCPy *target) {
+    void *pickle = NULL;
+    void *dumped = NULL;
+    void *mv = NULL;
+    void *loaded = NULL;
+    CC__PyBuffer view;
+    char *buf = NULL;
+    size_t n = 0;
+    CCArena *scratch = NULL;
+    char empty;
+
+    cc__py_bind_err_obj(obj);
+    if (!obj || !obj->home || !obj->home->ready) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: clone_into: source object is null or not ready");
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err("clone_into"));
+    }
+    if (!target || !target->ready) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: clone_into: target interpreter is null or not ready");
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err("clone_into"));
+    }
+    if (obj->home->tier != CC__PY_TIER_INPROC ||
+        target->tier != CC__PY_TIER_INPROC) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: clone_into: process-isolated domains refuse "
+                 "clone_into (same-process inproc only)");
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err("clone_into"));
+    }
+    if (obj->kind != CC__PY_K_LOCAL || !obj->o) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: clone_into: source is not a local PyObject");
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err("clone_into"));
+    }
+
+    /* Same home: another owned reference to the same object. */
+    if (obj->home == target) {
+        cc__py.IncRef(obj->o);
+        return cc__py_obj_or_err(target, obj->o, "clone_into");
+    }
+
+    /* Serialize in the home interpreter — attach already held. */
+    pickle = cc__py.ImportModule("pickle");
+    if (!pickle) return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err("clone_into"));
+    dumped = cc__py.CallMethod(pickle, "dumps", "O", obj->o);
+    cc__py.DecRef(pickle);
+    pickle = NULL;
+    if (!dumped) return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err("clone_into"));
+
+    memset(&view, 0, sizeof(view));
+    if (!cc__py.GetBuffer ||
+        cc__py.GetBuffer(dumped, &view, CC__PYBUF_CONTIG_FMT) != 0) {
+        if (cc__py.ErrClear) cc__py.ErrClear();
+        cc__py.DecRef(dumped);
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: clone_into: pickle.dumps did not yield a "
+                 "contiguous buffer");
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err("clone_into"));
+    }
+    if (view.len < 0) {
+        cc__py.ReleaseBuffer(&view);
+        cc__py.DecRef(dumped);
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: clone_into: negative pickle buffer length");
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err("clone_into"));
+    }
+    n = (size_t)view.len;
+    scratch = target->arena ? target->arena : obj->home->arena;
+    if (n > 0) {
+        if (scratch)
+            buf = (char *)cc_arena_alloc(scratch, n, 1);
+        if (!buf) {
+            cc__py.ReleaseBuffer(&view);
+            cc__py.DecRef(dumped);
+            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                     "python: clone_into: arena exhausted copying pickle "
+                     "bytes");
+            return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err("clone_into"));
+        }
+        memcpy(buf, view.buf, n);
+    }
+    cc__py.ReleaseBuffer(&view);
+    cc__py.DecRef(dumped);
+    dumped = NULL;
+
+    /* Rebuild in the target — bytes cross only as a C buffer. */
+    cc__py_bind_err_py(target);
+    pickle = cc__py.ImportModule("pickle");
+    if (!pickle) return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err("clone_into"));
+    empty = 0;
+    mv = cc__py.MemoryViewFromMemory(buf ? buf : &empty, (intptr_t)n,
+                                     0x100 /* PyBUF_READ */);
+    if (!mv) {
+        cc__py.DecRef(pickle);
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err("clone_into"));
+    }
+    loaded = cc__py.CallMethod(pickle, "loads", "O", mv);
+    cc__py.DecRef(mv);
+    cc__py.DecRef(pickle);
+    if (!loaded) return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err("clone_into"));
+    return cc__py_obj_or_err(target, loaded, "clone_into");
+}
+
+/* ---- dynamic sink: obj.anything(args) ---- */
+
+/* Tagged argument for the dynamic UFCS sink. CC_PY_ARG lifts each call
+ * argument by static type; cc_py_obj_callm re-materializes it as a
+ * Python value. */
+typedef struct CCPyArg {
+    int kind; /* 0=i64 1=f64 2=cstr 3=slice 4=obj 5=bool 6=typed slice
+               * 7=buffer borrow (memoryview over CC memory, no copy)
+               * 8=host fn (py_fn; p=fn, okind=0 → n=userdata
+               *   pointer, okind=1 → i=userdata i64 by value) */
+    const char *kwname; /* non-NULL: pass by keyword, not position */
+    long long i; /* kind 6: elem descriptor esz | is_float<<8 | is_signed<<9 */
+    double f;
+    const void *p;
+    size_t n;
+    CCPy *home; /* kind 4: argument's home; must match the receiver */
+    long long h; /* kind 4: remote handle id when okind is HANDLE */
+    int okind;   /* kind 4: the CCPyObj.kind being passed */
+} CCPyArg;
+
+/* Bound on one call's arguments, positional plus keyword. */
+#ifndef CC__PY_MAX_CALL_ARGS
+#define CC__PY_MAX_CALL_ARGS 64
+#endif
+
+static inline CCPyArg cc__py_arg_i(long long v) {
+    CCPyArg a = {0};
+    a.i = v;
+    return a;
+}
+static inline CCPyArg cc__py_arg_f(double v) {
+    CCPyArg a = {0};
+    a.kind = 1;
+    a.f = v;
+    return a;
+}
+static inline CCPyArg cc__py_arg_cstr(const char *s) {
+    CCPyArg a = {0};
+    a.kind = 2;
+    a.p = s;
+    a.n = s ? strlen(s) : 0;
+    return a;
+}
+static inline CCPyArg cc__py_arg_slice(CCSlice s) {
+    CCPyArg a = {0};
+    a.kind = 3;
+    a.p = s.ptr;
+    a.n = s.len;
+    return a;
+}
+static inline CCPyArg cc__py_arg_obj(CCPyObj o) {
+    CCPyArg a = {0};
+    /* Materialized scalars re-lift to their scalar arg kinds so a
+     * call result can be passed straight back on the wire. */
+    if (o.kind == CC__PY_K_NUM) {
+        if (o.num_is_int) return cc__py_arg_i(o.inum);
+        return cc__py_arg_f(o.num);
+    }
+    if (o.kind == CC__PY_K_STR) return cc__py_arg_slice(o.text);
+    if (o.kind == CC__PY_K_BOOL) {
+        a.kind = 5;
+        a.i = o.b ? 1 : 0;
+        return a;
+    }
+    a.kind = 4;
+    a.p = o.o;
+    a.home = o.home;
+    a.h = o.h;
+    a.okind = o.kind;
+    return a;
+}
+
+
+static inline CCPyArg cc__py_arg_bool(int v) {
+    CCPyArg a = {0};
+    a.kind = 5;
+    a.i = v ? 1 : 0;
+    return a;
+}
+
+static int cc__py_iso_arg_json(CC__PyIsoBuf *b, CCPy *home, const CCPyArg *a,
+                               const char *method) {
+    switch (a->kind) {
+    case 0: cc__py_iso_bnum_ll(b, a->i); return 0;
+    case 1: cc__py_iso_bnum_f(b, a->f); return 0;
+    case 2:
+    case 3:
+        cc__py_iso_bjson_str(b, (const char *)a->p, a->n);
+        return 0;
+    case 5:
+        cc__py_iso_bputs(b, a->i ? "true" : "false");
+        return 0;
+    case 4:
+        if (!a->home || a->home != home) {
+            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                     "python: %s: object argument from a different "
+                     "interpreter (same home required)",
+                     method ? method : "call");
+            return -1;
+        }
+        if (a->p) {
+            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                     "python: %s: cannot pass an in-process PyObject* "
+                     "across the isolated wire",
+                     method ? method : "call");
+            return -1;
+        }
+        if (a->okind == CC__PY_K_NULL) {
+            cc__py_iso_bputs(b, "null");
+            return 0;
+        }
+        if (a->okind != CC__PY_K_HANDLE) {
+            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                     "python: %s: isolated argument must be a scalar or "
+                     "a remote handle",
+                     method ? method : "call");
+            return -1;
+        }
+        cc__py_iso_bputs(b, "{\"$h\":");
+        cc__py_iso_bnum_ll(b, a->h);
+        cc__py_iso_bputs(b, "}");
+        return 0;
+    case 6:
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: %s: typed slices are not yet supported on "
+                 "process-isolated domains",
+                 method ? method : "call");
+        return -1;
+    case 7:
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: %s: buffer borrows (py_buf) are not yet "
+                 "supported on process-isolated domains",
+                 method ? method : "call");
+        return -1;
+    case 8: {
+        long long fid;
+        if (!a->p) {
+            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                     "python: %s: null py_fn", method ? method : "call");
+            return -1;
+        }
+        fid = cc__py_fn_add(home, (void *)a->p,
+                            a->okind ? NULL : (void *)(uintptr_t)a->n,
+                            a->okind ? a->i : 0, a->okind ? 1 : 0);
+        if (fid < 0) {
+            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                     "python: %s: out of memory registering py_fn",
+                     method ? method : "call");
+            return -1;
+        }
+        cc__py_iso_bputs(b, "{\"$f\":");
+        cc__py_iso_bnum_ll(b, fid);
+        cc__py_iso_bputs(b, "}");
+        return 0;
+    }
+    default:
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: %s: unsupported argument kind on the "
+                 "isolated wire",
+                 method ? method : "call");
+        return -1;
+    }
+}
+
+static CCResult_CCPyObj_CCPyError
+cc__py_iso_callm_n(CCPyObj *obj, const char *method, int argc,
+                   const CCPyArg *argv) {
+    CC__PyIsoBuf req = {0};
+    CC__PyIsoResp resp;
+    long long id;
+    int rc, i, nkw = 0;
+    CCResult_CCPyObj_CCPyError out;
+    CCPy *py = obj ? obj->home : NULL;
+    int is_invoke;
+    cc__py_bind_err_obj(obj);
+    if (!obj || !py)
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(method));
+    if (obj->kind != CC__PY_K_HANDLE) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: %s: not a remote handle",
+                 method ? method : "call");
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(method));
+    }
+    if (!cc__py_iso_alive(py, method ? method : "call"))
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(method));
+    if (argc > CC__PY_MAX_CALL_ARGS) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: %s: too many arguments (max %d)", method,
+                 CC__PY_MAX_CALL_ARGS);
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(method));
+    }
+    for (i = 0; i < argc; i++)
+        if (argv[i].kwname) nkw++;
+    if (nkw > 0) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: %s: keyword arguments are not yet supported "
+                 "on process-isolated domains",
+                 method ? method : "call");
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(method));
+    }
+    is_invoke = method && strcmp(method, "invoke") == 0;
+    id = py->next_id++;
+    cc__py_iso_bputs(&req, "{\"id\":");
+    cc__py_iso_bnum_ll(&req, id);
+    cc__py_iso_bputs(&req, ",\"op\":\"callp\",\"h\":");
+    cc__py_iso_bnum_ll(&req, obj->h);
+    cc__py_iso_bputs(&req, ",\"path\":[");
+    if (!is_invoke)
+        cc__py_iso_bjson_str(&req, method, method ? strlen(method) : 0);
+    cc__py_iso_bputs(&req, "],\"args\":[");
+    for (i = 0; i < argc; i++) {
+        if (i) cc__py_iso_bputs(&req, ",");
+        if (cc__py_iso_arg_json(&req, py, &argv[i], method) != 0) {
+            free(req.p);
+            return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(method));
+        }
+    }
+    cc__py_iso_bputs(&req, "]}");
+    rc = cc__py_iso_req(py, &req, method ? method : "call", id, &resp);
+    free(req.p);
+    if (rc != 0)
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(method));
+    memset(&out, 0, sizeof(out));
+    out.ok = true;
+    out.u.value = cc__py_iso_val_from(py, &resp);
+    return out;
+}
+
+static CCResult_CCPyObj_CCPyError
+cc__py_iso_call_o(CCPyObj *obj, const char *m, CCPyObj *arg) {
+    CCPyArg a;
+    if (!arg) return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(m));
+    a = cc__py_arg_obj(*arg);
+    return cc__py_iso_callm_n(obj, m, 1, &a);
+}
+
+
+/* Typed slices (`double[:]` -> CCSlice_double): marshal as a Python
+ * list of the element type. len = element count; the CC_PY_ARG
+ * _Generic dispatches on the instance struct, so any expression of a
+ * typed slice type marshals — not just declared locals. */
+static inline CCPyArg cc__py_arg_tslice(CCSlice s, int esz, int isf, int iss) {
+    CCPyArg a = {0};
+    a.kind = 6;
+    a.p = s.ptr;
+    a.n = s.len;
+    a.i = (long long)((esz & 0xff) | (isf ? 0x100 : 0) | (iss ? 0x200 : 0));
+    return a;
+}
+
+#define CC__PY_TSLICE_ARM(NAME, T)                                             \
+    static inline CCPyArg cc__py_arg_ts_##NAME(NAME s) {                       \
+        return cc__py_arg_tslice(s.base, (int)sizeof(T),                       \
+                                 _Generic((T)0, float: 1, double: 1, default: 0), \
+                                 (((T)-1) < ((T)1) ? 1 : 0));                  \
+    }
+CC__PY_TSLICE_ARM(CCSlice_short, short)
+CC__PY_TSLICE_ARM(CCSlice_int, int)
+CC__PY_TSLICE_ARM(CCSlice_long, long)
+CC__PY_TSLICE_ARM(CCSlice_long_long, long long)
+CC__PY_TSLICE_ARM(CCSlice_int16_t, int16_t)
+CC__PY_TSLICE_ARM(CCSlice_int32_t, int32_t)
+CC__PY_TSLICE_ARM(CCSlice_int64_t, int64_t)
+CC__PY_TSLICE_ARM(CCSlice_float, float)
+CC__PY_TSLICE_ARM(CCSlice_double, double)
+#undef CC__PY_TSLICE_ARM
+
+/* ---- py_fn: CC host callables into Python ---------------------------- */
+
+typedef struct CC__PyFnBox {
+    CCPy *home;
+    void *fn;
+    void *userdata;
+    long long userdata_i64;
+    int is_i64;
+    int dead;
+    struct CC__PyFnBox *next;
+} CC__PyFnBox;
+
+static long long cc__py_fn_add(CCPy *d, void *fn, void *userdata,
+                               long long userdata_i64, int is_i64) {
+    long long fid;
+    if (!d || !fn) return -1;
+    fid = d->next_cb++;
+    if ((size_t)fid >= d->cbs_cap) {
+        size_t nc = d->cbs_cap ? d->cbs_cap * 2 : 8;
+        void *np;
+        while (nc <= (size_t)fid) nc *= 2;
+        np = realloc(d->cbs, nc * sizeof(d->cbs[0]));
+        if (!np) return -1;
+        memset((char *)np + d->cbs_cap * sizeof(d->cbs[0]), 0,
+               (nc - d->cbs_cap) * sizeof(d->cbs[0]));
+        d->cbs = np;
+        d->cbs_cap = nc;
+    }
+    d->cbs[fid].fn = fn;
+    d->cbs[fid].userdata = userdata;
+    d->cbs[fid].userdata_i64 = userdata_i64;
+    d->cbs[fid].is_i64 = is_i64;
+    return fid;
+}
+
+static void cc__py_fn_kill_boxes(CCPy *d) {
+    CC__PyFnBox *b, *n;
+    if (!d) return;
+    for (b = d->fn_boxes; b; b = n) {
+        b->dead = 1;
+        n = b->next;
+        free(b);
+    }
+    d->fn_boxes = NULL;
+    free(d->cbs);
+    d->cbs = NULL;
+    d->cbs_cap = 0;
+    d->next_cb = 0;
+}
+
+static int cc__py_fn_from_pyobj(CCPy *home, void *o, CCPyObj *out) {
+    void *t = NULL, *f = NULL, *n = NULL;
+    const char *s;
+    intptr_t slen = 0;
+    long long iv;
+    double dv;
+    memset(out, 0, sizeof(*out));
+    out->home = home;
+    if (!o) {
+        out->kind = CC__PY_K_NULL;
+        return 0;
+    }
+    t = cc__py.BoolFromLong(1);
+    f = cc__py.BoolFromLong(0);
+    if (o == t || o == f) {
+        out->kind = CC__PY_K_BOOL;
+        out->b = (o == t);
+        if (t) cc__py.DecRef(t);
+        if (f) cc__py.DecRef(f);
+        return 0;
+    }
+    if (t) cc__py.DecRef(t);
+    if (f) cc__py.DecRef(f);
+    n = cc__py_none();
+    if (n) {
+        int is_none = (o == n);
+        cc__py.DecRef(n);
+        if (is_none) {
+            out->kind = CC__PY_K_NULL;
+            return 0;
+        }
+    }
+    if (cc__py.ErrClear) cc__py.ErrClear();
+    iv = cc__py.LongAsLongLong(o);
+    if (!cc__py.ErrOccurred || !cc__py.ErrOccurred()) {
+        out->kind = CC__PY_K_NUM;
+        out->num_is_int = 1;
+        out->inum = iv;
+        out->num = (double)iv;
+        return 0;
+    }
+    if (cc__py.ErrClear) cc__py.ErrClear();
+    dv = cc__py.FloatAsDouble(o);
+    if (!cc__py.ErrOccurred || !cc__py.ErrOccurred()) {
+        out->kind = CC__PY_K_NUM;
+        out->num = dv;
+        out->inum = (long long)dv;
+        out->num_is_int = 0;
+        return 0;
+    }
+    if (cc__py.ErrClear) cc__py.ErrClear();
+    s = cc__py.AsUTF8AndSize(o, &slen);
+    if (s && (!cc__py.ErrOccurred || !cc__py.ErrOccurred())) {
+        char *copy = NULL;
+        out->kind = CC__PY_K_STR;
+        if (home && home->arena && slen >= 0) {
+            copy = (char *)cc_arena_alloc(home->arena, (size_t)slen + 1, 1);
+            if (copy) {
+                memcpy(copy, s, (size_t)slen);
+                copy[slen] = 0;
+                out->text.ptr = copy;
+                out->text.len = (size_t)slen;
+                return 0;
+            }
+        }
+        out->text.ptr = (void *)s;
+        out->text.len = (size_t)(slen > 0 ? slen : 0);
+        return 0;
+    }
+    if (cc__py.ErrClear) cc__py.ErrClear();
+    out->kind = CC__PY_K_LOCAL;
+    out->o = o;
+    cc__py.IncRef(o);
+    return 0;
+}
+
+static void *cc__py_fn_to_pyobj(CCPy *home, const CCPyObj *v) {
+    if (!v) return cc__py_none();
+    switch (v->kind) {
+    case CC__PY_K_NULL: return cc__py_none();
+    case CC__PY_K_BOOL: return cc__py.BoolFromLong(v->b ? 1 : 0);
+    case CC__PY_K_NUM:
+        if (v->num_is_int) return cc__py.LongFromLongLong(v->inum);
+        return cc__py.FloatFromDouble(v->num);
+    case CC__PY_K_STR:
+        return cc__py.UnicodeFromStringAndSize(
+            v->text.ptr ? (const char *)v->text.ptr : "",
+            (intptr_t)v->text.len);
+    case CC__PY_K_LOCAL:
+        if (v->o) {
+            cc__py.IncRef(v->o);
+            return v->o;
+        }
+        return cc__py_none();
+    case CC__PY_K_HANDLE:
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: py_fn: cannot return a remote handle from an "
+                 "in-process host callback");
+        return NULL;
+    default:
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: py_fn: unsupported host-callback return kind");
+        return NULL;
+    }
+}
+
+static void *cc__py_fn_tramp(void *self, void *args) {
+    CC__PyFnBox *box =
+        cc__py.CapsuleGetPointer
+            ? (CC__PyFnBox *)cc__py.CapsuleGetPointer(self, "cc-py.fn")
+            : NULL;
+    CCPyObj argv[CC__PY_MAX_CALL_ARGS];
+    CCResult_CCPyObj_CCPyError rr;
+    CCPyObj out;
+    intptr_t n;
+    int i;
+    void *ret;
+    if (!box || !box->fn)
+        return cc__py_raise("python: py_fn: corrupt callback capsule");
+    if (box->dead || !box->home || !box->home->ready)
+        return cc__py_raise("python: py_fn: domain is closed");
+    n = args && cc__py.TupleSize ? cc__py.TupleSize(args) : 0;
+    if (n < 0) n = 0;
+    if (n > CC__PY_MAX_CALL_ARGS)
+        return cc__py_raise("python: py_fn: too many callback arguments");
+    memset(argv, 0, sizeof(argv));
+    memset(&rr, 0, sizeof(rr));
+    for (i = 0; i < (int)n; i++) {
+        void *item = cc__py.TupleGetItem(args, (intptr_t)i);
+        if (cc__py_fn_from_pyobj(box->home, item, &argv[i]) != 0) {
+            while (i-- > 0)
+                if (argv[i].kind == CC__PY_K_LOCAL && argv[i].o)
+                    cc__py.DecRef(argv[i].o);
+            return cc__py_raise(cc__py_errbuf[0] ? cc__py_errbuf
+                                                : "python: py_fn: bad arg");
+        }
+    }
+    box->home->cb_depth++;
+    if (box->is_i64)
+        rr = ((CCPyHostFnI64)box->fn)(box->userdata_i64, argv, (int)n);
+    else
+        rr = ((CCPyHostFn)box->fn)(box->userdata, argv, (int)n);
+    box->home->cb_depth--;
+    for (i = 0; i < (int)n; i++)
+        if (argv[i].kind == CC__PY_K_LOCAL && argv[i].o)
+            cc__py.DecRef(argv[i].o);
+    if (!rr.ok) {
+        const char *e = rr.u.error.base.message
+                            ? rr.u.error.base.message
+                            : "python: py_fn: callback failed";
+        return cc__py_raise(e);
+    }
+    out = rr.u.value;
+    ret = cc__py_fn_to_pyobj(box->home, &out);
+    if (out.kind == CC__PY_K_LOCAL && out.o) cc__py.DecRef(out.o);
+    if (!ret) {
+        if (cc__py.ErrClear) cc__py.ErrClear();
+        return cc__py_raise(cc__py_errbuf[0] ? cc__py_errbuf
+                                            : "python: py_fn: bad return");
+    }
+    return ret;
+}
+
+static CC__PyMethodDef cc__py_fn_def = {
+    "__cc_py_fn__", (void *)cc__py_fn_tramp, CC__PY_METH_VARARGS, NULL
+};
+
+static void *cc__py_fn_mint(CCPy *d, void *fn, void *userdata,
+                            long long userdata_i64, int is_i64,
+                            char *errbuf, size_t errcap) {
+    CC__PyFnBox *box;
+    void *capsule;
+    void *callable;
+    if (!d || !fn) {
+        snprintf(errbuf, errcap, "python: py_fn: null host function");
+        return NULL;
+    }
+    if (!cc__py.CFunctionNewEx || !cc__py.CapsuleNew ||
+        !cc__py.CapsuleGetPointer) {
+        snprintf(errbuf, errcap,
+                 "python: py_fn: this Python runtime cannot mint callables "
+                 "(needs PyCFunction_NewEx)");
+        return NULL;
+    }
+    box = (CC__PyFnBox *)calloc(1, sizeof(*box));
+    if (!box) {
+        snprintf(errbuf, errcap, "python: py_fn: out of memory");
+        return NULL;
+    }
+    box->home = d;
+    box->fn = fn;
+    box->userdata = userdata;
+    box->userdata_i64 = userdata_i64;
+    box->is_i64 = is_i64;
+    box->next = d->fn_boxes;
+    d->fn_boxes = box;
+    capsule = cc__py.CapsuleNew(box, "cc-py.fn", NULL);
+    callable = capsule ? cc__py.CFunctionNewEx(&cc__py_fn_def, capsule, NULL)
+                       : NULL;
+    if (capsule) cc__py.DecRef(capsule);
+    if (!callable) {
+        if (cc__py.ErrClear) cc__py.ErrClear();
+        snprintf(errbuf, errcap, "python: py_fn: cannot mint the callable");
+        return NULL;
+    }
+    return callable;
+}
+
+static inline CCPyArg cc__py_arg_fn(CCPyFn f) {
+    CCPyArg a = {0};
+    a.kind = 8;
+    a.p = f.fn;
+    if (f.is_i64) {
+        a.okind = 1; /* tag: fn is CCPyHostFnI64; i holds userdata by value */
+        a.i = f.userdata_i64;
+    } else {
+        a.okind = 0;
+        a.n = (size_t)(uintptr_t)f.userdata;
+    }
+    return a;
+}
+
+
+#define CC_PY_ARG(x)                                        \
+    _Generic((x),                                           \
+        double: cc__py_arg_f,                               \
+        float: cc__py_arg_f,                                \
+        int: cc__py_arg_i,                                  \
+        long: cc__py_arg_i,                                 \
+        long long: cc__py_arg_i,                            \
+        unsigned int: cc__py_arg_i,                         \
+        unsigned long: cc__py_arg_i,                        \
+        unsigned long long: cc__py_arg_i,                   \
+        char *: cc__py_arg_cstr,                            \
+        const char *: cc__py_arg_cstr,                      \
+        CCSlice: cc__py_arg_slice,                          \
+        CCSlice_short: cc__py_arg_ts_CCSlice_short,         \
+        CCSlice_int: cc__py_arg_ts_CCSlice_int,             \
+        CCSlice_long: cc__py_arg_ts_CCSlice_long,           \
+        CCSlice_long_long: cc__py_arg_ts_CCSlice_long_long, \
+        CCSlice_int16_t: cc__py_arg_ts_CCSlice_int16_t,     \
+        CCSlice_int32_t: cc__py_arg_ts_CCSlice_int32_t,     \
+        CCSlice_int64_t: cc__py_arg_ts_CCSlice_int64_t,     \
+        CCSlice_float: cc__py_arg_ts_CCSlice_float,         \
+        CCSlice_double: cc__py_arg_ts_CCSlice_double,       \
+        CCPyObj: cc__py_arg_obj,                            \
+        CCPyFn: cc__py_arg_fn,                              \
+        CCPyArg: cc__py_arg_pass,                           \
+        _Bool: cc__py_arg_bool)(x)
+
+/* `obj.f(1, py_kw("key", 2))` — a keyword argument is an ordinary
+ * marshalled argument carrying the name it binds to. */
+static inline CCPyArg cc__py_arg_named(const char *name, CCPyArg a) {
+    a.kwname = name;
+    return a;
+}
+/* An already-marshalled argument passes through the sink's CC_PY_ARG lift
+ * unchanged, so `py_kw(...)` nests inside an ordinary call argument list. */
+static inline CCPyArg cc__py_arg_pass(CCPyArg a) { return a; }
+
+/* Retarget a typed-slice argument (kind 6) at the buffer borrow (kind 7):
+ * same pointer, length restated in BYTES for the raw view; the element
+ * descriptor rides along and the materialized memoryview is cast to the
+ * element format, so Python sees values, not bytes.  Only a typed slice
+ * has a contiguous run to borrow, so any other argument is left exactly
+ * as it was and marshals normally — passing `py_buf` something that is
+ * not a buffer changes nothing rather than silently producing an empty
+ * view.
+ *
+ * Empty slices (n==0) often arrive with a NULL data pointer from
+ * napi/V8.  Still retarget to kind 7: falling through to kind-6 element
+ * marshalling would mint an empty Python list, so the Python type would
+ * flip at n=0 (memoryview vs list) — a classic production footgun. */
+static inline CCPyArg cc__py_arg_buffer(CCPyArg a) {
+    if (a.kind != 6) return a;
+    if (!a.p && a.n != 0) return a;
+    a.n = a.n * (size_t)(a.i & 0xff);
+    a.kind = 7;
+    return a;
+}
+#define py_kw(name, value) cc__py_arg_named((name), CC_PY_ARG(value))
+
+/* `obj.f(py_buf(xs))` — pass a typed slice as a `memoryview` over the CC
+ * buffer instead of marshalling element by element.  Nothing is copied.
+ *
+ *     double[:] xs = ...;
+ *     double s = m.sum_buffer(py_buf(xs)) !>;      // CC side
+ *     np.frombuffer(mv, dtype=np.float64).sum()    # Python side
+ *
+ * The memoryview borrows: it stays valid only while the CC buffer does, and
+ * a callee that stores it — or an array built on it with `np.frombuffer`,
+ * which shares the same memory — outlives its right to read. Copy on the
+ * Python side (`np.array(mv)`) to keep it. The view is read-only, so a
+ * callee cannot write back through it.
+ *
+ * The view is writable for the call (in-process sync); keep-past-return
+ * still fails the retention check. */
+#define py_buf(x) cc__py_arg_buffer(CC_PY_ARG(x))
+
+/* ---- vectorized call: one crossing for N calls ----
+ *
+ * `f.map::[T](&arena, cols...)` calls the held Python callable once per row:
+ * each argument is a typed slice (a column), row r's call is
+ * `f(col0[r], col1[r], ...)`, and the results land in a typed run of `T`.
+ * Columns may have DIFFERENT element types — a row is then a heterogeneous
+ * argument tuple — but every column must have the same length.
+ *
+ * The point is what it does NOT do per row: no interpreter attach, no
+ * attribute lookup, no UFCS dispatch, no Result box — one crossing carries
+ * the whole batch, and the C driver loop pays only per-element boxing plus
+ * the callee itself.  Per-call crossing is the dominant scalar cost, so this
+ * is the form for "call f over this data" when f must stay in Python.
+ *
+ * A row whose call raises reports that row's exception; a result that does
+ * not convert to `T` names the row.  Nothing is written past the failing
+ * row, and the slice is not returned. */
+static inline void *cc__py_box_elem(const CCPyArg *col, size_t row) {
+    int esz = (int)(col->i & 0xff);
+    int isf = (int)((col->i >> 8) & 1);
+    int iss = (int)((col->i >> 9) & 1);
+    const unsigned char *e = (const unsigned char *)col->p + row * (size_t)esz;
+    if (isf)
+        return cc__py.FloatFromDouble(esz == 4 ? (double)*(const float *)e
+                                               : *(const double *)e);
+    if (iss) {
+        long long x = esz == 1 ? *(const signed char *)e
+                    : esz == 2 ? *(const short *)e
+                    : esz == 4 ? *(const int *)e
+                               : *(const long long *)e;
+        return cc__py.LongFromLongLong(x);
+    }
+    {
+        unsigned long long x = esz == 1 ? *(const unsigned char *)e
+                             : esz == 2 ? *(const unsigned short *)e
+                             : esz == 4 ? *(const unsigned int *)e
+                                        : *(const unsigned long long *)e;
+        return cc__py.LongFromUnsignedLongLong(x);
+    }
+}
+
+/* The (elem size, floatness) pair is the cross-embedding worker shape —
+ * the parser-mode rewrite emits it textually, so no type token rides in
+ * the call.  Python stores by kind: floats widen to double, integers land
+ * as int64 or int. */
+static inline CCResult_CCSlice_CCPyError cc__py_obj_map_raw(
+        CCPyObj *fobj, CCArena *arena, int out_esz, int out_isf,
+        int argc, const CCPyArg *argv) {
+    CCPyElemKind outkind;
+    size_t nrows, r, esz;
+    CCSlice out;
+    int c;
+    cc__py_bind_err_obj(fobj);
+    if (out_isf)
+        outkind = CC__PY_EL_F64;
+    else if (out_esz == 8)
+        outkind = CC__PY_EL_I64;
+    else if (out_esz == 4)
+        outkind = CC__PY_EL_INT;
+    else {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: map: unsupported result element (size %d)", out_esz);
+        return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("map"));
+    }
+    esz = cc__py_elem_size(outkind);
+    if (!fobj || !fobj->o || !arena || argc < 1 || argc > 8) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: map: needs a callable, an arena, and 1..8 columns");
+        return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("map"));
+    }
+    if (!cc__py.Vectorcall) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: map: vectorcall unavailable");
+        return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("map"));
+    }
+    for (c = 0; c < argc; c++) {
+        if (argv[c].kind != 6 || (!argv[c].p && argv[c].n)) {
+            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                     "python: map: column %d is not a typed slice", c);
+            return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("map"));
+        }
+    }
+    nrows = argv[0].n;
+    for (c = 1; c < argc; c++) {
+        if (argv[c].n != nrows) {
+            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                     "python: map: column %d length %zu, column 0 length %zu",
+                     c, argv[c].n, nrows);
+            return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("map"));
+        }
+    }
+    out = cc_arena_alloc_slice(arena, esz, nrows, cc__py_elem_align(outkind));
+    if (!out.ptr && nrows > 0) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: map: arena exhausted (%zu rows)", nrows);
+        return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("map"));
+    }
+    for (r = 0; r < nrows; r++) {
+        void *av[8];
+        void *res;
+        for (c = 0; c < argc; c++) {
+            av[c] = cc__py_box_elem(&argv[c], r);
+            if (!av[c]) {
+                while (c-- > 0) cc__py.DecRef(av[c]);
+                snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                         "python: map: row %zu: argument does not box", r);
+                if (cc__py.ErrClear) cc__py.ErrClear();
+                return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("map"));
+            }
+        }
+        res = cc__py.Vectorcall(fobj->o, av, (size_t)argc, NULL);
+        for (c = 0; c < argc; c++) cc__py.DecRef(av[c]);
+        if (!res) {
+            /* The row's Python exception is the message; the row rides in
+             * the context so "which input" survives into the error face. */
+            char rctx[32];
+            snprintf(rctx, sizeof(rctx), "map row %zu", r);
+            return cc_err_CCResult_CCSlice_CCPyError(cc__py_err(rctx));
+        }
+        if (cc__py_elem_store(res, outkind, (char *)out.ptr + r * esz, arena) != 0) {
+            cc__py.DecRef(res);
+            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                     "python: map: row %zu: result does not convert", r);
+            if (cc__py.ErrClear) cc__py.ErrClear();
+            return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("map"));
+        }
+        cc__py.DecRef(res);
+    }
+    out.len = nrows;
+    return cc_ok_CCResult_CCSlice_CCPyError(out);
+}
+
+/* Destination-typed rows: `double[:] ys = f.map(&a, cols…) !>` binds the
+ * typed slice directly — the lowering composes `cc__py_obj_map_<dest>`
+ * when the destination (or the spelled `::[T]`) is a typed slice, and
+ * the raw worker otherwise.  Spelled longhand: macro-minted names are
+ * invisible to compose-then-verify. */
+#ifndef CCResult_CCSlice_double_CCPyError_DEFINED
+#define CCResult_CCSlice_double_CCPyError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCSlice_double_CCPyError_DEFINED
+#define CCResult_CCSlice_double_CCPyError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCSlice_double_CCPyError, CCSlice_double, CCPyError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_CCSlice_double_CCPyError, CCSlice_double, CCPyError)
+#endif
+#ifndef CCResult_CCSlice_float_CCPyError_DEFINED
+#define CCResult_CCSlice_float_CCPyError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCSlice_float_CCPyError_DEFINED
+#define CCResult_CCSlice_float_CCPyError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCSlice_float_CCPyError, CCSlice_float, CCPyError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_CCSlice_float_CCPyError, CCSlice_float, CCPyError)
+#endif
+#ifndef CCResult_CCSlice_int64_t_CCPyError_DEFINED
+#define CCResult_CCSlice_int64_t_CCPyError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCSlice_int64_t_CCPyError_DEFINED
+#define CCResult_CCSlice_int64_t_CCPyError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCSlice_int64_t_CCPyError, CCSlice_int64_t, CCPyError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_CCSlice_int64_t_CCPyError, CCSlice_int64_t, CCPyError)
+#endif
+#ifndef CCResult_CCSlice_long_long_CCPyError_DEFINED
+#define CCResult_CCSlice_long_long_CCPyError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCSlice_long_long_CCPyError_DEFINED
+#define CCResult_CCSlice_long_long_CCPyError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCSlice_long_long_CCPyError, CCSlice_long_long, CCPyError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_CCSlice_long_long_CCPyError, CCSlice_long_long, CCPyError)
+#endif
+#ifndef CCResult_CCSlice_int_CCPyError_DEFINED
+#define CCResult_CCSlice_int_CCPyError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCSlice_int_CCPyError_DEFINED
+#define CCResult_CCSlice_int_CCPyError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCSlice_int_CCPyError, CCSlice_int, CCPyError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_CCSlice_int_CCPyError, CCSlice_int, CCPyError)
+#endif
+
+static inline CCResult_CCSlice_double_CCPyError cc__py_obj_map_CCSlice_double(
+        CCPyObj *fobj, CCArena *arena, int esz, int isf, int argc,
+        const CCPyArg *argv) {
+    CCResult_CCSlice_CCPyError r =
+        cc__py_obj_map_raw(fobj, arena, esz, isf, argc, argv);
+    CCSlice_double out;
+    if (!r.ok)
+        return cc_err_CCResult_CCSlice_double_CCPyError(r.u.error);
+    out.base = r.u.value;
+    return cc_ok_CCResult_CCSlice_double_CCPyError(out);
+}
+
+static inline CCResult_CCSlice_float_CCPyError cc__py_obj_map_CCSlice_float(
+        CCPyObj *fobj, CCArena *arena, int esz, int isf, int argc,
+        const CCPyArg *argv) {
+    CCResult_CCSlice_CCPyError r =
+        cc__py_obj_map_raw(fobj, arena, esz, isf, argc, argv);
+    CCSlice_float out;
+    if (!r.ok)
+        return cc_err_CCResult_CCSlice_float_CCPyError(r.u.error);
+    out.base = r.u.value;
+    return cc_ok_CCResult_CCSlice_float_CCPyError(out);
+}
+
+static inline CCResult_CCSlice_int64_t_CCPyError cc__py_obj_map_CCSlice_int64_t(
+        CCPyObj *fobj, CCArena *arena, int esz, int isf, int argc,
+        const CCPyArg *argv) {
+    CCResult_CCSlice_CCPyError r =
+        cc__py_obj_map_raw(fobj, arena, esz, isf, argc, argv);
+    CCSlice_int64_t out;
+    if (!r.ok)
+        return cc_err_CCResult_CCSlice_int64_t_CCPyError(r.u.error);
+    out.base = r.u.value;
+    return cc_ok_CCResult_CCSlice_int64_t_CCPyError(out);
+}
+
+static inline CCResult_CCSlice_long_long_CCPyError cc__py_obj_map_CCSlice_long_long(
+        CCPyObj *fobj, CCArena *arena, int esz, int isf, int argc,
+        const CCPyArg *argv) {
+    CCResult_CCSlice_CCPyError r =
+        cc__py_obj_map_raw(fobj, arena, esz, isf, argc, argv);
+    CCSlice_long_long out;
+    if (!r.ok)
+        return cc_err_CCResult_CCSlice_long_long_CCPyError(r.u.error);
+    out.base = r.u.value;
+    return cc_ok_CCResult_CCSlice_long_long_CCPyError(out);
+}
+
+static inline CCResult_CCSlice_int_CCPyError cc__py_obj_map_CCSlice_int(
+        CCPyObj *fobj, CCArena *arena, int esz, int isf, int argc,
+        const CCPyArg *argv) {
+    CCResult_CCSlice_CCPyError r =
+        cc__py_obj_map_raw(fobj, arena, esz, isf, argc, argv);
+    CCSlice_int out;
+    if (!r.ok)
+        return cc_err_CCResult_CCSlice_int_CCPyError(r.u.error);
+    out.base = r.u.value;
+    return cc_ok_CCResult_CCSlice_int_CCPyError(out);
+}
+
+/* Column lift: CC_PY_ARG applied to each vararg, counted.  Explicit per
+ * arity — recursion tricks save lines and cost readability. */
+#define CC__PY_NARG_(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, \
+                     a13, a14, a15, a16, N, ...) N
+#define CC__PY_NARG(...) CC__PY_NARG_(__VA_ARGS__, \
+        16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1)
+#define CC__PY_MAPA1(a) CC_PY_ARG(a)
+#define CC__PY_MAPA2(a, b) CC_PY_ARG(a), CC_PY_ARG(b)
+#define CC__PY_MAPA3(a, b, c) CC_PY_ARG(a), CC_PY_ARG(b), CC_PY_ARG(c)
+#define CC__PY_MAPA4(a, b, c, d) CC__PY_MAPA3(a, b, c), CC_PY_ARG(d)
+#define CC__PY_MAPA5(a, b, c, d, e) CC__PY_MAPA4(a, b, c, d), CC_PY_ARG(e)
+#define CC__PY_MAPA6(a, b, c, d, e, f) CC__PY_MAPA5(a, b, c, d, e), CC_PY_ARG(f)
+#define CC__PY_MAPA7(a, b, c, d, e, f, g) CC__PY_MAPA6(a, b, c, d, e, f), CC_PY_ARG(g)
+#define CC__PY_MAPA8(a, b, c, d, e, f, g, h) CC__PY_MAPA7(a, b, c, d, e, f, g), CC_PY_ARG(h)
+/* Past the cap, the count selects a poison arm whose name IS the message:
+ * a ninth column reports `cc__py_map_takes_at_most_8_columns` undeclared at
+ * the call's line, instead of the ninth column landing in the count
+ * parameter and failing as a slice-to-int conversion. */
+#define CC__PY_MAPA9(...)  cc__py_map_takes_at_most_8_columns
+#define CC__PY_MAPA10(...) cc__py_map_takes_at_most_8_columns
+#define CC__PY_MAPA11(...) cc__py_map_takes_at_most_8_columns
+#define CC__PY_MAPA12(...) cc__py_map_takes_at_most_8_columns
+#define CC__PY_MAPA13(...) cc__py_map_takes_at_most_8_columns
+#define CC__PY_MAPA14(...) cc__py_map_takes_at_most_8_columns
+#define CC__PY_MAPA15(...) cc__py_map_takes_at_most_8_columns
+#define CC__PY_MAPA16(...) cc__py_map_takes_at_most_8_columns
+#define CC__PY_MAPCAT_(a, b) a##b
+#define CC__PY_MAPCAT(a, b) CC__PY_MAPCAT_(a, b)
+/* Declared before it is defined as a macro, so the Result registry can type
+ * a `cc_py_obj_map(...) !>` call site: every arity returns the same
+ * CCSlice !>(CCPyError), and without a typed entry the unwrap falls
+ * back to the roster `_Generic`, whose `default:` arm hands the whole
+ * Result struct to a CCSlice destination.  The symbol is never defined —
+ * the macro below intercepts every call — so nothing references it at
+ * link time. */
+CCResult_CCSlice_CCPyError cc_py_obj_map(void *never_defined, ...);
+#define cc_py_obj_map(T, obj, arena, ...)     cc__py_obj_map_raw((obj), (arena), (int)sizeof(T),         _Generic((T)0, float: 1, double: 1, default: 0),         CC__PY_NARG(__VA_ARGS__),         (const CCPyArg[]){             CC__PY_MAPCAT(CC__PY_MAPA, CC__PY_NARG(__VA_ARGS__))(__VA_ARGS__) })
+
+
+/* `obj.method(args…)` sink core: builds an argument tuple and calls the
+ * attribute. `cc_py_obj_callm` (the `.ufcs_sink` registration) and
+ * the destination-typed variants below share this body. */
+/* The interned name object for `method` in `home`'s interpreter, or NULL when
+ * it cannot be cached (no handle, table full, interning unavailable) — the
+ * caller then falls back to the by-string lookup, which always works. */
+static inline void *cc__py_name_obj(CCPy *home, const char *method) {
+    int i;
+    void *n;
+    const char *stable;
+    intptr_t nlen = 0;
+    if (!home || !method || !cc__py.UnicodeInternFromString) return NULL;
+    for (i = 0; i < home->name_count; i++) {
+        if (home->names[i].key == method ||
+            strcmp(home->names[i].key, method) == 0)
+            return home->names[i].name;
+    }
+    if (home->name_count >= CC__PY_NAME_CACHE) return NULL;
+    n = cc__py.UnicodeInternFromString(method);
+    if (!n) { cc__py.ErrClear(); return NULL; }
+    /* Key the cache by the interned object's UTF-8: stable for as long as
+     * we hold `n`, unlike a caller's reused buffer. */
+    stable = cc__py.AsUTF8AndSize(n, &nlen);
+    if (!stable) {
+        cc__py.DecRef(n);
+        cc__py.ErrClear();
+        return NULL;
+    }
+    /* Held for the life of the handle: the table is bounded, and the object
+     * must outlive every call that looks it up. */
+    home->names[home->name_count].key = stable;
+    home->names[home->name_count].name = n;
+    home->name_count++;
+    return n;
+}
+
+/* The call body takes the arguments as an ARRAY.  Varargs cost a copy of each
+ * `CCPyArg` into the call frame and another back out through `va_arg`; a
+ * caller holding an array pays neither, and the array form is what the UFCS
+ * lowering emits.  The variadic entry points below adapt onto this. */
+/* sys.getrefcount, held on the handle (released in cc_py_close): the
+ * py_buf retained-export check runs per view. */
+static inline void *cc__py_getrefcount(CCPy *py) {
+    if (!py) return NULL;
+    if (!py->sys_getrefcount && cc__py.ImportModule && cc__py.GetAttrString) {
+        void *sysm = cc__py.ImportModule("sys");
+        if (sysm) {
+            py->sys_getrefcount = cc__py.GetAttrString(sysm, "getrefcount");
+            cc__py.DecRef(sysm);
+        }
+        if (!py->sys_getrefcount && cc__py.ErrClear) cc__py.ErrClear();
+    }
+    return py->sys_getrefcount;
+}
+
+/* mv.release() through the interned name and a vectorcall; the
+ * string-keyed CallMethod shape stays as the fallback. */
+static inline void cc__py_view_release(CCPy *py, void *view) {
+    void *rel = NULL;
+    void *nm = py ? cc__py_name_obj(py, "release") : NULL;
+    if (nm && cc__py.GetAttr && cc__py.Vectorcall) {
+        void *m = cc__py.GetAttr(view, nm);
+        if (m) {
+            rel = cc__py.Vectorcall(m, NULL, 0, NULL);
+            cc__py.DecRef(m);
+        }
+    } else if (cc__py.CallMethod) {
+        rel = cc__py.CallMethod(view, "release", NULL);
+    }
+    if (rel) cc__py.DecRef(rel);
+    else if (cc__py.ErrClear) cc__py.ErrClear();
+}
+
+static inline CCResult_CCPyObj_CCPyError cc__py_obj_callm_n(CCPyObj *obj,
+                                                            const char *method,
+                                                            int argc,
+                                                            const CCPyArg *argv) {
+    void *attr = NULL;
+    void *tuple = NULL;
+    void *kwargs = NULL;
+    void *r = NULL;
+    void *av[CC__PY_MAX_CALL_ARGS];
+    void *views[CC__PY_MAX_CALL_ARGS];
+    int view_arg[CC__PY_MAX_CALL_ARGS];
+    /* Py_buffer backing for one-shot typed views (format/shape must stay
+     * valid while the view lives; the view is call-scoped, released
+     * below, and a view kept past release answers ValueError before any
+     * field is read). */
+    CC__PyBuffer vpb[CC__PY_MAX_CALL_ARGS];
+    intptr_t vshape[CC__PY_MAX_CALL_ARGS];
+    char vfmt[CC__PY_MAX_CALL_ARGS][2];
+    int i, nkw = 0, npos = 0, pi = 0, use_vec = 0, nviews = 0;
+    cc__py_bind_err_obj(obj);
+    if (!obj || argc < 0)
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(method));
+    if (obj->home && obj->home->tier == CC__PY_TIER_PROC)
+        return cc__py_iso_callm_n(obj, method, argc, argv);
+    if (!obj->o)
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(method));
+    if (method && strcmp(method, "invoke") == 0) {
+        /* `f.invoke(args…)` calls the VALUE itself — the hot path for a
+         * held callable (np.get("dot") once, invoke per call): no
+         * attribute lookup rides on the call.  This shadows a Python
+         * attribute literally named `invoke`; an object that really has
+         * one is reached as f.get("invoke") plus .invoke() on the get. */
+        attr = obj->o;
+        cc__py.IncRef(attr);
+    } else {
+        void *nm = cc__py_name_obj(obj->home, method);
+        attr = (nm && cc__py.GetAttr) ? cc__py.GetAttr(obj->o, nm)
+                                      : cc__py.GetAttrString(obj->o, method);
+    }
+    if (!attr) return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(method));
+    if (argc > CC__PY_MAX_CALL_ARGS) {
+        cc__py.DecRef(attr);
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: %s: too many arguments (max %d)", method,
+                 CC__PY_MAX_CALL_ARGS);
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(method));
+    }
+    for (i = 0; i < argc; i++)
+        if (argv[i].kwname) nkw++;
+    npos = argc - nkw;
+    /* No keywords and a vectorcall available: the arguments go in a local
+     * array and no tuple is built at all.  The tuple was allocated and freed
+     * on every call purely to hand CPython a container it immediately
+     * unpacks.  Keywords still need one, so that path is unchanged. */
+    use_vec = (nkw == 0 && cc__py.Vectorcall != NULL);
+    if (!use_vec) {
+        tuple = cc__py.TupleNew((intptr_t)npos);
+        if (!tuple) {
+            cc__py.DecRef(attr);
+            return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(method));
+        }
+    }
+    if (nkw > 0) {
+        kwargs = cc__py.DictNew ? cc__py.DictNew() : NULL;
+        if (!kwargs) {
+            cc__py.DecRef(tuple);
+            cc__py.DecRef(attr);
+            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                     "python: %s: keyword arguments unavailable", method);
+            return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(method));
+        }
+    }
+    for (i = 0; i < argc; i++) {
+        CCPyArg a = argv[i];
+        void *v = NULL;
+        switch (a.kind) {
+        case 0: v = cc__py.LongFromLongLong(a.i); break;
+        case 1: v = cc__py.FloatFromDouble(a.f); break;
+        case 2:
+        case 3:
+            v = cc__py.UnicodeFromStringAndSize((const char *)a.p,
+                                                (intptr_t)a.n);
+            break;
+        case 4:
+            /* Home is load-bearing: a PyObject* from interpreter A must
+             * not be incref'd into a call on interpreter B. */
+            if (a.p && (!a.home || a.home != obj->home)) {
+                snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                         "python: %s: object argument from a different "
+                         "interpreter (same home required)",
+                         method ? method : "call");
+                v = NULL;
+                break;
+            }
+            v = (void *)a.p;
+            if (v) cc__py.IncRef(v); /* tuple will steal one */
+            break;
+        case 5: v = cc__py.BoolFromLong((long)a.i); break;
+        case 8: {
+            v = cc__py_fn_mint(obj->home, (void *)a.p,
+                               a.okind ? NULL : (void *)(uintptr_t)a.n,
+                               a.okind ? a.i : 0, a.okind ? 1 : 0,
+                               cc__py_errbuf, sizeof(cc__py_errbuf));
+            break;
+        }
+        case 6: {
+            /* Typed slice -> Python list of scalars. */
+            size_t cnt = a.n;
+            int esz = (int)(a.i & 0xff);
+            int isf = (int)((a.i >> 8) & 1);
+            int iss = (int)((a.i >> 9) & 1);
+            const unsigned char *base = (const unsigned char *)a.p;
+            size_t k;
+            v = cc__py.ListNew((intptr_t)cnt);
+            if (v && base) {
+                for (k = 0; k < cnt; k++) {
+                    const void *e = base + k * (size_t)esz;
+                    void *ev = NULL;
+                    if (isf) {
+                        ev = cc__py.FloatFromDouble(
+                            esz == 4 ? (double)*(const float *)e
+                                     : *(const double *)e);
+                    } else if (iss) {
+                        long long x = esz == 1 ? *(const signed char *)e
+                                    : esz == 2 ? *(const short *)e
+                                    : esz == 4 ? *(const int *)e
+                                               : *(const long long *)e;
+                        ev = cc__py.LongFromLongLong(x);
+                    } else {
+                        unsigned long long x =
+                              esz == 1 ? *(const unsigned char *)e
+                            : esz == 2 ? *(const unsigned short *)e
+                            : esz == 4 ? *(const unsigned int *)e
+                                       : *(const unsigned long long *)e;
+                        ev = cc__py.LongFromUnsignedLongLong(x);
+                    }
+                    if (!ev || cc__py.ListSetItem(v, (intptr_t)k, ev) != 0) {
+                        cc__py.DecRef(v);
+                        v = NULL;
+                        break;
+                    }
+                }
+            }
+            break;
+        }
+        case 7: {
+            /* Borrow, not copy: a `memoryview` over the CC buffer itself.
+             * Kind 6 builds one Python object per element and the callee then
+             * rebuilds a contiguous array from them, which is the whole cost
+             * of the crossing when both sides already agree on the layout.
+             *
+             * The view carries the slice's ELEMENT format (`d`, `q`, …), not
+             * bytes: `len(mv)` is the element count, `sum(mv)` sums values,
+             * and numpy's asarray wraps it typed — a bytes-shaped view made
+             * every consumer restate the dtype the slice already knew.
+             *
+             * The borrow is CALL-SCOPED: the view is released when the call
+             * returns (below), so the callee computes through it or copies.
+             * A callee that kept a buffer export (numpy.frombuffer, a nested
+             * memoryview) fails the call at the boundary; one that kept the
+             * view itself gets ValueError on a later touch — never a read
+             * through freed CC memory.  Writable: in-process is sync and
+             * single-threaded, so writes land in the caller's TypedArray
+             * for the call (same idiom as CC module-export slice borrow). */
+            {
+                int esz = (int)(a.i & 0xff);
+                int isf = (int)((a.i >> 8) & 1);
+                int iss = (int)((a.i >> 9) & 1);
+                const char *fmt =
+                    isf ? (esz == 4 ? "f" : "d")
+                        : esz == 1 ? (iss ? "b" : "B")
+                        : esz == 2 ? (iss ? "h" : "H")
+                        : esz == 4 ? (iss ? "i" : "I")
+                                   : (iss ? "q" : "Q");
+                /* Empty borrows often have a NULL data pointer; CPython
+                 * still wants a non-NULL buf for len==0. */
+                static char cc__py_empty_borrow_byte;
+                void *buf = (void *)(uintptr_t)a.p;
+                if (!buf && a.n == 0) buf = &cc__py_empty_borrow_byte;
+                v = NULL;
+                if (buf && cc__py.MemoryViewFromBuffer &&
+                    nviews < CC__PY_MAX_CALL_ARGS) {
+                    /* One shot: the filled Py_buffer carries the element
+                     * format, no cast call rides on the argument. */
+                    CC__PyBuffer *pb = &vpb[nviews];
+                    memset(pb, 0, sizeof(*pb));
+                    vfmt[nviews][0] = fmt[0];
+                    vfmt[nviews][1] = 0;
+                    vshape[nviews] = (intptr_t)(a.n / (size_t)(esz ? esz : 1));
+                    pb->buf = buf;
+                    pb->len = (intptr_t)a.n;
+                    pb->itemsize = esz ? esz : 1;
+                    pb->readonly = 0;
+                    pb->ndim = 1;
+                    pb->format = vfmt[nviews];
+                    pb->shape = &vshape[nviews];
+                    v = cc__py.MemoryViewFromBuffer(pb);
+                    if (!v && cc__py.ErrClear) cc__py.ErrClear();
+                }
+                if (!v && buf && cc__py.MemoryViewFromMemory) {
+                    v = cc__py.MemoryViewFromMemory((char *)buf,
+                                                    (intptr_t)a.n,
+                                                    0x200 /* PyBUF_WRITE */);
+                    if (v) {
+                        void *cast = cc__py.CallMethod
+                                         ? cc__py.CallMethod(v, "cast", "s", fmt)
+                                         : NULL;
+                        if (!cast) {
+                            /* No silent bytes view — the callee would
+                             * compute on uint8 and be indistinguishable
+                             * from success. */
+                            cc__py.DecRef(v);
+                            v = NULL;
+                            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                                     "python: %s: py_buf view cast to '%s' "
+                                     "failed",
+                                     method, fmt);
+                            if (cc__py.ErrClear) cc__py.ErrClear();
+                        } else {
+                            cc__py.DecRef(v);
+                            v = cast;
+                        }
+                    }
+                }
+            }
+            if (v && nviews < CC__PY_MAX_CALL_ARGS) {
+                cc__py.IncRef(v); /* the record's own reference */
+                views[nviews] = v;
+                view_arg[nviews] = i;
+                nviews++;
+            }
+            break;
+        }
+        default: break;
+        }
+        if (!v) goto arg_failed;
+        if (a.kwname) {
+            int rc = cc__py.DictSetItemString(kwargs, a.kwname, v);
+            cc__py.DecRef(v); /* dict took its own reference */
+            if (rc != 0) goto arg_failed;
+        } else {
+            av[pi++] = v;
+            /* `PyTuple_SetItem` STEALS the reference; the vectorcall path
+             * keeps ownership and drops it after the call. */
+            if (!use_vec && cc__py.TupleSetItem(tuple, (intptr_t)(pi - 1), v) != 0)
+                goto arg_failed;
+        }
+        continue;
+    arg_failed:
+        if (use_vec) { int k; for (k = 0; k < pi; k++) cc__py.DecRef(av[k]); }
+        { int k; for (k = 0; k < nviews; k++) cc__py.DecRef(views[k]); }
+        if (kwargs) cc__py.DecRef(kwargs);
+        if (tuple) cc__py.DecRef(tuple);
+        cc__py.DecRef(attr);
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(method));
+    }
+    if (use_vec) {
+        r = cc__py.Vectorcall(attr, av, (size_t)npos, NULL);
+        for (i = 0; i < pi; i++) cc__py.DecRef(av[i]);
+    } else {
+        /* PyObject_Call carries keywords; CallObject is the no-kwargs path. */
+        r = kwargs ? cc__py.Call(attr, tuple, kwargs)
+                   : cc__py.CallObject(attr, tuple);
+    }
+    if (kwargs) cc__py.DecRef(kwargs);
+    if (tuple) cc__py.DecRef(tuple);
+    cc__py.DecRef(attr);
+    /* End of the borrow: every py_buf view is checked and released now
+     * that the call has returned.  Retention is detected by refcount — a
+     * clean view holds exactly our record's reference (getrefcount
+     * reports 2: the record plus its own argument temp); anything higher
+     * means the callee kept the view or something built on it (a numpy
+     * frombuffer array holds its base this way while snapshotting the
+     * raw pointer, which release() alone can neither see nor revoke).
+     * The view is then release()d regardless, so a kept view that
+     * somehow escaped the count dies loudly (ValueError) rather than
+     * reading freed CC memory.  When the call itself raised, its
+     * exception stays primary and the views just drop with their
+     * references (no Python calls with an exception pending). */
+    if (nviews > 0) {
+        /* sys.getrefcount is resolved once per handle; each check is one
+         * vectorcall, not an import plus a string-keyed method call. */
+        void *grc = r ? cc__py_getrefcount(obj->home) : NULL;
+        for (i = 0; i < nviews && r; i++) {
+            /* The clean-view count depends on how getrefcount is called:
+             * a vectorcall passes the view borrowed (record ref only, 1);
+             * the CallMethod fallback adds its argument-tuple ref (2). */
+            long long rc = 0, clean = 0;
+            if (grc && cc__py.Vectorcall) {
+                void *rco = cc__py.Vectorcall(grc, &views[i], 1, NULL);
+                if (rco) { rc = cc__py.LongAsLongLong(rco); cc__py.DecRef(rco); }
+                else if (cc__py.ErrClear) cc__py.ErrClear();
+                clean = 1;
+            } else if (cc__py.CallMethod) {
+                void *sysm = cc__py.ImportModule("sys");
+                if (sysm) {
+                    void *rco =
+                        cc__py.CallMethod(sysm, "getrefcount", "O", views[i]);
+                    if (rco) { rc = cc__py.LongAsLongLong(rco); cc__py.DecRef(rco); }
+                    else if (cc__py.ErrClear) cc__py.ErrClear();
+                    cc__py.DecRef(sysm);
+                }
+                clean = 2;
+            }
+            if (clean && rc > clean) {
+                char rctx[160];
+                int k;
+                snprintf(rctx, sizeof(rctx),
+                         "%s: py_buf argument %d retained by the callee "
+                         "(the borrow ends with the call; copy to keep it)",
+                         method, view_arg[i] + 1);
+                cc__py.DecRef(r);
+                for (k = 0; k < nviews; k++) {
+                    cc__py_view_release(obj->home, views[k]);
+                    cc__py.DecRef(views[k]);
+                }
+                cc__py_errbuf[0] = 0;
+                snprintf(cc__py_errbuf, sizeof(cc__py_errbuf), "python: %s", rctx);
+                return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(rctx));
+            }
+        }
+        for (i = 0; i < nviews; i++) {
+            if (r) cc__py_view_release(obj->home, views[i]);
+            cc__py.DecRef(views[i]);
+        }
+    }
+    return cc__py_obj_or_err(obj->home, r, method);
+}
+
+/* Variadic adapter: collects into an array, then runs the array path.  Kept
+ * for hand-written call sites and for the destination-typed variants below. */
+static inline CCResult_CCPyObj_CCPyError cc__py_obj_callm_v(CCPyObj *obj,
+                                                            const char *method,
+                                                            int argc,
+                                                            va_list ap) {
+    CCPyArg tmp[CC__PY_MAX_CALL_ARGS];
+    int i;
+    if (argc < 0) argc = 0;
+    if (argc > CC__PY_MAX_CALL_ARGS) argc = CC__PY_MAX_CALL_ARGS + 1; /* let the body report */
+    for (i = 0; i < argc && i < CC__PY_MAX_CALL_ARGS; i++)
+        tmp[i] = va_arg(ap, CCPyArg);
+    return cc__py_obj_callm_n(obj, method, argc, tmp);
+}
+
+static inline CCResult_CCPyObj_CCPyError cc_py_obj_callm(CCPyObj *obj,
+                                                         const char *method,
+                                                         int argc, ...) {
+    CCResult_CCPyObj_CCPyError r;
+    va_list ap;
+    va_start(ap, argc);
+    r = cc__py_obj_callm_v(obj, method, argc, ap);
+    va_end(ap);
+    return r;
+}
+
+/* ---- marshaling ---- */
+
+/* `xs` is a slice of doubles: len = element count. */
+static inline CCResult_CCPyObj_CCPyError cc_py_list_f64(CCPy *py, CCSlice xs) {
+    const double *d = (const double *)xs.ptr;
+    void *list;
+    size_t i;
+    cc__py_bind_err_py(py);
+    if (!py || !py->ready)
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err("list_f64"));
+    list = cc__py.ListNew((intptr_t)xs.len);
+    if (!list)
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err("list_f64"));
+    for (i = 0; i < xs.len; i++) {
+        void *f = cc__py.FloatFromDouble(d[i]);
+        if (!f || cc__py.ListSetItem(list, (intptr_t)i, f) != 0) {
+            cc__py.DecRef(list);
+            return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err("list_f64"));
+        }
+    }
+    return cc__py_obj_or_err(py, list, "list_f64");
+}
+
+/* Scalar conversion failure: short message in the thread errbuf only.
+ * Do not copy into `cc__py_err_arena` — bridges probe as_i64 then as_f64
+ * (and discard the first error), and durable arena copies there become a
+ * domain-lifetime leak on every successful float return. Real invoke /
+ * attribute failures still use `cc__py_err` (arena + traceback). */
+static CCPyError cc__py_err_convert(const char *ctx) {
+    CCPyError e;
+    memset(&e, 0, sizeof(e));
+    if (cc__py.lib && cc__py.ErrOccurred && cc__py.ErrOccurred()) {
+        void *t = NULL, *v = NULL, *tb = NULL;
+        cc__py.ErrFetch(&t, &v, &tb);
+        if (cc__py.ErrNormalize) cc__py.ErrNormalize(&t, &v, &tb);
+        {
+            void *s = v ? cc__py.Str(v) : NULL;
+            const char *msg = NULL;
+            intptr_t n = 0;
+            const char *tn = NULL;
+            intptr_t tnl = 0;
+            void *nm = NULL;
+            if (s) msg = cc__py.AsUTF8AndSize(s, &n);
+            if (t) {
+                nm = cc__py.GetAttrString(t, "__name__");
+                if (nm) tn = cc__py.AsUTF8AndSize(nm, &tnl);
+            }
+            if (tn && tnl > 0 && msg && n > 0)
+                snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                         "python: %s: %.*s: %.*s", ctx, (int)tnl, tn,
+                         (int)n, msg);
+            else if (tn && tnl > 0)
+                snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                         "python: %s: %.*s", ctx, (int)tnl, tn);
+            else
+                snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                         "python: %s: %s", ctx, msg ? msg : "unknown error");
+            if (nm) cc__py.DecRef(nm);
+            if (s) cc__py.DecRef(s);
+        }
+        if (t) cc__py.DecRef(t);
+        if (v) cc__py.DecRef(v);
+        if (tb) cc__py.DecRef(tb);
+        cc__py.ErrClear();
+        e.base = CC_ERROR(CC_ERR_USER, cc__py_errbuf);
+        return e;
+    }
+    if (!cc__py_errbuf[0])
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: %s failed", ctx);
+    e.base = CC_ERROR(CC_ERR_USER, cc__py_errbuf);
+    return e;
+}
+
+static inline CCResult_double_CCPyError cc_py_obj_as_f64(CCPyObj *obj) {
+    double v;
+    cc__py_bind_err_obj(obj);
+    if (!obj)
+        return cc_err_CCResult_double_CCPyError(cc__py_err("as_f64"));
+    /* Materialized scalars (isolated wire, py_fn args) carry kind/num
+     * without a live PyObject*. */
+    if (obj->kind == CC__PY_K_NUM) return cc_ok_CCResult_double_CCPyError(obj->num);
+    if (obj->kind == CC__PY_K_BOOL) return cc_ok_CCResult_double_CCPyError(obj->b ? 1.0 : 0.0);
+    if (obj->home && obj->home->tier == CC__PY_TIER_PROC) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: as_f64: isolated value is not a number");
+        return cc_err_CCResult_double_CCPyError(cc__py_err("as_f64"));
+    }
+    if (!obj->o)
+        return cc_err_CCResult_double_CCPyError(cc__py_err("as_f64"));
+    v = cc__py.FloatAsDouble(obj->o);
+    if (v == -1.0 && cc__py.ErrOccurred())
+        return cc_err_CCResult_double_CCPyError(cc__py_err_convert("as_f64"));
+    return cc_ok_CCResult_double_CCPyError(v);
+}
+
+static inline CCResult_int64_t_CCPyError cc_py_obj_as_i64(CCPyObj *obj) {
+    long long v;
+    cc__py_bind_err_obj(obj);
+    if (!obj)
+        return cc_err_CCResult_int64_t_CCPyError(cc__py_err("as_i64"));
+    /* Materialized scalars (isolated wire, py_fn args) carry kind/num
+     * without a live PyObject*. */
+    if (obj->kind == CC__PY_K_NUM) {
+        if (obj->num_is_int) return cc_ok_CCResult_int64_t_CCPyError((int64_t)obj->inum);
+        if (obj->num >= -9223372036854775808.0 &&
+            obj->num < 9223372036854775808.0)
+            return cc_ok_CCResult_int64_t_CCPyError((int64_t)obj->num);
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: as_i64: result out of range for integer "
+                 "destination");
+        return cc_err_CCResult_int64_t_CCPyError(cc__py_err("as_i64"));
+    }
+    if (obj->kind == CC__PY_K_BOOL) return cc_ok_CCResult_int64_t_CCPyError((int64_t)(obj->b ? 1 : 0));
+    if (obj->home && obj->home->tier == CC__PY_TIER_PROC) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: as_i64: isolated value is not an integer");
+        return cc_err_CCResult_int64_t_CCPyError(cc__py_err("as_i64"));
+    }
+    if (!obj->o)
+        return cc_err_CCResult_int64_t_CCPyError(cc__py_err("as_i64"));
+    /* Exact float: never an integer. Reject without LongAsLongLong —
+     * that raises TypeError and, via cc__py_err, used to arena-copy the
+     * diagnostic on every speculative probe from result materialize. */
+    if (cc__py_is_exact_float(obj->o)) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: as_i64: a float is not an integer");
+        {
+            CCPyError e;
+            memset(&e, 0, sizeof(e));
+            e.base = CC_ERROR(CC_ERR_USER, cc__py_errbuf);
+            return cc_err_CCResult_int64_t_CCPyError(e);
+        }
+    }
+    v = cc__py.LongAsLongLong(obj->o);
+    if (v == -1 && cc__py.ErrOccurred())
+        return cc_err_CCResult_int64_t_CCPyError(cc__py_err_convert("as_i64"));
+    return cc_ok_CCResult_int64_t_CCPyError((int64_t)v);
+}
+
+/* Integer extraction for the destination-typed variants: a Python int
+ * extracts exactly; a Python float truncates toward zero (C cast and
+ * Python `int()` semantics agree). A float outside int64 range is a
+ * CCPyError. */
+static inline CCResult_int64_t_CCPyError cc__py_obj_take_i64(
+        CCPyObj *o, const char *method) {
+    /* Prefer the float path for exact floats — skip the failing i64 probe. */
+    if (o && o->o && cc__py_is_exact_float(o->o)) {
+        CCResult_double_CCPyError d = cc_py_obj_as_f64(o);
+        if (!d.ok) return cc_err_CCResult_int64_t_CCPyError(d.u.error);
+        if (d.u.value >= -9223372036854775808.0 &&
+            d.u.value < 9223372036854775808.0)
+            return cc_ok_CCResult_int64_t_CCPyError((int64_t)d.u.value);
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: %s: result out of range for integer destination",
+                 method);
+        return cc_err_CCResult_int64_t_CCPyError(cc__py_err(method));
+    }
+    {
+        CCResult_int64_t_CCPyError v = cc_py_obj_as_i64(o);
+        if (!v.ok) {
+            CCResult_double_CCPyError d = cc_py_obj_as_f64(o);
+            if (d.ok) {
+                if (d.u.value >= -9223372036854775808.0 &&
+                    d.u.value < 9223372036854775808.0)
+                    return cc_ok_CCResult_int64_t_CCPyError((int64_t)d.u.value);
+                snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                         "python: %s: result out of range for integer "
+                         "destination",
+                         method);
+                return cc_err_CCResult_int64_t_CCPyError(cc__py_err(method));
+            }
+        }
+        return v;
+    }
+}
+
+/* Destination-typed call variants: `.ufcs_sink` resolution composes
+ * `cc_py_obj_callm_<mangled dest>` at `T v = obj.method(args…)` sites and
+ * uses the variant when one is declared here. Each runs the shared call
+ * core, extracts the destination type, and releases the intermediate
+ * object — it never reaches user space, so it needs no @destroy. */
+static inline CCResult_double_CCPyError cc_py_obj_callm_double(
+        CCPyObj *obj, const char *method, int argc, ...) {
+    CCResult_CCPyObj_CCPyError r;
+    CCPyObj o;
+    CCResult_double_CCPyError out;
+    va_list ap;
+    va_start(ap, argc);
+    r = cc__py_obj_callm_v(obj, method, argc, ap);
+    va_end(ap);
+    if (!r.ok) return cc_err_CCResult_double_CCPyError(r.u.error);
+    o = r.u.value;
+    out = cc_py_obj_as_f64(&o);
+    cc_py_obj_release(&o);
+    return out;
+}
+
+static inline CCResult_int64_t_CCPyError cc_py_obj_callm_int64_t(
+        CCPyObj *obj, const char *method, int argc, ...) {
+    CCResult_CCPyObj_CCPyError r;
+    CCPyObj o;
+    CCResult_int64_t_CCPyError out;
+    va_list ap;
+    va_start(ap, argc);
+    r = cc__py_obj_callm_v(obj, method, argc, ap);
+    va_end(ap);
+    if (!r.ok) return cc_err_CCResult_int64_t_CCPyError(r.u.error);
+    o = r.u.value;
+    out = cc__py_obj_take_i64(&o, method);
+    cc_py_obj_release(&o);
+    return out;
+}
+
+/* `float` narrows from the double extraction: precision loss is the
+ * destination's own C semantics; range is not checked. */
+static inline CCResult_float_CCPyError cc_py_obj_callm_float(
+        CCPyObj *obj, const char *method, int argc, ...) {
+    CCResult_CCPyObj_CCPyError r;
+    CCPyObj o;
+    CCResult_double_CCPyError d;
+    va_list ap;
+    va_start(ap, argc);
+    r = cc__py_obj_callm_v(obj, method, argc, ap);
+    va_end(ap);
+    if (!r.ok) return cc_err_CCResult_float_CCPyError(r.u.error);
+    o = r.u.value;
+    d = cc_py_obj_as_f64(&o);
+    cc_py_obj_release(&o);
+    if (!d.ok) return cc_err_CCResult_float_CCPyError(d.u.error);
+    return cc_ok_CCResult_float_CCPyError((float)d.u.value);
+}
+
+/* `int` range-checks the 64-bit extraction: a value outside int is a
+ * CCPyError, not a silent truncation. */
+static inline CCResult_int_CCPyError cc_py_obj_callm_int(
+        CCPyObj *obj, const char *method, int argc, ...) {
+    CCResult_CCPyObj_CCPyError r;
+    CCPyObj o;
+    CCResult_int64_t_CCPyError v;
+    va_list ap;
+    va_start(ap, argc);
+    r = cc__py_obj_callm_v(obj, method, argc, ap);
+    va_end(ap);
+    if (!r.ok) return cc_err_CCResult_int_CCPyError(r.u.error);
+    o = r.u.value;
+    v = cc__py_obj_take_i64(&o, method);
+    cc_py_obj_release(&o);
+    if (!v.ok) return cc_err_CCResult_int_CCPyError(v.u.error);
+    if (v.u.value < (int64_t)INT_MIN || v.u.value > (int64_t)INT_MAX) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: %s: result out of range for int destination",
+                 method);
+        return cc_err_CCResult_int_CCPyError(cc__py_err(method));
+    }
+    return cc_ok_CCResult_int_CCPyError((int)v.u.value);
+}
+
+static inline CCResult_long_long_CCPyError cc_py_obj_callm_long_long(
+        CCPyObj *obj, const char *method, int argc, ...) {
+    CCResult_CCPyObj_CCPyError r;
+    CCPyObj o;
+    CCResult_int64_t_CCPyError v;
+    va_list ap;
+    va_start(ap, argc);
+    r = cc__py_obj_callm_v(obj, method, argc, ap);
+    va_end(ap);
+    if (!r.ok) return cc_err_CCResult_long_long_CCPyError(r.u.error);
+    o = r.u.value;
+    v = cc__py_obj_take_i64(&o, method);
+    cc_py_obj_release(&o);
+    if (!v.ok) return cc_err_CCResult_long_long_CCPyError(v.u.error);
+    return cc_ok_CCResult_long_long_CCPyError((long long)v.u.value);
+}
+
+/* ---- the CCPy dynamic sink ----
+ *
+ * `.ufcs_sink` for the interpreter handle itself, so the declared
+ * destination joins resolution for the members that produce values from
+ * source text.  Real members (`exec`, `import`, `close`, …) are
+ * header-visible and win resolution as always; the sink carries the
+ * dynamic ones — today that is `eval`.  An unknown member is a loud
+ * error naming it, not a silent lookup. */
+static CCResult_CCPyObj_CCPyError cc__py_host_callm_n(CCPy *py,
+                                                      const char *method,
+                                                      int argc,
+                                                      const CCPyArg *argv) {
+    cc__py_bind_err_py(py);
+    if (!py || !py->ready) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: %s: handle not ready", method ? method : "?");
+        return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(method));
+    }
+    if (method && argc == 1 && (argv[0].kind == 2 || argv[0].kind == 3) &&
+        strcmp(method, "eval") == 0) {
+        CCSlice src;
+        src.ptr = (void *)(uintptr_t)argv[0].p;
+        src.len = argv[0].n;
+        return cc__py_eval(py, src);
+    }
+    snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+             "python: CCPy has no dynamic method '%s' (dynamic members: "
+             "eval(src))",
+             method ? method : "?");
+    return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err(method));
+}
+
+static inline CCResult_CCPyObj_CCPyError cc_py_callm(CCPy *py,
+                                                     const char *method,
+                                                     int argc, ...) {
+    CCPyArg tmp[CC__PY_MAX_CALL_ARGS];
+    int i;
+    va_list ap;
+    if (argc < 0) argc = 0;
+    if (argc > CC__PY_MAX_CALL_ARGS) argc = CC__PY_MAX_CALL_ARGS;
+    va_start(ap, argc);
+    for (i = 0; i < argc; i++) tmp[i] = va_arg(ap, CCPyArg);
+    va_end(ap);
+    return cc__py_host_callm_n(py, method, argc, tmp);
+}
+
+/* Destination-typed variants: `.ufcs_sink` resolution composes
+ * `cc_py_callm_<mangled dest>` at `T v = py.eval(...)` sites.  Each runs
+ * the sink core, extracts the destination type, and releases the
+ * intermediate object — it never reaches user space, so no @destroy. */
+static inline CCResult_double_CCPyError cc_py_callm_double(
+        CCPy *py, const char *method, int argc, ...) {
+    CCPyArg tmp[CC__PY_MAX_CALL_ARGS];
+    int i;
+    CCResult_CCPyObj_CCPyError r;
+    CCPyObj o;
+    CCResult_double_CCPyError out;
+    va_list ap;
+    if (argc < 0) argc = 0;
+    if (argc > CC__PY_MAX_CALL_ARGS) argc = CC__PY_MAX_CALL_ARGS;
+    va_start(ap, argc);
+    for (i = 0; i < argc; i++) tmp[i] = va_arg(ap, CCPyArg);
+    va_end(ap);
+    r = cc__py_host_callm_n(py, method, argc, tmp);
+    if (!r.ok) return cc_err_CCResult_double_CCPyError(r.u.error);
+    o = r.u.value;
+    out = cc_py_obj_as_f64(&o);
+    cc_py_obj_release(&o);
+    return out;
+}
+
+static inline CCResult_float_CCPyError cc_py_callm_float(
+        CCPy *py, const char *method, int argc, ...) {
+    CCPyArg tmp[CC__PY_MAX_CALL_ARGS];
+    int i;
+    CCResult_CCPyObj_CCPyError r;
+    CCPyObj o;
+    CCResult_double_CCPyError d;
+    va_list ap;
+    if (argc < 0) argc = 0;
+    if (argc > CC__PY_MAX_CALL_ARGS) argc = CC__PY_MAX_CALL_ARGS;
+    va_start(ap, argc);
+    for (i = 0; i < argc; i++) tmp[i] = va_arg(ap, CCPyArg);
+    va_end(ap);
+    r = cc__py_host_callm_n(py, method, argc, tmp);
+    if (!r.ok) return cc_err_CCResult_float_CCPyError(r.u.error);
+    o = r.u.value;
+    d = cc_py_obj_as_f64(&o);
+    cc_py_obj_release(&o);
+    if (!d.ok) return cc_err_CCResult_float_CCPyError(d.u.error);
+    return cc_ok_CCResult_float_CCPyError((float)d.u.value);
+}
+
+static inline CCResult_int64_t_CCPyError cc_py_callm_int64_t(
+        CCPy *py, const char *method, int argc, ...) {
+    CCPyArg tmp[CC__PY_MAX_CALL_ARGS];
+    int i;
+    CCResult_CCPyObj_CCPyError r;
+    CCPyObj o;
+    CCResult_int64_t_CCPyError out;
+    va_list ap;
+    if (argc < 0) argc = 0;
+    if (argc > CC__PY_MAX_CALL_ARGS) argc = CC__PY_MAX_CALL_ARGS;
+    va_start(ap, argc);
+    for (i = 0; i < argc; i++) tmp[i] = va_arg(ap, CCPyArg);
+    va_end(ap);
+    r = cc__py_host_callm_n(py, method, argc, tmp);
+    if (!r.ok) return cc_err_CCResult_int64_t_CCPyError(r.u.error);
+    o = r.u.value;
+    out = cc__py_obj_take_i64(&o, method);
+    cc_py_obj_release(&o);
+    return out;
+}
+
+static inline CCResult_long_long_CCPyError cc_py_callm_long_long(
+        CCPy *py, const char *method, int argc, ...) {
+    CCPyArg tmp[CC__PY_MAX_CALL_ARGS];
+    int i;
+    CCResult_CCPyObj_CCPyError r;
+    CCPyObj o;
+    CCResult_int64_t_CCPyError v;
+    va_list ap;
+    if (argc < 0) argc = 0;
+    if (argc > CC__PY_MAX_CALL_ARGS) argc = CC__PY_MAX_CALL_ARGS;
+    va_start(ap, argc);
+    for (i = 0; i < argc; i++) tmp[i] = va_arg(ap, CCPyArg);
+    va_end(ap);
+    r = cc__py_host_callm_n(py, method, argc, tmp);
+    if (!r.ok) return cc_err_CCResult_long_long_CCPyError(r.u.error);
+    o = r.u.value;
+    v = cc__py_obj_take_i64(&o, method);
+    cc_py_obj_release(&o);
+    if (!v.ok) return cc_err_CCResult_long_long_CCPyError(v.u.error);
+    return cc_ok_CCResult_long_long_CCPyError((long long)v.u.value);
+}
+
+static inline CCResult_int_CCPyError cc_py_callm_int(
+        CCPy *py, const char *method, int argc, ...) {
+    CCPyArg tmp[CC__PY_MAX_CALL_ARGS];
+    int i;
+    CCResult_CCPyObj_CCPyError r;
+    CCPyObj o;
+    CCResult_int64_t_CCPyError v;
+    va_list ap;
+    if (argc < 0) argc = 0;
+    if (argc > CC__PY_MAX_CALL_ARGS) argc = CC__PY_MAX_CALL_ARGS;
+    va_start(ap, argc);
+    for (i = 0; i < argc; i++) tmp[i] = va_arg(ap, CCPyArg);
+    va_end(ap);
+    r = cc__py_host_callm_n(py, method, argc, tmp);
+    if (!r.ok) return cc_err_CCResult_int_CCPyError(r.u.error);
+    o = r.u.value;
+    v = cc__py_obj_take_i64(&o, method);
+    cc_py_obj_release(&o);
+    if (!v.ok) return cc_err_CCResult_int_CCPyError(v.u.error);
+    if (v.u.value < (int64_t)INT_MIN || v.u.value > (int64_t)INT_MAX) {
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: %s: result out of range for int destination",
+                 method);
+        return cc_err_CCResult_int_CCPyError(cc__py_err(method));
+    }
+    return cc_ok_CCResult_int_CCPyError((int)v.u.value);
+}
+
+/* str(obj) copied into `arena`; NUL-terminated (char[:0] compatible).
+ * Slice provenance matches the arena epoch. */
+static inline CCResult_CCSlice_CCPyError cc_py_obj_as_slice_into(CCPyObj *obj,
+                                                                 CCArena *arena) {
+    void *s;
+    const char *msg;
+    intptr_t n = 0;
+    CCSlice out;
+    cc__py_bind_err_obj(obj);
+    if (!obj || !arena)
+        return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("as_slice"));
+    if (obj->home && obj->home->tier == CC__PY_TIER_PROC) {
+        CCSlice src;
+        if (obj->kind == CC__PY_K_STR) {
+            src = obj->text;
+        } else if (obj->kind == CC__PY_K_HANDLE) {
+            CCResult_CCPyObj_CCPyError sr = cc__py_iso_str(obj);
+            if (!sr.ok) return cc_err_CCResult_CCSlice_CCPyError(sr.u.error);
+            if (sr.u.value.kind != CC__PY_K_STR) {
+                snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                         "python: as_slice: isolated str did not return a "
+                         "string");
+                return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("as_slice"));
+            }
+            src = sr.u.value.text;
+        } else if (obj->kind == CC__PY_K_NUM) {
+            char buf[64];
+            int nbuf;
+            if (obj->num_is_int)
+                nbuf = snprintf(buf, sizeof(buf), "%lld", obj->inum);
+            else
+                nbuf = snprintf(buf, sizeof(buf), "%.17g", obj->num);
+            if (nbuf < 0) return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("as_slice"));
+            out = cc_arena_alloc_slice_bytes(arena, (size_t)nbuf + 1);
+            if (!out.ptr) {
+                snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                         "python: as_slice: arena exhausted");
+                return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("as_slice"));
+            }
+            memcpy(out.ptr, buf, (size_t)nbuf);
+            ((char *)out.ptr)[nbuf] = '\0';
+            out.len = (size_t)nbuf;
+            return cc_ok_CCResult_CCSlice_CCPyError(out);
+        } else if (obj->kind == CC__PY_K_BOOL) {
+            const char *bs = obj->b ? "True" : "False";
+            size_t bl = obj->b ? 4 : 5;
+            out = cc_arena_alloc_slice_bytes(arena, bl + 1);
+            if (!out.ptr) {
+                snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                         "python: as_slice: arena exhausted");
+                return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("as_slice"));
+            }
+            memcpy(out.ptr, bs, bl);
+            ((char *)out.ptr)[bl] = '\0';
+            out.len = bl;
+            return cc_ok_CCResult_CCSlice_CCPyError(out);
+        } else if (obj->kind == CC__PY_K_NULL) {
+            out = cc_arena_alloc_slice_bytes(arena, 5);
+            if (!out.ptr) {
+                snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                         "python: as_slice: arena exhausted");
+                return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("as_slice"));
+            }
+            memcpy(out.ptr, "None", 4);
+            ((char *)out.ptr)[4] = '\0';
+            out.len = 4;
+            return cc_ok_CCResult_CCSlice_CCPyError(out);
+        } else {
+            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                     "python: as_slice: isolated value is not a scalar "
+                     "(typed buffers and containers are not yet supported "
+                     "on process-isolated domains)");
+            return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("as_slice"));
+        }
+        out = cc_arena_alloc_slice_bytes(arena, src.len + 1);
+        if (!out.ptr) {
+            snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                     "python: as_slice: arena exhausted");
+            return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("as_slice"));
+        }
+        if (src.len && src.ptr) memcpy(out.ptr, src.ptr, src.len);
+        ((char *)out.ptr)[src.len] = '\0';
+        out.len = src.len;
+        return cc_ok_CCResult_CCSlice_CCPyError(out);
+    }
+    if (!obj->o)
+        return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("as_slice"));
+    s = cc__py.Str(obj->o);
+    if (!s) return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("as_slice"));
+    msg = cc__py.AsUTF8AndSize(s, &n);
+    if (!msg) {
+        cc__py.DecRef(s);
+        return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("as_slice"));
+    }
+    /* +1 for trailing NUL; logical len stays `n` (NUL is capacity only). */
+    out = cc_arena_alloc_slice_bytes(arena, (size_t)n + 1);
+    if (!out.ptr) {
+        cc__py.DecRef(s);
+        snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
+                 "python: as_slice: arena exhausted");
+        return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("as_slice"));
+    }
+    memcpy(out.ptr, msg, (size_t)n);
+    ((char *)out.ptr)[n] = '\0';
+    cc__py.DecRef(s);
+    out.len = (size_t)n;
+    return cc_ok_CCResult_CCSlice_CCPyError(out);
+}
+
+/* Default extract: copy into the home handle's scratch arena. */
+static inline CCResult_CCSlice_CCPyError cc_py_obj_as_slice(CCPyObj *obj) {
+    CCArena *arena = (obj && obj->home) ? obj->home->arena : NULL;
+    return cc_py_obj_as_slice_into(obj, arena);
+}
+
+
+/* ============================================================
+ * `py_expose::[T]` — a CC type becomes a Python module.
+ *
+ * The module IS the type: its methods are the module's functions and the
+ * receiver is the module's per-interpreter state, which is the same reading of
+ * "first parameter" the language already dispatches on.  Nothing new declares
+ * what a member is.
+ *
+ *     py.expose::[Counter]("counter", &seed) !>;        // installs cc.counter
+ *     py_expose::[Counter](&py, "counter", &seed) !>;   // the same call
+ *
+ * The registrar's own first parameter is the interpreter, so it reads under
+ * the same rule it applies to the methods it exposes.  Both spellings name one
+ * factory and lower to one monomorph.
+ *
+ * It returns the interpreter, so a registration is a link rather than a dead
+ * end — including into another `expose`:
+ *
+ *     py.expose::[A]("a", &a)!>.expose::[B]("b", &b)!>.exec(src)!>;
+ *
+ * A member-generic hop resolves once the hop before it is hoisted into a
+ * typed temp; the factory still reflects on the pre-lowering snapshot of the
+ * TU, so a late instantiation generates what an early one would.
+ *
+ * The Python name is the method's UFCS member name — what a caller writes
+ * after the dot in CC — so the export list and the callable list are one list,
+ * while the long searchable symbol stays at file scope.
+ *
+ * A fragment is spliced ahead of the file's own definitions and is host C, so
+ * each method is forward-declared and a fallible one is consumed through the
+ * Result accessors rather than the sigil.
+ * ============================================================ */
+                                  
+                                 
+                
+                                                                               
+                                                                
+                                      
+                 
+                                   
+                
+                                                                                
+                                                                            
+                                                       
+                                
+     
+                                 
+                                                                            
+                         
+               
+                                                     
+                                                       
+                                                                    
+                                                                         
+                                                                         
+                                                                           
+                                   
+                                                       
+                                                     
+                                                    
+                                                    
+                      
+                                                                        
+                                                                            
+                                             
+                                    
+         
+                                        
+                     
+                                                                             
+                                                                       
+                                    
+         
+                                                                      
+                                                                            
+                                                         
+                                    
+         
+                                                                                  
+                                                    
+                                    
+     
+                                    
+                                                                            
+                                 
+                              
+                                                     
+                                                       
+                                   
+                                        
+                                                                                                          
+     
+                                    
+                          
+          
+                                                                           
+                                                                   
+                                                                          
+                                                    
+                                                                                
+                                                                       
+                                                                    
+                                                                                   
+                                                                            
+                         
+                                  
+                                                                                      
+                                   
+                                                                   
+                                                                               
+                                                                                        
+                             
+                           
+                                  
+ 
+
+/* ============================================================
+ * `py_module::[T]` — the same exposure, pointed the other way: Python
+ * imports US.  Where `py_expose` installs a module into an interpreter
+ * the CC program owns, `py_module` CREATES the module and returns it,
+ * which is exactly what a CPython extension entry point must do:
+ *
+ *     void *PyInit_counter(void) {
+ *         return py_module::[Counter]("counter", NULL);
+ *     }
+ *
+ * `ccc build` sees the exported `PyInit_<name>` (and no `main`) and
+ * links a shared object — the source declares what it is; there is no
+ * flag.  The seed may be NULL for zeroed module state.
+ *
+ * The CALLER is CPython's import machinery: `import counter` matches
+ * counter.abi3.so on sys.path, dlopens it, and derives the symbol from
+ * the module name — "PyInit_" + name — which is why the symbol, the
+ * factory's name string, and the artifact filename are one name spelled
+ * three ways, and the build's naming rule keeps them from drifting.
+ * Called once per interpreter: under multi-phase init the return is the
+ * module DEFINITION and each (sub)interpreter builds its own module
+ * from it, seeding fresh state — the twin of Node calling the napi
+ * entry once per worker environment.  Failure follows Python's
+ * convention — NULL, with the exception set when an interpreter exists
+ * to hold one — not a CC Result.  The method trampolines are the same
+ * shape `py_expose` emits (same reflection, same marshal macros), under
+ * a distinct symbol prefix so both factories can instantiate for one
+ * type in one TU. */
+                                  
+                                 
+                
+                                                                               
+                                      
+                 
+                                   
+                
+                                                                                
+                                                                            
+                                                       
+                                
+     
+                                 
+                                                                            
+                         
+               
+                                                     
+                                                       
+                                                                    
+                                                                         
+                                                                         
+                                                                           
+                                   
+                                                       
+                                                     
+                                                    
+                                                    
+                      
+                                                                        
+                                                                            
+                                             
+                                    
+         
+                                        
+                     
+                                                                             
+                                                                       
+                                    
+         
+                                                                      
+                                                                            
+                                                         
+                                    
+         
+                                                                                  
+                                                    
+                                    
+     
+                          
+                       
+                                 
+                              
+                                                     
+                                                       
+                                         
+                                                                 
+                  
+         
+     
+                                    
+                                                                            
+                                 
+                              
+                                                     
+                                                       
+                                   
+                                        
+                                                                                                          
+     
+                                    
+                          
+          
+                                                       
+                                                      
+                                                                    
+                               
+                                                                                        
+                                            
+                                                                          
+                     
+                           
+                         
+                                                                          
+                                                                      
+                                                                
+                                        
+                                                        
+                                                                    
+                                       
+                           
+     
+                                    
+                                                                          
+                                       
+                                                 
+                     
+                      
+                                                                           
+                                                                           
+                                                                               
+                                                              
+                            
+                                  
+                                                                         
+                                          
+                              
+                                        
+                                                              
+                                     
+                                       
+                                                                           
+                                                                              
+                                                                       
+                                                                         
+                                                                           
+                                                                          
+                                                                        
+                                                                     
+                                                                  
+                                  
+                                                         
+                                    
+                                                      
+                                                             
+                                                          
+                                                    
+                                                                    
+                                                          
+                         
+                                        
+                                                                                   
+     
+                                    
+                        
+                                                                                           
+                 
+                                                  
+             
+                                                                           
+                                                                         
+                                    
+             
+                                                                                 
+                                                                                   
+                                                                              
+                        
+                                                                                                 
+                                                                   
+                                                                
+                                                                                                        
+                         
+             
+                           
+                                  
+ 
+
+
+
+
+
+
+#endif /* CC_SCRIPT_PY_H */

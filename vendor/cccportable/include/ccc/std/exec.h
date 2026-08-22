@@ -1,0 +1,122 @@
+/*
+ * Arena-backed process command builder for Concurrent-C stdlib.
+ */
+#ifndef CC_STD_EXEC_H
+#define CC_STD_EXEC_H
+
+#include <errno.h>
+#include <string.h>
+
+#include <ccc/cc_compat.h>
+#include <ccc/cc_type.h>
+#include <ccc/cc_ufcs.h>
+#include <ccc/std/process.h>
+#include <ccc/std/string.h>
+#include <ccc/std/vec.h>
+
+typedef struct CCCommand {
+    CCArena *arena;
+    CCString storage;
+    CCVec_size_t offsets;
+    const char** env;
+    const char* cwd_path;
+    CCSlice stdin_data;
+    bool pipe_stdin;
+    bool pipe_stdout;
+    bool pipe_stderr;
+    bool merge_stderr;
+} CCCommand;
+
+#ifndef CCResult_CCProcess_CCIoError_DEFINED
+#define CCResult_CCProcess_CCIoError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCProcess_CCIoError_DEFINED
+#define CCResult_CCProcess_CCIoError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCProcess_CCIoError, CCProcess, CCIoError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_CCProcess_CCIoError, CCProcess, CCIoError)
+#endif
+
+#ifndef CCResult_CCProcessOutput_CCIoError_DEFINED
+#define CCResult_CCProcessOutput_CCIoError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCProcessOutput_CCIoError_DEFINED
+#define CCResult_CCProcessOutput_CCIoError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCProcessOutput_CCIoError, CCProcessOutput, CCIoError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_CCProcessOutput_CCIoError, CCProcessOutput, CCIoError)
+#endif
+
+#ifndef CCResult_int_CCIoError_DEFINED
+#define CCResult_int_CCIoError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_int_CCIoError_DEFINED
+#define CCResult_int_CCIoError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_int_CCIoError, int, CCIoError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_int_CCIoError, int, CCIoError)
+#endif
+
+CCCommand cc_command_new(CCArena *arena, CCSlice program);
+
+static inline CCCommand cc_command(CCArena *arena, CCSlice program) {
+    return cc_command_new(arena, program);
+}
+
+size_t cc_command_argc(const CCCommand *cmd);
+const char *cc_command_get(const CCCommand *cmd, size_t idx);
+const char *cc_command_program(const CCCommand *cmd);
+
+CCCommand *cc_command_arg(CCCommand *cmd, const char *arg);
+CCCommand *cc_command_arg_slice(CCCommand *cmd, CCSlice arg);
+CCCommand *cc_command_arg_i64(CCCommand *cmd, int64_t value);
+CCCommand *cc_command_stdin_pipe(CCCommand *cmd);
+CCCommand *cc_command_stdin_slice(CCCommand *cmd, CCSlice input);
+CCCommand *cc_command_stdin(CCCommand *cmd, const char *input);
+CCCommand *cc_command_stdout_capture(CCCommand *cmd);
+CCCommand *cc_command_stderr_capture(CCCommand *cmd);
+CCCommand *cc_command_stderr_to_stdout(CCCommand *cmd);
+CCCommand *cc_command_inherit_stdio(CCCommand *cmd);
+CCCommand *cc_command_cwd(CCCommand *cmd, CCSlice cwd);
+CCCommand *cc_command_env(CCCommand *cmd, const char **env);
+
+static inline CCCommand *cc_command_arg_i32(CCCommand *cmd, int value) {
+    return cc_command_arg_i64(cmd, (int64_t)value);
+}
+
+static inline CCCommand *cc_command_arg_if(CCCommand *cmd, bool cond, const char *arg) {
+    return cond ? cc_command_arg(cmd, arg) : cmd;
+}
+
+static inline CCCommand *cc_command_arg_i64_if(CCCommand *cmd, bool cond, int64_t value) {
+    return cond ? cc_command_arg_i64(cmd, value) : cmd;
+}
+
+static inline CCCommand *cc_command_arg_i32_if(CCCommand *cmd, bool cond, int value) {
+    return cond ? cc_command_arg_i32(cmd, value) : cmd;
+}
+
+const char **cc_command_argv(CCCommand *cmd);
+CCProcessConfig cc_command_process_config(CCCommand *cmd);
+CCResult_CCProcess_CCIoError cc_command_spawn(CCCommand *cmd);
+CCResult_CCProcessOutput_CCIoError cc_command_run(CCCommand *cmd, CCArena *arena);
+CCResult_CCProcessOutput_CCIoError cc_command_output(CCCommand *cmd, CCArena *arena);
+CCResult_CCProcessOutput_CCIoError cc_command_output_with_input(CCCommand *cmd, CCArena *arena, CCSlice input);
+CCResult_int_CCIoError cc_command_status(CCCommand *cmd);
+
+/* Script/oracle default: merge stderr into stdout, then capture.
+ * Prefer this over stderr_to_stdout() + output() for inspect-the-text runs.
+ * Exit status stays on the returned CCProcessOutput (not folded into Err). */
+static inline CCResult_CCProcessOutput_CCIoError
+cc_command_capture(CCCommand *cmd, CCArena *arena) {
+    (void)cc_command_stderr_to_stdout(cmd);
+    return cc_command_output(cmd, arena);
+}
+
+/* CCCommand UFCS uses the shared generic snake_case helper:
+   smart-lowering CCCommand -> cc_command_*, matching the existing C API. */
+
+/* CCCommand UFCS dispatch is covered by the global `*` registration
+   in cc_arena.cch; no per-type opt-in needed here. */
+
+#endif /* CC_STD_EXEC_H */

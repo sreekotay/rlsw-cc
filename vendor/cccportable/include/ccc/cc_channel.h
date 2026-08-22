@@ -1,0 +1,755 @@
+/*
+ * Generic channel with blocking send/recv.
+ * Backed by mutex/condvar; capacity fixed at creation.
+ *
+ * Typing helpers:
+ *  - CC_DECL_TYPED_CHAN_PTR(T, Name): sends/receives pointers to T.
+ *  - CC_DECL_TYPED_CHAN_VAL(T, Name): sends/receives T by value (copied).
+ */
+#ifndef CC_CHANNEL_H
+#define CC_CHANNEL_H
+
+#include <ccc/cc_compat.h>
+#include <time.h>
+#include <errno.h>
+#include <string.h>
+
+#include <ccc/cc_sched.h>
+#include <ccc/cc_slice.h>
+#include <ccc/cc_nursery.h>
+#include <ccc/cc_exec.h>
+#include <ccc/cc_chan_handle.h>
+#include <ccc/cc_result.h>
+#include <ccc/cc_type.h>
+#include <ccc/cc_ufcs.h>
+#include <ccc/cc_io_error.h>
+#include <ccc/std/task.h>
+
+typedef struct CCAsyncHandle CCAsyncHandle;
+typedef struct CCArena CCArena;
+typedef union CCSocketSignal CCSocketSignal;
+#include <ccc/std/future.h>
+
+typedef struct CCChan CCChan;
+
+/*
+ * Unified I/O pattern for channels: bool !>(CCIoError)
+ * Channels use CCIoError (same as files, network) for unified error handling.
+ * - Ok(true)  = operation succeeded, got/sent data
+ * - Ok(false) = channel closed gracefully (EOF)
+ * - Err(e)    = actual error
+ */
+
+/*
+ * Convert errno-style return to bool !>(CCIoError).
+ * 0 → Ok(true), EPIPE → Ok(false), other → Err(e)
+ */
+static inline CCResult_bool_CCIoError cc_chan_result_from_errno(int err) {
+    if (err == 0) {
+        return cc_ok_CCResult_bool_CCIoError(true);
+    } else if (err == EPIPE) {
+        return cc_ok_CCResult_bool_CCIoError(false);
+    } else {
+        return cc_err_CCResult_bool_CCIoError(cc_io_from_errno(err));
+    }
+}
+
+/* Accessors implemented in channel.c. Expose the structured CCIoError stored
+ * by cc_chan_close_with / cc_chan_cancel so the typed result helper below can
+ * return the exact error the producer set, preserving both kind and os_code
+ * across the channel handoff. */
+int cc__chan_has_close_error(CCChan* ch, bool is_recv);
+CCIoError cc__chan_get_close_error(CCChan* ch, bool is_recv);
+
+/*
+ * Typed result helper with channel context. Behaves like
+ * cc_chan_result_from_errno for legacy int-returning close_err paths, but
+ * additionally promotes a stored structured CCIoError to the Err arm when
+ * cc_chan_close_with() / cc_chan_cancel() set one. is_recv selects which side
+ * of the close to read (tx-side error on recv, rx-side error on send).
+ */
+static inline CCResult_bool_CCIoError cc_chan_result_with(CCChan* ch, int err, bool is_recv) {
+    if (err == 0) {
+        return cc_ok_CCResult_bool_CCIoError(true);
+    }
+    if (err == EPIPE) {
+        return cc_ok_CCResult_bool_CCIoError(false);
+    }
+    if (ch && cc__chan_has_close_error(ch, is_recv)) {
+        return cc_err_CCResult_bool_CCIoError(cc__chan_get_close_error(ch, is_recv));
+    }
+    return cc_err_CCResult_bool_CCIoError(cc_io_from_errno(err));
+}
+
+/*
+ * Unified I/O helper for bool !>(CCIoError) results.
+ * 
+ * cc_io_avail(res) - true only if result is success AND value is true
+ *                    Use for: while (cc_io_avail(rx.recv(&item))) { ... }
+ *                    Breaks on both error AND graceful close/EOF.
+ */
+static inline bool cc_io_avail(CCResult_bool_CCIoError res) {
+    return res.ok && res.u.value;
+}
+
+/* Ordered receive: receives a CCTask from channel, blocks on it, extracts result.
+ * For use with ordered (task) channels.
+ * Returns: 1 = value received, 0 = channel closed, -1 = error
+ * 
+ * The spawned task stores its result in fiber-local storage via cc_task_result_ptr.
+ * The result struct has __result at offset 0, so we dereference to get the value.
+ * 
+ * Usage:
+ *   void* result;
+ *   int rc;
+ *   while ((rc = ordered_recv(rx, &result)) == 1) { use result }
+ *   if (rc < 0) { handle error }
+ */
+static inline int ordered_recv(CCChanRx rx, void** out) {
+    CCTask task;
+    int rc = cc_chan_recv(rx.raw, &task, sizeof(task));
+    if (rc == 0) {
+        /* Successfully received task - block on it and extract result.
+           The thunk returns a pointer to fiber-local storage where __result is at offset 0.
+           For fiber tasks, cc_block_on_intptr copies result_buf into a TLS buffer
+           before freeing the fiber, so the returned pointer is safe to dereference. */
+        void* cap = (void*)cc_block_on_intptr(task);
+        *out = cap ? *(void**)cap : NULL;
+        return 1;  /* value received */
+    } else if (rc == EPIPE) {
+        return 0;  /* channel closed */
+    } else {
+        return -1;  /* error */
+    }
+}
+
+/* Forward declaration needed by cc__chan_recv_ordered below.
+   Full declaration appears after the pair-creation API. */
+int cc_chan_is_ordered(CCChan* ch);
+
+/* Internal helper used by typed channel recv lowering.
+ *
+ * For unordered channels: plain blocking recv into `out` (out_sz bytes).
+ * For ordered channels: receives a queued CCTask handle, awaits it, then
+ * copies the user-typed result (stored at offset 0 of the fiber-local result
+ * struct) into `out`.  The caller is responsible for sizing `out` correctly
+ * (sizeof(*out_ptr) in the lowered call, i.e. sizeof(T) where T is the element type).
+ *
+ * Channels with the runtime is_ordered flag are task-handle channels: they
+ * hold CCTask values internally (elem_size == sizeof(CCTask)), which is
+ * enforced by the cc_channel_pair lowering pass.  A DATA channel declared
+ * `ordered` does NOT set the runtime flag — the attribute is a per-sender
+ * FIFO contract marker and the channel uses the normal machinery, so the
+ * unordered branch below is the data path.
+ */
+#include <string.h>
+static inline CCResult_bool_CCIoError cc__chan_recv_ordered(CCChanRx rx, void* out, size_t out_sz) {
+    if (cc_chan_is_ordered(rx.raw)) {
+        CCTask task;
+        int rc = cc_chan_recv(rx.raw, &task, sizeof(task));
+        if (rc == 0) {
+            void* cap = (void*)cc_block_on_intptr(task);
+            if (cap) memcpy(out, cap, out_sz);
+            else memset(out, 0, out_sz);
+        }
+        return cc_chan_result_with(rx.raw, rc, /*is_recv=*/true);
+    }
+    return cc_chan_result_with(rx.raw, cc_chan_recv(rx.raw, out, out_sz), /*is_recv=*/true);
+}
+
+typedef enum {
+    CC_CHAN_MODE_BLOCK = 0,   // block when full/empty (default)
+    CC_CHAN_MODE_DROP_NEW,    // drop new send (return EAGAIN) when full
+    CC_CHAN_MODE_DROP_OLD     // drop oldest and enqueue new when full
+} CCChanMode;
+
+typedef enum {
+    CC_CHAN_TOPO_DEFAULT = 0, // N:N - any senders, any receivers
+    CC_CHAN_TOPO_1_1 = 1,     // 1:1 - single producer, single consumer
+    CC_CHAN_TOPO_1_N = 2,     // 1:N - broadcast: one sender, many receivers
+    CC_CHAN_TOPO_N_1 = 3,     // N:1 - many senders, one receiver
+    CC_CHAN_TOPO_N_N = 4      // N:N - explicit (same as default)
+} CCChanTopology;
+
+// Create a channel with the given capacity (>=1). Returns NULL on failure.
+// allow_send_take enables zero-copy pointer payloads via send_take API.
+// Note: send_take is pointer-only (elem_size must be sizeof(void*)); by-value payloads are not eligible.
+CCChan* cc_chan_create(size_t capacity);
+CCChan* cc_chan_create_mode(size_t capacity, CCChanMode mode);
+CCChan* cc_chan_create_mode_take(size_t capacity, CCChanMode mode, bool allow_send_take);
+
+// Create a channel and return a directional handle pair (tx/rx).
+// elem_size==0 means "leave uninitialized" (caller will call cc_chan_init_elem).
+int cc_chan_pair_create(size_t capacity,
+                        CCChanMode mode,
+                        bool allow_send_take,
+                        size_t elem_size,
+                        CCChanTx* out_tx,
+                        CCChanRx* out_rx);
+
+// Extended pair creation with explicit sync/async flag.
+// is_sync: true = sync channel (blocks OS thread), false = async channel (cooperative).
+int cc_chan_pair_create_ex(size_t capacity,
+                           CCChanMode mode,
+                           bool allow_send_take,
+                           size_t elem_size,
+                           bool is_sync,
+                           CCChanTx* out_tx,
+                           CCChanRx* out_rx);
+
+// Full pair creation with all options including topology.
+// topology: one of CC_CHAN_TOPO_* values.
+int cc_chan_pair_create_full(size_t capacity,
+                             CCChanMode mode,
+                             bool allow_send_take,
+                             size_t elem_size,
+                             bool is_sync,
+                             int topology,
+                             CCChanTx* out_tx,
+                             CCChanRx* out_rx);
+
+// Same as cc_chan_pair_create_full but returns CCChan* for assignment.
+// Returns NULL on error. Used by cc_channel_pair() language construct.
+// is_ordered: if true, typed recv awaits CCTask and extracts result (task channel semantics)
+CCChan* cc_chan_pair_create_returning(size_t capacity,
+                                      CCChanMode mode,
+                                      bool allow_send_take,
+                                      size_t elem_size,
+                                      bool is_sync,
+                                      int topology,
+                                      bool is_ordered,
+                                      CCChanTx* out_tx,
+                                      CCChanRx* out_rx);
+
+// Create a sync channel directly (blocking mode).
+CCChan* cc_chan_create_sync(size_t capacity, CCChanMode mode, bool allow_send_take);
+
+// Create an owned channel (resource pool) with lifecycle callbacks.
+// - on_create: CCClosure0 called when recv on empty pool, returns created item (cast to void*)
+// - on_destroy: CCClosure1 called for each item on channel free, arg0 is item pointer
+// - on_reset: CCClosure1 called on item when returned via send, arg0 is item pointer (may have fn=NULL)
+// Returns NULL on error. Owned channels are implicitly sync and bidirectional.
+CCChan* cc_chan_create_owned(size_t capacity,
+                             size_t elem_size,
+                             CCClosure0 on_create,
+                             CCClosure1 on_destroy,
+                             CCClosure1 on_reset);
+
+// Convenience alias for cc_chan_create_owned.
+CCChan* cc_chan_create_owned_pool(size_t capacity,
+                                  size_t elem_size,
+                                  CCClosure0 on_create,
+                                  CCClosure1 on_destroy,
+                                  CCClosure1 on_reset);
+
+// Check if channel is an ordered (task) channel.
+int cc_chan_is_ordered(CCChan* ch);
+
+// Close the channel: unblocks waiters. Further sends fail with EPIPE.
+void cc_chan_close(CCChan* ch);
+
+// Close channel with error code - recv() will return this error instead of EPIPE.
+// Use for downstream error propagation in pipelines (producer -> consumer).
+void cc_chan_close_err(CCChan* ch, int err);
+
+// Close rx side with error - send() will return this error.
+// Enables upstream error propagation in pipelines (consumer -> producer).
+// Does not set the channel closed flag, only signals senders.
+void cc_chan_rx_close_err(CCChan* ch, int err);
+
+// Bilateral close with a structured CCIoError.
+// Same wake/tear-down semantics as cc_chan_close (both senders and receivers
+// observe the channel as finished), but pending and future send/recv
+// operations return Err(e) instead of Ok(false). Preserves both kind and
+// os_code end-to-end; use this to propagate specific failure reasons.
+void cc_chan_close_with(CCChan* ch, CCIoError e);
+
+// Cancel: shorthand for cc_chan_close_with(ch, {CC_IO_CANCELLED, 0}).
+// Same mechanics as cc_chan_close; peers see Err(CC_IO_CANCELLED).
+void cc_chan_cancel(CCChan* ch);
+
+// Free channel resources. Safe to call on NULL. Undefined if called while
+// other threads are still using the channel.
+void cc_chan_free(CCChan* ch);
+
+// Blocking send/recv. Returns 0 on success or an errno-style error.
+int cc_chan_send(CCChan* ch, const void* value, size_t value_size);
+int cc_chan_send_into(CCChan* ch, CCClosure2 builder, size_t value_size, CCArena* arena);
+int cc_chan_recv(CCChan* ch, void* out_value, size_t value_size);
+size_t cc_chan_elem_size(const CCChan* ch);
+
+// Batched send/recv: sends or receives `count` elements from/to contiguous buffers.
+// Returns 0 on success or errno-style error.
+
+// Non-blocking: return EAGAIN if would block.
+int cc_chan_try_send(CCChan* ch, const void* value, size_t value_size);
+int cc_chan_try_send_into(CCChan* ch, CCClosure2 builder, size_t value_size, CCArena* arena);
+int cc_chan_try_recv(CCChan* ch, void* out_value, size_t value_size);
+void cc_chan_set_recv_signal(CCChan* ch, CCSocketSignal* sig);
+
+/* R2 — record/read channel diagnostic metadata.  The setter is called
+ * once by the spawn-site lowering (`pass_channel_syntax.c`) right after
+ * the channel is created; both the deadlock detector and
+ * `cc_rt_diag_channel_meta` read it later.  `name` is typically the
+ * `"tx,rx"` handle pair or the single-handle name; `file`/`line` are
+ * the creation-site source location.  All strings are caller-owned and
+ * must outlive the channel (C string literals in lowered output
+ * trivially satisfy that). */
+void cc_chan_set_diag_meta(CCChan* ch, const char* name,
+                           const char* file, int line);
+int  cc_chan_get_diag_meta(const CCChan* ch, const char** out_name,
+                           const char** out_file, int* out_line);
+/* R2 — user-facing channel meta query.  Same semantics as
+ * `cc_chan_get_diag_meta`; exposed via `cc_rt_diag_*` so user code can
+ * follow a consistent diagnostic API surface.  Returns 1 if any field
+ * was populated, 0 for NULL ch or for channels created outside the
+ * lowered path (raw `cc_chan_create`).  Any out_* pointer may be NULL. */
+int cc_rt_diag_channel_meta(const CCChan* ch, const char** out_name,
+                             const char** out_file, int* out_line);
+
+// Timed send/recv honoring an absolute deadline.
+int cc_chan_timed_send(CCChan* ch, const void* value, size_t value_size, const struct timespec* abs_deadline);
+int cc_chan_timed_recv(CCChan* ch, void* out_value, size_t value_size, const struct timespec* abs_deadline);
+
+// CCDeadline-aware helpers.
+int cc_chan_deadline_send(CCChan* ch, const void* value, size_t value_size, const CCDeadline* deadline);
+int cc_chan_deadline_recv(CCChan* ch, void* out_value, size_t value_size, const CCDeadline* deadline);
+
+// Zero-copy pointer transfer (send_take). Valid only when elem_size == sizeof(void*) and channel was created with allow_send_take=true.
+int cc_chan_send_take(CCChan* ch, void* ptr);
+int cc_chan_try_send_take(CCChan* ch, void* ptr);
+int cc_chan_timed_send_take(CCChan* ch, void* ptr, const struct timespec* abs_deadline);
+int cc_chan_deadline_send_take(CCChan* ch, void* ptr, const CCDeadline* deadline);
+
+// Slice-aware transfer with eligibility checks (unique + transferable + not subslice).
+// Stores the slice descriptor in-channel (structure copy); ownership of the backing
+// allocation is transferred on success. Fails with EINVAL if eligibility fails.
+// Note: CCSliceUnique documents that caller is transferring ownership.
+int cc_chan_send_take_slice(CCChan* ch, const CCSliceUnique* slice);
+int cc_chan_try_send_take_slice(CCChan* ch, const CCSliceUnique* slice);
+int cc_chan_timed_send_take_slice(CCChan* ch, const CCSliceUnique* slice, const struct timespec* abs_deadline);
+int cc_chan_deadline_send_take_slice(CCChan* ch, const CCSliceUnique* slice, const CCDeadline* deadline);
+
+// Nursery-aware helpers: use nursery deadline/cancel state.
+int cc_chan_nursery_send(CCChan* ch, CCNurseryHost* n, const void* value, size_t value_size);
+int cc_chan_nursery_recv(CCChan* ch, CCNurseryHost* n, void* out_value, size_t value_size);
+int cc_chan_nursery_send_take(CCChan* ch, CCNurseryHost* n, void* ptr);
+int cc_chan_nursery_send_take_slice(CCChan* ch, CCNurseryHost* n, const CCSliceUnique* slice);
+
+// Async send/recv using executor; completion signaled on done channel.
+typedef enum {
+    CC_CHAN_ASYNC_PENDING = 0,
+    CC_CHAN_ASYNC_OK = 1,
+    CC_CHAN_ASYNC_ERR = 2,
+    CC_CHAN_ASYNC_TIMEOUT = 3,
+    CC_CHAN_ASYNC_CANCELLED = 4
+} CCChanAsyncStatus;
+
+typedef struct {
+    CCAsyncHandle handle;
+    CCChanAsyncStatus status;
+} CCChanAsync;
+
+typedef enum {
+    CC_CHAN_WAIT_RECV = 0,
+    CC_CHAN_WAIT_SOCKET = 1,
+    CC_CHAN_WAIT_CLOSED = 2,
+} CCChanWaitOrSocketKind;
+
+#ifndef CCResult_CCChanWaitOrSocketKind_CCIoError_DEFINED
+#define CCResult_CCChanWaitOrSocketKind_CCIoError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCChanWaitOrSocketKind_CCIoError_DEFINED
+#define CCResult_CCChanWaitOrSocketKind_CCIoError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCChanWaitOrSocketKind_CCIoError, CCChanWaitOrSocketKind, CCIoError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_CCChanWaitOrSocketKind_CCIoError, CCChanWaitOrSocketKind, CCIoError)
+#endif
+
+int cc_chan_send_async(CCExec* ex, CCChan* ch, const void* value, size_t value_size, CCChanAsync* out, const CCDeadline* deadline);
+int cc_chan_recv_async(CCExec* ex, CCChan* ch, void* out_value, size_t value_size, CCChanAsync* out, const CCDeadline* deadline);
+CCResult_CCChanWaitOrSocketKind_CCIoError cc_chan_wait_recv_or_socket(CCChan* ch,
+                                                                      CCSocketSignal* sig,
+                                                                      void* out_value,
+                                                                      size_t value_size);
+
+// Poll-based channel tasks returning CCTaskIntptr (cooperative async).
+// Result is errno (0=success). Caller must ensure value/out_value outlives the task.
+CCTaskIntptr cc_chan_send_task(CCChan* ch, const void* value, size_t value_size);
+CCTaskIntptr cc_chan_recv_task(CCChan* ch, void* out_value, size_t value_size);
+
+/* Preferred explicit erased-core aliases.
+   These keep the runtime-facing API honest and leave room for typed wrapper
+   families above this layer. Generated C should target the cc_channel_* namespace. */
+static inline CCChan* cc_channel_pair_create(size_t capacity,
+                                             CCChanMode mode,
+                                             bool allow_send_take,
+                                             size_t elem_size,
+                                             bool is_sync,
+                                             int topology,
+                                             bool is_ordered,
+                                             CCChanTx* out_tx,
+                                             CCChanRx* out_rx) {
+    return cc_chan_pair_create_returning(capacity, mode, allow_send_take, elem_size,
+                                         is_sync, topology, is_ordered, out_tx, out_rx);
+}
+static inline CCChan* cc_channel_pair_create_returning(size_t capacity,
+                                                       CCChanMode mode,
+                                                       bool allow_send_take,
+                                                       size_t elem_size,
+                                                       bool is_sync,
+                                                       int topology,
+                                                       bool is_ordered,
+                                                       CCChanTx* out_tx,
+                                                       CCChanRx* out_rx) {
+    return cc_channel_pair_create(capacity, mode, allow_send_take, elem_size,
+                                  is_sync, topology, is_ordered, out_tx, out_rx);
+}
+/* R2 — single-call create + diag-meta stamp.
+ *
+ * The spawn-site lowering in `pass_channel_syntax.c` emits this helper
+ * (instead of a statement-expression wrapping `cc_channel_pair_create`
+ * + `cc_chan_set_diag_meta`) for two reasons:
+ *   1. Inside `@async` bodies, the state-machine frame promotion
+ *      mangles locals declared inside `({ ... })` (e.g. `CCChan* __cc_ch`
+ *      gets rewritten to `CCChan* __f->__cc_ch`, which is invalid C).
+ *   2. A single inline function generates the same code paths as before
+ *      while keeping the lowering's emit small and the lowered C
+ *      hand-crafted-looking (one call, no `do { ... } while(0)` block). */
+static inline CCChan* cc_channel_pair_create_named(size_t capacity,
+                                                    CCChanMode mode,
+                                                    bool allow_send_take,
+                                                    size_t elem_size,
+                                                    bool is_sync,
+                                                    int topology,
+                                                    bool is_ordered,
+                                                    CCChanTx* out_tx,
+                                                    CCChanRx* out_rx,
+                                                    const char* diag_name,
+                                                    const char* diag_file,
+                                                    int diag_line) {
+    CCChan* ch = cc_channel_pair_create(capacity, mode, allow_send_take, elem_size,
+                                        is_sync, topology, is_ordered, out_tx, out_rx);
+    cc_chan_set_diag_meta(ch, diag_name, diag_file, diag_line);
+    return ch;
+}
+static inline int cc_channel_is_ordered(CCChan* ch) { return cc_chan_is_ordered(ch); }
+static inline void cc_channel_raw_close(CCChan* ch) { cc_chan_close(ch); }
+static inline void cc_channel_close_err(CCChan* ch, int err) { cc_chan_close_err(ch, err); }
+static inline void cc_channel_rx_close_err(CCChan* ch, int err) { cc_chan_rx_close_err(ch, err); }
+static inline void cc_channel_raw_close_with(CCChan* ch, CCIoError e) { cc_chan_close_with(ch, e); }
+static inline void cc_channel_raw_cancel(CCChan* ch) { cc_chan_cancel(ch); }
+static inline void cc_channel_raw_free(CCChan* ch) { cc_chan_free(ch); }
+static inline int cc_channel_raw_send(CCChan* ch, const void* value, size_t value_size) {
+    return cc_chan_send(ch, value, value_size);
+}
+static inline int cc_channel_raw_send_into(CCChan* ch, CCClosure2 builder, size_t value_size, CCArena* arena) {
+    return cc_chan_send_into(ch, builder, value_size, arena);
+}
+static inline int cc_channel_raw_recv(CCChan* ch, void* out_value, size_t value_size) {
+    return cc_chan_recv(ch, out_value, value_size);
+}
+static inline int cc_channel_raw_try_send(CCChan* ch, const void* value, size_t value_size) {
+    return cc_chan_try_send(ch, value, value_size);
+}
+static inline int cc_channel_raw_try_send_into(CCChan* ch, CCClosure2 builder, size_t value_size, CCArena* arena) {
+    return cc_chan_try_send_into(ch, builder, value_size, arena);
+}
+static inline int cc_channel_raw_try_recv(CCChan* ch, void* out_value, size_t value_size) {
+    return cc_chan_try_recv(ch, out_value, value_size);
+}
+static inline void cc_channel_raw_set_recv_signal(CCChan* ch, CCSocketSignal* sig) {
+    cc_chan_set_recv_signal(ch, sig);
+}
+static inline int cc_channel_raw_send_take(CCChan* ch, void* ptr) { return cc_chan_send_take(ch, ptr); }
+static inline int cc_channel_raw_send_take_slice(CCChan* ch, const CCSliceUnique* slice) {
+    return cc_chan_send_take_slice(ch, slice);
+}
+static inline CCTaskIntptr cc_channel_raw_send_task(CCChan* ch, const void* value, size_t value_size) {
+    return cc_chan_send_task(ch, value, value_size);
+}
+static inline CCTaskIntptr cc_channel_raw_recv_task(CCChan* ch, void* out_value, size_t value_size) {
+    return cc_chan_recv_task(ch, out_value, value_size);
+}
+static inline CCResult_CCChanWaitOrSocketKind_CCIoError
+cc_channel_raw_wait_recv_or_socket(CCChan* ch, CCSocketSignal* sig, void* out_value, size_t value_size) {
+    return cc_chan_wait_recv_or_socket(ch, sig, out_value, value_size);
+}
+
+/* Canonical typed/manual-C wrappers over the erased runtime core.
+   The compiler should target the stable `cc_channel_*` family directly. */
+static inline void cc__channel_close_tx(CCChanTx tx) { cc_channel_raw_close(tx.raw); }
+static inline void cc__channel_close_rx(CCChanRx rx) { cc_channel_raw_close(rx.raw); }
+static inline void cc__channel_close_with_tx(CCChanTx tx, CCIoError e) { cc_channel_raw_close_with(tx.raw, e); }
+static inline void cc__channel_close_with_rx(CCChanRx rx, CCIoError e) { cc_channel_raw_close_with(rx.raw, e); }
+static inline void cc__channel_cancel_tx(CCChanTx tx) { cc_channel_raw_cancel(tx.raw); }
+static inline void cc__channel_cancel_rx(CCChanRx rx) { cc_channel_raw_cancel(rx.raw); }
+static inline void cc__channel_free_tx(CCChanTx tx) { cc_channel_raw_free(tx.raw); }
+static inline void cc__channel_free_rx(CCChanRx rx) { cc_channel_raw_free(rx.raw); }
+static inline void cc__channel_set_recv_signal_tx(CCChanTx tx, CCSocketSignal* sig) {
+    cc_channel_raw_set_recv_signal(tx.raw, sig);
+}
+static inline CCResult_CCChanWaitOrSocketKind_CCIoError
+cc__channel_wait_recv_or_socket_rx(CCChanRx rx, CCSocketSignal* sig, void* out_value, size_t value_size) {
+    return cc_channel_raw_wait_recv_or_socket(rx.raw, sig, out_value, value_size);
+}
+static inline CCResult_bool_CCIoError cc__channel_send_take_typed(CCChanTx tx, void* ptr) {
+    return cc_chan_result_with(tx.raw, cc_channel_raw_send_take(tx.raw, ptr), /*is_recv=*/false);
+}
+
+#define CC__CHANNEL_SELECT_2_OR_3(_1, _2, _3, NAME, ...) NAME
+#define CC__CHANNEL_SELECT_3_OR_4(_1, _2, _3, _4, NAME, ...) NAME
+#define cc_channel_send_raw3(ch, value, value_size) cc_channel_raw_send((ch), (value), (value_size))
+#define cc_channel_send_typed(tx, value) ({ \
+    __typeof__(value) __cc_tmp = (value); \
+    cc_chan_result_with((tx).raw, cc_channel_raw_send((tx).raw, &__cc_tmp, sizeof(__cc_tmp)), /*is_recv=*/false); \
+})
+#define cc_channel_send(...) CC__CHANNEL_SELECT_2_OR_3(__VA_ARGS__, cc_channel_send_raw3, cc_channel_send_typed)(__VA_ARGS__)
+
+#define cc_channel_recv_typed(rx, out_ptr) cc__chan_recv_ordered((rx), (void*)(out_ptr), sizeof(*(out_ptr)))
+#define cc_channel_recv_raw3(ch, out_value, value_size) cc_channel_raw_recv((ch), (out_value), (value_size))
+#define cc_channel_recv(...) CC__CHANNEL_SELECT_2_OR_3(__VA_ARGS__, cc_channel_recv_raw3, cc_channel_recv_typed)(__VA_ARGS__)
+
+#define cc_channel_try_send_raw3(ch, value, value_size) cc_channel_raw_try_send((ch), (value), (value_size))
+#define cc_channel_try_send_typed(tx, value) ({ \
+    __typeof__(value) __cc_tmp = (value); \
+    cc_chan_result_with((tx).raw, cc_channel_raw_try_send((tx).raw, &__cc_tmp, sizeof(__cc_tmp)), /*is_recv=*/false); \
+})
+#define cc_channel_try_send(...) CC__CHANNEL_SELECT_2_OR_3(__VA_ARGS__, cc_channel_try_send_raw3, cc_channel_try_send_typed)(__VA_ARGS__)
+
+/* send_into / try_send_into: dispatch on the first argument's type, not
+ * arity.  Closure builders often contain capture-list commas (`[a, b]`)
+ * that are not parenthesis-protected; arity macros mis-count those as
+ * extra arguments.  `_Generic` + `(first, __VA_ARGS__)` keeps the builder
+ * intact because `__VA_ARGS__` re-joins the remaining preprocessor args. */
+static inline int cc_channel_send_into_raw_call(CCChan* ch, CCClosure2 builder,
+                                               size_t value_size, CCArena* arena) {
+    return cc_channel_raw_send_into(ch, builder, value_size, arena);
+}
+static inline CCResult_bool_CCIoError cc_channel_send_into_typed_call(CCChanTx tx,
+                                                                     CCClosure2 builder,
+                                                                     CCArena* arena) {
+    return cc_chan_result_with(tx.raw,
+                               cc_channel_raw_send_into(tx.raw, builder,
+                                                        cc_chan_elem_size(tx.raw), arena),
+                               /*is_recv=*/false);
+}
+#define cc_channel_send_into(a, ...) \
+    _Generic((a), \
+        CCChan *: cc_channel_send_into_raw_call, \
+        default: cc_channel_send_into_typed_call \
+    )((a), __VA_ARGS__)
+
+static inline int cc_channel_try_send_into_raw_call(CCChan* ch, CCClosure2 builder,
+                                                   size_t value_size, CCArena* arena) {
+    return cc_channel_raw_try_send_into(ch, builder, value_size, arena);
+}
+static inline CCResult_bool_CCIoError cc_channel_try_send_into_typed_call(CCChanTx tx,
+                                                                         CCClosure2 builder,
+                                                                         CCArena* arena) {
+    return cc_chan_result_with(tx.raw,
+                               cc_channel_raw_try_send_into(tx.raw, builder,
+                                                            cc_chan_elem_size(tx.raw), arena),
+                               /*is_recv=*/false);
+}
+#define cc_channel_try_send_into(a, ...) \
+    _Generic((a), \
+        CCChan *: cc_channel_try_send_into_raw_call, \
+        default: cc_channel_try_send_into_typed_call \
+    )((a), __VA_ARGS__)
+
+#define cc_channel_try_recv_typed(rx, out_ptr) (cc_chan_result_with((rx).raw, cc_channel_raw_try_recv((rx).raw, (out_ptr), sizeof(*(out_ptr))), /*is_recv=*/true))
+#define cc_channel_try_recv_raw3(ch, out_value, value_size) cc_channel_raw_try_recv((ch), (out_value), (value_size))
+#define cc_channel_try_recv(...) CC__CHANNEL_SELECT_2_OR_3(__VA_ARGS__, cc_channel_try_recv_raw3, cc_channel_try_recv_typed)(__VA_ARGS__)
+
+#define cc_channel_wait_recv_or_socket(h, sig, out_ptr) _Generic((h), \
+    CCChan*: cc_channel_raw_wait_recv_or_socket, \
+    CCChanRx: cc__channel_wait_recv_or_socket_rx \
+)((h), (sig), (out_ptr), sizeof(*(out_ptr)))
+
+/* cc_channel_close is arity-overloaded:
+ *   cc_channel_close(h)       -> graceful close; peers observe Ok(false) (EOF).
+ *   cc_channel_close(h, e)    -> structured close; peers observe Err(e).
+ * Handle dispatch (CCChan* / CCChanTx / CCChanRx) is handled per arm below. */
+#define cc__channel_close_1(h) _Generic((h), \
+    CCChan*: cc_channel_raw_close, \
+    CCChanTx: cc__channel_close_tx, \
+    CCChanRx: cc__channel_close_rx \
+)((h))
+#define cc__channel_close_2(h, e) _Generic((h), \
+    CCChan*: cc_channel_raw_close_with, \
+    CCChanTx: cc__channel_close_with_tx, \
+    CCChanRx: cc__channel_close_with_rx \
+)((h), (e))
+#define cc__channel_close_dispatch(_1, _2, NAME, ...) NAME
+#define cc_channel_close(...) cc__channel_close_dispatch(__VA_ARGS__, cc__channel_close_2, cc__channel_close_1)(__VA_ARGS__)
+
+#define cc_channel_cancel(h) _Generic((h), \
+    CCChan*: cc_channel_raw_cancel, \
+    CCChanTx: cc__channel_cancel_tx, \
+    CCChanRx: cc__channel_cancel_rx \
+)((h))
+
+#define cc_channel_free(h) _Generic((h), \
+    CCChan*: cc_channel_raw_free, \
+    CCChanTx: cc__channel_free_tx, \
+    CCChanRx: cc__channel_free_rx \
+)((h))
+
+#define cc_channel_set_recv_signal(h, sig) _Generic((h), \
+    CCChan*: cc_channel_raw_set_recv_signal, \
+    CCChanTx: cc__channel_set_recv_signal_tx \
+)((h), (sig))
+
+#define cc_channel_send_take(h, value) _Generic((h), \
+    CCChan*: cc_channel_raw_send_take, \
+    CCChanTx: cc__channel_send_take_typed \
+)((h), (value))
+
+#define cc_channel_send_take_slice(ch, slice) cc_channel_raw_send_take_slice((ch), (slice))
+#define cc_channel_send_task_typed(tx, value) ({ \
+    __typeof__(value) __cc_tmp = (value); \
+    cc_channel_raw_send_task((tx).raw, &__cc_tmp, sizeof(__cc_tmp)); \
+})
+#define cc_channel_send_task_raw3(ch, value, value_size) cc_channel_raw_send_task((ch), (value), (value_size))
+#define cc_channel_send_task(...) CC__CHANNEL_SELECT_2_OR_3(__VA_ARGS__, cc_channel_send_task_raw3, cc_channel_send_task_typed)(__VA_ARGS__)
+
+#define cc_channel_recv_task_typed(rx, out_ptr) cc_channel_raw_recv_task((rx).raw, (out_ptr), sizeof(*(out_ptr)))
+#define cc_channel_recv_task_raw3(ch, out_value, value_size) cc_channel_raw_recv_task((ch), (out_value), (value_size))
+#define cc_channel_recv_task(...) CC__CHANNEL_SELECT_2_OR_3(__VA_ARGS__, cc_channel_recv_task_raw3, cc_channel_recv_task_typed)(__VA_ARGS__)
+
+static inline bool cc__channel_lower_c_eq(CCSlice s, const char *cstr) {
+    size_t len = cstr ? strlen(cstr) : 0;
+    return cstr && s.len == len && memcmp(s.ptr, cstr, len) == 0;
+}
+
+static inline CCSlice cc_channel_tx_lower_c(CCSlice recv_type, CCSlice method, CCSlice mode, CCSliceArray argv, CCSliceArray arg_types, CCArena *arena) {
+    (void)recv_type;
+    (void)argv;
+    (void)arg_types;
+    if (cc__channel_lower_c_eq(method, "send")) {
+        if (cc__channel_lower_c_eq(mode, "await")) return cc_ufcs_emit_value_cstr(arena, "cc_channel_send_task");
+        return cc_ufcs_emit_value_cstr(arena, "cc_channel_send");
+    }
+    if (cc__channel_lower_c_eq(method, "try_send")) return cc_ufcs_emit_value_cstr(arena, "cc_channel_try_send");
+    if (cc__channel_lower_c_eq(method, "send_into")) return cc_ufcs_emit_value_cstr(arena, "cc_channel_send_into");
+    if (cc__channel_lower_c_eq(method, "try_send_into")) return cc_ufcs_emit_value_cstr(arena, "cc_channel_try_send_into");
+    if (cc__channel_lower_c_eq(method, "set_recv_signal")) return cc_ufcs_emit_value_cstr(arena, "cc_channel_set_recv_signal");
+    if (cc__channel_lower_c_eq(method, "send_take")) return cc_ufcs_emit_value_cstr(arena, "cc_channel_send_take");
+    if (cc__channel_lower_c_eq(method, "send_task")) return cc_ufcs_emit_value_cstr(arena, "cc_channel_send_task");
+    if (cc__channel_lower_c_eq(method, "send_task_hybrid")) return cc_ufcs_emit_value_cstr(arena, "cc_channel_send_task_hybrid");
+    if (cc__channel_lower_c_eq(method, "close")) return cc_ufcs_emit_value_cstr(arena, "cc_channel_close");
+    if (cc__channel_lower_c_eq(method, "cancel")) return cc_ufcs_emit_value_cstr(arena, "cc_channel_cancel");
+    if (cc__channel_lower_c_eq(method, "free")) return cc_ufcs_emit_value_cstr(arena, "cc_channel_free");
+    return cc_slice_empty();
+}
+
+static inline CCSlice cc_channel_rx_lower_c(CCSlice recv_type, CCSlice method, CCSlice mode, CCSliceArray argv, CCSliceArray arg_types, CCArena *arena) {
+    (void)recv_type;
+    (void)argv;
+    (void)arg_types;
+    if (cc__channel_lower_c_eq(method, "recv")) {
+        if (cc__channel_lower_c_eq(mode, "await")) return cc_ufcs_emit_value_cstr(arena, "cc_channel_recv_task");
+        return cc_ufcs_emit_value_cstr(arena, "cc_channel_recv");
+    }
+    if (cc__channel_lower_c_eq(method, "try_recv")) return cc_ufcs_emit_value_cstr(arena, "cc_channel_try_recv");
+    if (cc__channel_lower_c_eq(method, "close")) return cc_ufcs_emit_value_cstr(arena, "cc_channel_close");
+    if (cc__channel_lower_c_eq(method, "cancel")) return cc_ufcs_emit_value_cstr(arena, "cc_channel_cancel");
+    if (cc__channel_lower_c_eq(method, "free")) return cc_ufcs_emit_value_cstr(arena, "cc_channel_free");
+    return cc_slice_empty();
+}
+
+
+
+
+/* Raw (untyped) aliases: `CCChanTx tx = ...; tx.send(1)` used to hit
+   the builtin-callable lookup in ufcs.c.  Now that the AST dispatch is
+   registry-only, the bare aliases also need explicit hooks — the
+   wildcard pattern `CCChanTx_*` only matches the typed family
+   (CCChanTx_int, CCChanTx_Foo, ...), not the plain CCChanTx typedef. */
+
+
+
+/* Complete-type-only helper for direct header use after the element type is defined. */
+#define CC_DECL_TYPED_CHAN_FAMILY(T, Mangled)                                           \
+    typedef CCChanTx CCChanTx_##Mangled;                                                \
+    typedef CCChanRx CCChanRx_##Mangled;                                                \
+    static inline bool !>(CCIoError) CCChanTx_##Mangled##_send(CCChanTx_##Mangled tx, T value) { \
+        return cc_chan_result_with(tx.raw, cc_channel_raw_send(tx.raw, &value, sizeof(T)), /*is_recv=*/false);   \
+    }                                                                                   \
+    static inline bool !>(CCIoError) CCChanRx_##Mangled##_recv(CCChanRx_##Mangled rx, T* out_value) { \
+        return cc__chan_recv_ordered(rx, (void*)out_value, sizeof(T));                  \
+    }                                                                                   \
+    static inline bool !>(CCIoError) CCChanTx_##Mangled##_try_send(CCChanTx_##Mangled tx, T value) { \
+        return cc_chan_result_with(tx.raw, cc_channel_raw_try_send(tx.raw, &value, sizeof(T)), /*is_recv=*/false); \
+    }                                                                                   \
+    static inline bool !>(CCIoError) CCChanRx_##Mangled##_try_recv(CCChanRx_##Mangled rx, T* out_value) { \
+        return cc_chan_result_with(rx.raw, cc_channel_raw_try_recv(rx.raw, out_value, sizeof(T)), /*is_recv=*/true); \
+    }                                                                                   \
+    static inline void CCChanTx_##Mangled##_set_recv_signal(CCChanTx_##Mangled tx, CCSocketSignal* sig) { \
+        cc_channel_raw_set_recv_signal(tx.raw, sig);                                     \
+    }                                                                                   \
+    static inline void CCChanTx_##Mangled##_close(CCChanTx_##Mangled tx) { cc_channel_raw_close(tx.raw); } \
+    static inline void CCChanRx_##Mangled##_close(CCChanRx_##Mangled rx) { cc_channel_raw_close(rx.raw); } \
+    static inline void CCChanTx_##Mangled##_close_with(CCChanTx_##Mangled tx, CCIoError e) { cc_channel_raw_close_with(tx.raw, e); } \
+    static inline void CCChanRx_##Mangled##_close_with(CCChanRx_##Mangled rx, CCIoError e) { cc_channel_raw_close_with(rx.raw, e); } \
+    static inline void CCChanTx_##Mangled##_cancel(CCChanTx_##Mangled tx) { cc_channel_raw_cancel(tx.raw); } \
+    static inline void CCChanRx_##Mangled##_cancel(CCChanRx_##Mangled rx) { cc_channel_raw_cancel(rx.raw); } \
+    static inline void CCChanTx_##Mangled##_free(CCChanTx_##Mangled tx) { cc_channel_raw_free(tx.raw); } \
+    static inline void CCChanRx_##Mangled##_free(CCChanRx_##Mangled rx) { cc_channel_raw_free(rx.raw); }
+
+#define CC_DECL_TYPED_CHAN_WRAPPERS(T, Mangled) CC_DECL_TYPED_CHAN_FAMILY(T, Mangled)
+
+// Non-blocking multi-case match helper: tries each case once, returns index of ready case.
+typedef struct {
+    CCChan* ch;
+    const void* send_buf; // for send
+    void* recv_buf;       // for recv
+    size_t elem_size;
+    bool is_send;
+} CCChanMatchCase;
+
+int cc_chan_match_try(CCChanMatchCase* cases, size_t n, size_t* ready_index);
+int cc_chan_match_deadline(CCChanMatchCase* cases, size_t n, size_t* ready_index, const CCDeadline* deadline);
+
+// Blocking select-style match over multiple channels with deadline support.
+// Returns 0 on success (ready_index set), ETIMEDOUT on timeout, EPIPE if a closed channel is encountered with no ready cases.
+int cc_chan_match_select(CCChanMatchCase* cases, size_t n, size_t* ready_index, const CCDeadline* deadline);
+
+// Async select over channels. Submits to executor; sets *ready_index on completion and signals via CCAsyncHandle done channel (err code).
+int cc_chan_match_select_async(CCExec* ex, CCChanMatchCase* cases, size_t n, size_t* ready_index, CCAsyncHandle* h, const CCDeadline* deadline);
+
+// Future-based async select for ergonomic awaiting.
+int cc_chan_match_select_future(CCExec* ex, CCChanMatchCase* cases, size_t n, size_t* ready_index, CCFuture* f, const CCDeadline* deadline);
+
+// Typed-size initialization helper (eagerly sets elem_size and allocates buffer).
+int cc_chan_init_elem(CCChan* ch, size_t elem_size);
+
+// Convenience macros to build match cases.
+#define CC_CHAN_MATCH_SEND_CASE(CH, BUF, TYPE) (CCChanMatchCase){ .ch = (CH), .send_buf = (BUF), .recv_buf = NULL, .elem_size = sizeof(TYPE), .is_send = true }
+#define CC_CHAN_MATCH_RECV_CASE(CH, BUF, TYPE) (CCChanMatchCase){ .ch = (CH), .send_buf = NULL, .recv_buf = (BUF), .elem_size = sizeof(TYPE), .is_send = false }
+
+// Typed wrapper macros: value and pointer variants with bool helpers for spec parity.
+#define CC_DECL_TYPED_CHAN_VAL(T, Name)                                                \
+    typedef struct { CCChan* raw; } Name;                                              \
+    static inline Name Name##_create(size_t cap) { Name c = { cc_chan_create(cap) }; if (c.raw) cc_chan_init_elem(c.raw, sizeof(T)); return c; } \
+    static inline void Name##_close(Name* c) { if (c && c->raw) cc_channel_raw_close(c->raw); } \
+    static inline void Name##_free(Name* c) { if (c && c->raw) cc_channel_raw_free(c->raw); } \
+    static inline int Name##_send(Name* c, T v) { return cc_channel_raw_send(c ? c->raw : NULL, &v, sizeof(T)); } \
+    static inline int Name##_recv(Name* c, T* out_v) { return cc_channel_raw_recv(c ? c->raw : NULL, out_v, sizeof(T)); } \
+    static inline bool Name##_try_send(Name* c, T v) { return cc_channel_raw_try_send(c ? c->raw : NULL, &v, sizeof(T)) == 0; } \
+    static inline bool Name##_try_recv(Name* c, T* out_v) { return cc_channel_raw_try_recv(c ? c->raw : NULL, out_v, sizeof(T)) == 0; }
+
+#define CC_DECL_TYPED_CHAN_PTR(T, Name)                                                \
+    typedef struct { CCChan* raw; } Name;                                              \
+    static inline Name Name##_create(size_t cap) { Name c = { cc_chan_create_mode_take(cap, CC_CHAN_MODE_BLOCK, true) }; if (c.raw) cc_chan_init_elem(c.raw, sizeof(void*)); return c; } \
+    static inline void Name##_close(Name* c) { if (c && c->raw) cc_channel_raw_close(c->raw); } \
+    static inline void Name##_free(Name* c) { if (c && c->raw) cc_channel_raw_free(c->raw); } \
+    static inline int Name##_send(Name* c, T* ptr) { return cc_channel_raw_send_take(c ? c->raw : NULL, ptr); } \
+    static inline int Name##_recv(Name* c, T** out_ptr) { return cc_channel_raw_recv(c ? c->raw : NULL, out_ptr, sizeof(void*)); } \
+    static inline bool Name##_try_send(Name* c, T* ptr) { return cc_chan_try_send_take(c ? c->raw : NULL, ptr) == 0; } \
+    static inline bool Name##_try_recv(Name* c, T** out_ptr) { return cc_channel_raw_try_recv(c ? c->raw : NULL, out_ptr, sizeof(void*)) == 0; }
+
+#endif // CC_CHANNEL_H
+
+

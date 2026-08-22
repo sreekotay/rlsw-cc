@@ -1,0 +1,670 @@
+/*
+ * Argv parsing runtime for @grammar(cli) — descriptor table → typed struct.
+ * String fields are char[:0] (NUL-terminated borrows of argv / default lits).
+ * Declare options with @grammar(cli) (include this header so the `cli` engine
+ * is harvested); call cc_parse_args / cc_print_usage. The fenced declaration
+ * DSL is the CliSyntax factory in cli_decl.rules.
+ */
+#ifndef CC_STD_CLI_H
+#define CC_STD_CLI_H
+
+#include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+
+#include <ccc/cc_compat.h>
+#include <ccc/cc_slice.h>
+#include <ccc/cc_arena.h>
+#include <ccc/cc_result.h>
+#include <ccc/std/string.h>
+
+typedef enum {
+    CC_CLI_FLAG = 1,
+    CC_CLI_COUNT,
+    CC_CLI_OPT_I64,
+    CC_CLI_OPT_STRING,
+    CC_CLI_MANY_STRING,
+    CC_CLI_ALIAS,
+} CCCliKind;
+
+typedef struct CCCliField {
+    const char *name;                 /* struct field / logical key */
+    CCCliKind kind;
+    const char *const *longs;         /* NULL-terminated long names (no leading --) */
+    const char *shorts;               /* single-char shorts packed, e.g. "c" or "vh" */
+    const char *const *short_aliases; /* NULL-terminated multi-char shorts ("11") */
+    bool allow_attached;              /* -p4 when true; else space-required */
+    bool require_space;               /* legacy; treat as !allow_attached */
+    const char *desc;
+    const char *value_name;           /* usage metavariable (grammar `as`) */
+    const char *default_cstr;         /* opt default lit text, or NULL */
+    bool is_help;                     /* help flag: prepare → Ok(false) */
+    /* CC_CLI_ALIAS: write into maps_to field with optional fixed value */
+    const char *maps_to;              /* target field name */
+    const char *maps_value;           /* fixed value text, or NULL */
+    /* byte offsets into the out struct (0 = unused) */
+    unsigned off;                     /* value */
+    unsigned off_present;             /* bool present (opt kinds) */
+    unsigned off_len;                 /* size_t len (many) */
+} CCCliField;
+
+typedef struct CCCliFillResult {
+    bool ok;
+    int exit_code;
+    CCSlice prog;
+} CCCliFillResult;
+
+/* Borrow a NUL-terminated token as a char[:0]-compatible view (ptr[len]==0). */
+static inline CCSlice cc__cli_cstr_slice(const char *text) {
+    return cc_slice_cstr(text);
+}
+
+/* Argv tokens: same NUL sentinel, untracked lifetime (not immortal static). */
+static inline CCSlice cc__cli_argv_slice(const char *text) {
+    return cc_slice_cstr(text);
+}
+
+static inline const char *cc_cli_prog(int argc, char **argv) {
+    if (!argv || argc <= 0 || !argv[0]) return "program";
+    return argv[0];
+}
+
+static inline CCSlice cc_cli_prog_slice(int argc, char **argv) {
+    return cc__cli_cstr_slice(cc_cli_prog(argc, argv));
+}
+
+/* Overlay grammar opts onto destination state only when the user set the field
+ * (`*_present`). Flags are the value itself — use a plain `if (opts->flag)`. */
+#define cc_cli_overlay_i64(dst, opts, field) \
+    do { \
+        if ((opts)->field##_present) *(dst) = (opts)->field; \
+    } while (0)
+
+#define cc_cli_overlay_cstr(dst, opts, field) \
+    do { \
+        if ((opts)->field##_present) *(dst) = (char *)(opts)->field.ptr; \
+    } while (0)
+
+static inline bool cc__cli_is_digit_str(CCSlice slice) {
+    size_t i;
+    if (slice.len == 0) return false;
+    for (i = 0; i < slice.len; i++) {
+        char ch = ((const char *)slice.ptr)[i];
+        if (ch < '0' || ch > '9') return false;
+    }
+    return true;
+}
+
+static inline bool cc__cli_is_option_like(CCSlice slice) {
+    return slice.len > 0 && ((const char *)slice.ptr)[0] == '-'
+        && !CCSlice_eq_cstr(&slice, "-");
+}
+
+static inline bool cc__cli_longs_has(const char *const *longs, CCSlice name) {
+    size_t i;
+    if (!longs) return false;
+    for (i = 0; longs[i]; i++) {
+        if (CCSlice_eq_cstr(&name, longs[i])) return true;
+    }
+    return false;
+}
+
+static inline bool cc__cli_short_aliases_has(const char *const *aliases, CCSlice name) {
+    size_t i;
+    if (!aliases) return false;
+    for (i = 0; aliases[i]; i++) {
+        if (CCSlice_eq_cstr(&name, aliases[i])) return true;
+    }
+    return false;
+}
+
+static inline bool cc__cli_shorts_has(const char *shorts, char ch) {
+    size_t i;
+    if (!shorts) return false;
+    for (i = 0; shorts[i]; i++) {
+        if (shorts[i] == ch) return true;
+    }
+    return false;
+}
+
+static inline const CCCliField *cc__cli_find_by_name(const CCCliField *fields,
+                                                    size_t n,
+                                                    const char *name) {
+    size_t i;
+    if (!fields || !name) return NULL;
+    for (i = 0; i < n; i++) {
+        if (fields[i].name && strcmp(fields[i].name, name) == 0
+            && fields[i].kind != CC_CLI_ALIAS)
+            return &fields[i];
+    }
+    return NULL;
+}
+
+static inline const CCCliField *cc__cli_find_long(const CCCliField *fields,
+                                                 size_t n,
+                                                 CCSlice name) {
+    size_t i;
+    for (i = 0; i < n; i++) {
+        if (cc__cli_longs_has(fields[i].longs, name)) return &fields[i];
+    }
+    return NULL;
+}
+
+static inline const CCCliField *cc__cli_find_short_char(const CCCliField *fields,
+                                                       size_t n,
+                                                       char ch) {
+    size_t i;
+    for (i = 0; i < n; i++) {
+        if (fields[i].kind == CC_CLI_MANY_STRING) continue;
+        if (cc__cli_shorts_has(fields[i].shorts, ch)) return &fields[i];
+    }
+    return NULL;
+}
+
+static inline const CCCliField *cc__cli_find_numeric_short(const CCCliField *fields,
+                                                          size_t n,
+                                                          CCSlice name) {
+    size_t i;
+    if (!cc__cli_is_digit_str(name)) return NULL;
+    for (i = 0; i < n; i++) {
+        if (fields[i].kind != CC_CLI_OPT_I64 && fields[i].kind != CC_CLI_ALIAS)
+            continue;
+        if (cc__cli_short_aliases_has(fields[i].short_aliases, name))
+            return &fields[i];
+        /* single-digit also listed in shorts */
+        if (name.len == 1 && cc__cli_shorts_has(fields[i].shorts,
+                                                ((const char *)name.ptr)[0]))
+            return &fields[i];
+    }
+    return NULL;
+}
+
+static inline const CCCliField *cc__cli_find_positional(const CCCliField *fields,
+                                                       size_t n) {
+    size_t i;
+    for (i = 0; i < n; i++) {
+        if (fields[i].kind == CC_CLI_MANY_STRING) return &fields[i];
+    }
+    return NULL;
+}
+
+static inline bool cc__cli_take_next_value(int argc, char **argv, int *index,
+                                          CCSlice *value_out) {
+    CCSlice next;
+    if (!index || !value_out) return false;
+    if (*index + 1 >= argc || !argv || !argv[*index + 1]) return false;
+    next = cc__cli_argv_slice(argv[*index + 1]);
+    if (cc__cli_is_option_like(next)) return false;
+    *index = *index + 1;
+    *value_out = next;
+    return true;
+}
+
+static inline bool cc__cli_parse_i64(CCSlice value, int64_t *out) {
+    CCResult_int64_t_CC_I64ParseError parsed = cc_slice_parse_i64(value, 10);
+    if (cc_is_err(parsed)) return false;
+    if (out) *out = cc_unwrap(parsed);
+    return true;
+}
+
+static inline void cc__cli_set_present(void *base, const CCCliField *f) {
+    if (!base || !f || !f->off_present) return;
+    *(bool *)((char *)base + f->off_present) = true;
+}
+
+static inline bool cc__cli_apply_value(void *base,
+                                       const CCCliField *fields,
+                                       size_t nfields,
+                                       const CCCliField *spec,
+                                       CCSlice value,
+                                       CCArena *arena,
+                                       int *exit_code) {
+    const CCCliField *target = spec;
+    CCSlice use = value;
+    if (!base || !spec) return false;
+    if (spec->kind == CC_CLI_ALIAS) {
+        target = cc__cli_find_by_name(fields, nfields, spec->maps_to);
+        if (!target) {
+            fprintf(stderr, "Internal error: alias maps to unknown field\n");
+            if (exit_code) *exit_code = 1;
+            return false;
+        }
+        if (spec->maps_value)
+            use = cc__cli_cstr_slice(spec->maps_value);
+    }
+    switch (target->kind) {
+    case CC_CLI_FLAG:
+        *(bool *)((char *)base + target->off) = true;
+        return true;
+    case CC_CLI_COUNT:
+        (*(int64_t *)((char *)base + target->off))++;
+        return true;
+    case CC_CLI_OPT_I64: {
+        int64_t v = 0;
+        if (!cc__cli_parse_i64(use, &v)) {
+            fprintf(stderr, "Invalid integer for --%s\n",
+                    target->name ? target->name : "?");
+            if (exit_code) *exit_code = 1;
+            return false;
+        }
+        *(int64_t *)((char *)base + target->off) = v;
+        cc__cli_set_present(base, target);
+        return true;
+    }
+    case CC_CLI_OPT_STRING:
+        *(CCSlice *)((char *)base + target->off) = use;
+        cc__cli_set_present(base, target);
+        return true;
+    case CC_CLI_MANY_STRING: {
+        CCSlice **items = (CCSlice **)((char *)base + target->off);
+        size_t *len = (size_t *)((char *)base + target->off_len);
+        CCSlice *next;
+        size_t cap = *len + 1;
+        if (!arena) {
+            fprintf(stderr, "Out of memory while parsing arguments\n");
+            if (exit_code) *exit_code = 1;
+            return false;
+        }
+        next = (CCSlice *)cc_arena_alloc(arena, sizeof(CCSlice) * cap, _Alignof(CCSlice));
+        if (!next) {
+            fprintf(stderr, "Out of memory while parsing arguments\n");
+            if (exit_code) *exit_code = 1;
+            return false;
+        }
+        if (*items && *len)
+            memcpy(next, *items, sizeof(CCSlice) * (*len));
+        next[*len] = use;
+        *items = next;
+        (*len)++;
+        return true;
+    }
+    default:
+        fprintf(stderr, "Internal error: bad CLI field kind\n");
+        if (exit_code) *exit_code = 1;
+        return false;
+    }
+}
+
+static inline bool cc__cli_parse_long(void *base,
+                                      const CCCliField *fields,
+                                      size_t nfields,
+                                      int argc,
+                                      char **argv,
+                                      int *index,
+                                      CCSlice arg,
+                                      CCArena *arena,
+                                      int *exit_code) {
+    const CCCliField *spec;
+    CCSlice name;
+    CCSlice value = cc_slice_empty();
+    size_t pos = 2;
+    while (pos < arg.len && ((const char *)arg.ptr)[pos] != '=') pos++;
+    name = CCSlice_sub(&arg, 2, pos);
+    spec = cc__cli_find_long(fields, nfields, name);
+    if (!spec) {
+        fprintf(stderr, "Unknown option: %.*s\n", (int)arg.len, (const char *)arg.ptr);
+        if (exit_code) *exit_code = 1;
+        return false;
+    }
+    if (spec->kind == CC_CLI_FLAG || spec->kind == CC_CLI_COUNT
+        || spec->kind == CC_CLI_ALIAS) {
+        if (pos < arg.len) {
+            fprintf(stderr, "Option does not take a value: %.*s\n",
+                    (int)arg.len, (const char *)arg.ptr);
+            if (exit_code) *exit_code = 1;
+            return false;
+        }
+        return cc__cli_apply_value(base, fields, nfields, spec, cc_slice_empty(),
+                                   arena, exit_code);
+    }
+    if (pos < arg.len) {
+        value = CCSlice_sub(&arg, pos + 1, arg.len);
+    } else if (!cc__cli_take_next_value(argc, argv, index, &value)) {
+        fprintf(stderr, "Missing value for %.*s\n", (int)arg.len, (const char *)arg.ptr);
+        if (exit_code) *exit_code = 1;
+        return false;
+    }
+    return cc__cli_apply_value(base, fields, nfields, spec, value, arena, exit_code);
+}
+
+static inline bool cc__cli_parse_short(void *base,
+                                       const CCCliField *fields,
+                                       size_t nfields,
+                                       int argc,
+                                       char **argv,
+                                       int *index,
+                                       CCSlice arg,
+                                       CCArena *arena,
+                                       int *exit_code) {
+    CCSlice tail = CCSlice_sub(&arg, 1, arg.len);
+    const CCCliField *numeric = cc__cli_find_numeric_short(fields, nfields, tail);
+    size_t pos = 1;
+    if (numeric) {
+        return cc__cli_apply_value(base, fields, nfields, numeric, tail, arena,
+                                   exit_code);
+    }
+    while (pos < arg.len) {
+        const CCCliField *spec =
+            cc__cli_find_short_char(fields, nfields, ((const char *)arg.ptr)[pos]);
+        if (!spec) {
+            fprintf(stderr, "Unknown option: -%c\n", ((const char *)arg.ptr)[pos]);
+            if (exit_code) *exit_code = 1;
+            return false;
+        }
+        if (spec->kind == CC_CLI_FLAG || spec->kind == CC_CLI_COUNT
+            || spec->kind == CC_CLI_ALIAS) {
+            if (!cc__cli_apply_value(base, fields, nfields, spec, cc_slice_empty(),
+                                     arena, exit_code))
+                return false;
+            pos++;
+            continue;
+        }
+        if (pos + 1 < arg.len) {
+            if (spec->require_space || !spec->allow_attached) {
+                fprintf(stderr, "Invalid usage: -%c must be followed by space\n",
+                        ((const char *)arg.ptr)[pos]);
+                if (exit_code) *exit_code = 1;
+                return false;
+            }
+            return cc__cli_apply_value(base, fields, nfields, spec,
+                                       CCSlice_sub(&arg, pos + 1, arg.len),
+                                       arena, exit_code);
+        }
+        {
+            CCSlice value = cc_slice_empty();
+            if (!cc__cli_take_next_value(argc, argv, index, &value)) {
+                fprintf(stderr, "Missing value for -%c\n",
+                        ((const char *)arg.ptr)[pos]);
+                if (exit_code) *exit_code = 1;
+                return false;
+            }
+            return cc__cli_apply_value(base, fields, nfields, spec, value, arena,
+                                       exit_code);
+        }
+    }
+    return true;
+}
+
+/*
+ * Fill `out` (layout described by `fields`) from argc/argv.
+ * Does not clear `out` — caller zeros / sets defaults first.
+ */
+static inline CCCliFillResult cc_cli_fill(const CCCliField *fields,
+                                          size_t nfields,
+                                          int argc,
+                                          char **argv,
+                                          CCArena *arena,
+                                          void *out) {
+    CCCliFillResult r;
+    bool stop = false;
+    int index;
+    const CCCliField *positional = cc__cli_find_positional(fields, nfields);
+    r.ok = true;
+    r.exit_code = 0;
+    r.prog = cc_cli_prog_slice(argc, argv);
+    if (!fields || !out) {
+        r.ok = false;
+        r.exit_code = 1;
+        return r;
+    }
+    for (index = 1; index < argc; index++) {
+        CCSlice arg;
+        if (!argv || !argv[index]) continue;
+        arg = cc__cli_argv_slice(argv[index]);
+        if (!stop && CCSlice_eq_cstr(&arg, "--")) {
+            stop = true;
+            continue;
+        }
+        if (!stop && arg.len > 1 && ((const char *)arg.ptr)[0] == '-'
+            && ((const char *)arg.ptr)[1] == '-') {
+            if (!cc__cli_parse_long(out, fields, nfields, argc, argv, &index, arg,
+                                    arena, &r.exit_code)) {
+                r.ok = false;
+                return r;
+            }
+            continue;
+        }
+        if (!stop && arg.len > 1 && ((const char *)arg.ptr)[0] == '-'
+            && !CCSlice_eq_cstr(&arg, "-")) {
+            if (!cc__cli_parse_short(out, fields, nfields, argc, argv, &index, arg,
+                                     arena, &r.exit_code)) {
+                r.ok = false;
+                return r;
+            }
+            continue;
+        }
+        if (!positional) {
+            fprintf(stderr, "Unexpected argument: %.*s\n",
+                    (int)arg.len, (const char *)arg.ptr);
+            r.ok = false;
+            r.exit_code = 1;
+            return r;
+        }
+        if (!cc__cli_apply_value(out, fields, nfields, positional, arg, arena,
+                                 &r.exit_code)) {
+            r.ok = false;
+            return r;
+        }
+    }
+    return r;
+}
+
+/* Apply grammar `default` lits. Does not set *_present (absent vs explicit). */
+static inline void cc_cli_apply_defaults(const CCCliField *fields,
+                                         size_t nfields,
+                                         void *out) {
+    size_t i;
+    if (!fields || !out) return;
+    for (i = 0; i < nfields; i++) {
+        const CCCliField *f = &fields[i];
+        if (!f->default_cstr || !f->default_cstr[0]) continue;
+        if (f->kind == CC_CLI_OPT_I64) {
+            int64_t v = 0;
+            CCSlice s = cc__cli_cstr_slice(f->default_cstr);
+            if (cc__cli_parse_i64(s, &v))
+                *(int64_t *)((char *)out + f->off) = v;
+        } else if (f->kind == CC_CLI_OPT_STRING) {
+            *(CCSlice *)((char *)out + f->off) = cc__cli_cstr_slice(f->default_cstr);
+        }
+    }
+}
+
+/* Basename of argv0 for Usage: lines (borrows into `argv0`). */
+static inline CCSlice cc_cli_prog_basename(const char *argv0) {
+    const char *p;
+    if (!argv0 || !argv0[0]) return cc__cli_cstr_slice("program");
+    p = strrchr(argv0, '/');
+    return cc__cli_cstr_slice(p ? p + 1 : argv0);
+}
+
+/* Prefer a letter short for help; digit-only shorts (gzip -9) stay accepted
+ * but are not the headline spelling. */
+static inline char cc__cli_display_short(const CCCliField *f) {
+    size_t i;
+    if (!f || !f->shorts) return 0;
+    for (i = 0; f->shorts[i]; i++) {
+        char c = f->shorts[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) return c;
+    }
+    return 0;
+}
+
+static inline const char *cc__cli_display_long(const CCCliField *f) {
+    if (!f) return "";
+    if (f->longs && f->longs[0]) return f->longs[0];
+    return f->name ? f->name : "";
+}
+
+static inline void cc__cli_print_option_line(FILE *out,
+                                             char short0,
+                                             const char *long0,
+                                             const char *value_name,
+                                             const char *desc,
+                                             const char *default_cstr) {
+    char long_buf[64];
+    if (!out) return;
+    if (value_name && value_name[0])
+        snprintf(long_buf, sizeof(long_buf), "%s %s", long0 ? long0 : "",
+                 value_name);
+    else
+        snprintf(long_buf, sizeof(long_buf), "%s", long0 ? long0 : "");
+    if (short0)
+        fprintf(out, "  -%c, --%-22s  %s", short0, long_buf,
+                desc ? desc : "");
+    else
+        fprintf(out, "      --%-22s  %s", long_buf, desc ? desc : "");
+    if (default_cstr && default_cstr[0])
+        fprintf(out, " [default: %s]", default_cstr);
+    fprintf(out, "\n");
+}
+
+static inline void cc__cli_print_alias_line(FILE *out,
+                                            const CCCliField *alias,
+                                            const CCCliField *target) {
+    const char *long0;
+    const char *tlong;
+    char desc_buf[256];
+    if (!out || !alias) return;
+    long0 = cc__cli_display_long(alias);
+    tlong = target ? cc__cli_display_long(target)
+                   : (alias->maps_to ? alias->maps_to : "?");
+    if (alias->desc && alias->desc[0]) {
+        snprintf(desc_buf, sizeof(desc_buf), "%s", alias->desc);
+    } else if (alias->maps_value && alias->maps_value[0]) {
+        snprintf(desc_buf, sizeof(desc_buf), "Same as --%s %s", tlong,
+                 alias->maps_value);
+    } else {
+        snprintf(desc_buf, sizeof(desc_buf), "Same as --%s", tlong);
+    }
+    cc__cli_print_option_line(out, cc__cli_display_short(alias), long0, NULL,
+                              desc_buf, NULL);
+}
+
+static inline void cc_cli_print_fields(FILE *out,
+                                       CCSlice prog,
+                                       const CCCliField *fields,
+                                       size_t nfields) {
+    size_t i, j;
+    bool have_options = false;
+    if (!out || !fields) return;
+    if (!prog.ptr || prog.len == 0) prog = cc__cli_cstr_slice("program");
+    fprintf(out, "Usage: %.*s", (int)prog.len, (const char *)prog.ptr);
+    for (i = 0; i < nfields; i++) {
+        if (fields[i].kind != CC_CLI_MANY_STRING && fields[i].kind != CC_CLI_ALIAS) {
+            have_options = true;
+            break;
+        }
+    }
+    if (have_options) fprintf(out, " [options]");
+    for (i = 0; i < nfields; i++) {
+        if (fields[i].kind != CC_CLI_MANY_STRING || !fields[i].name) continue;
+        fprintf(out, " [%s...]", fields[i].name);
+    }
+    fprintf(out, "\n");
+    if (!have_options) return;
+    fprintf(out, "Options:\n");
+    for (i = 0; i < nfields; i++) {
+        const CCCliField *f = &fields[i];
+        const char *vname = NULL;
+        if (f->kind == CC_CLI_MANY_STRING || f->kind == CC_CLI_ALIAS) continue;
+        if ((f->kind == CC_CLI_OPT_I64 || f->kind == CC_CLI_OPT_STRING)
+            && f->value_name)
+            vname = f->value_name;
+        cc__cli_print_option_line(out, cc__cli_display_short(f),
+                                  cc__cli_display_long(f), vname, f->desc,
+                                  f->default_cstr);
+        /* Aliases that target this field, in declaration order. */
+        for (j = 0; j < nfields; j++) {
+            if (fields[j].kind != CC_CLI_ALIAS) continue;
+            if (!fields[j].maps_to || !f->name) continue;
+            if (strcmp(fields[j].maps_to, f->name) != 0) continue;
+            cc__cli_print_alias_line(out, &fields[j], f);
+        }
+    }
+    /* Orphan aliases (bad maps_to) still show up. */
+    for (i = 0; i < nfields; i++) {
+        const CCCliField *a = &fields[i];
+        const CCCliField *t;
+        if (a->kind != CC_CLI_ALIAS) continue;
+        t = cc__cli_find_by_name(fields, nfields, a->maps_to);
+        if (t) continue;
+        cc__cli_print_alias_line(out, a, NULL);
+    }
+}
+
+static inline bool cc__cli_help_requested(const CCCliField *fields,
+                                          size_t nfields,
+                                          const void *out) {
+    size_t i;
+    if (!fields || !out) return false;
+    for (i = 0; i < nfields; i++) {
+        if (!fields[i].is_help || fields[i].kind != CC_CLI_FLAG) continue;
+        if (*(const bool *)((const char *)out + fields[i].off)) return true;
+    }
+    return false;
+}
+
+/*
+ * Parse argv into `out`, print usage on help or error.
+ * Result face (same three-way as cc_try_read / net recv):
+ *   Ok(true)  — proceed with opts
+ *   Ok(false) — help requested; usage already printed; caller returns 0
+ *   Err       — bad argv; usage already printed; caller returns non-zero
+ */
+static inline CCResult_bool_CCError
+cc_cli_prepare_fields(const CCCliField *fields,
+                      size_t nfields,
+                      int argc,
+                      char **argv,
+                      CCArena *arena,
+                      void *out,
+                      FILE *usage_out) {
+    CCCliFillResult r;
+    FILE *u = usage_out ? usage_out : stderr;
+    if (!fields || !out) {
+        return cc_err_CCResult_bool_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "cc_cli_prepare: bad args"));
+    }
+    cc_cli_apply_defaults(fields, nfields, out);
+    r = cc_cli_fill(fields, nfields, argc, argv, arena, out);
+    if (!r.ok) {
+        cc_cli_print_fields(u, cc_cli_prog_basename(argv ? argv[0] : NULL),
+                            fields, nfields);
+        return cc_err_CCResult_bool_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "invalid command line"));
+    }
+    if (cc__cli_help_requested(fields, nfields, out)) {
+        cc_cli_print_fields(u, cc_cli_prog_basename(argv ? argv[0] : NULL),
+                            fields, nfields);
+        return cc_ok_CCResult_bool_CCError(false);
+    }
+    return cc_ok_CCResult_bool_CCError(true);
+}
+
+/* `@grammar(cli)` engine: harvested comptime function. The seam synthesizes
+ * `cli(name, body, file, line)` for the non-builtin engine name. Argv overlay
+ * stays in this header; the fenced DSL is the CliSyntax factory
+ * (`cli_decl.rules`) and the argv product is emitted here. */
+                                                                            
+                                                                             
+                                                                            
+                                                                               
+                    
+                  
+              
+                           
+                                                        
+                                                                
+                       
+                  
+                                                                            
+                                                                       
+                                                
+               
+                                                                   
+               
+     
+                                             
+              
+ 
+
+#endif /* CC_STD_CLI_H */

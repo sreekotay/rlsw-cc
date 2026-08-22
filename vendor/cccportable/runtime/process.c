@@ -1,0 +1,1151 @@
+/*
+ * Concurrent-C Process Runtime
+ *
+ * Cross-platform: POSIX (macOS, Linux, BSD) and Windows.
+ */
+
+#include <ccc/std/process.h>
+
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <process.h>
+#else
+#include <unistd.h>
+#include <signal.h>
+#include <sys/select.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <spawn.h>
+#if defined(__APPLE__)
+#include <AvailabilityMacros.h>
+#endif
+/* glibc declares addchdir_np only under _GNU_SOURCE; unity TUs often omit it. */
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 29))
+int posix_spawn_file_actions_addchdir_np(posix_spawn_file_actions_t *__restrict,
+                                         const char *__restrict);
+#endif
+extern char **environ;  /* For posix_spawn with inherited environment */
+#endif
+
+/* ============================================================================
+ * Helpers
+ * ============================================================================ */
+
+#ifndef _WIN32
+static int cc__set_cloexec(int fd) {
+    int flags = fcntl(fd, F_GETFD);
+    if (flags < 0) return -1;
+    return fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+}
+
+static int cc__pipe_cloexec(int fds[2]) {
+    if (pipe(fds) < 0) return -1;
+    if (cc__set_cloexec(fds[0]) < 0 || cc__set_cloexec(fds[1]) < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        fds[0] = fds[1] = -1;
+        return -1;
+    }
+    return 0;
+}
+#endif
+
+/* Use cc_io_from_errno() from cc_io_error.cch for error conversion. */
+
+static int cc__append_process_output(CCArena* arena, CCSlice* dst, size_t* cap, const void* data, size_t len) {
+    char* buf;
+    size_t next_cap;
+    if (!arena || !dst || !cap) return -1;
+    if (len == 0) return 0;
+
+    if (!dst->ptr) {
+        *cap = 4096;
+        while (*cap < len) *cap *= 2;
+        dst->ptr = cc_arena_alloc(arena, *cap, 1);
+        if (!dst->ptr) return -1;
+        dst->len = 0;
+    }
+
+    if (dst->len + len <= *cap) {
+        memcpy((char*)dst->ptr + dst->len, data, len);
+        dst->len += len;
+        return 0;
+    }
+
+    next_cap = *cap;
+    while (dst->len + len > next_cap) next_cap *= 2;
+    buf = cc_arena_alloc(arena, next_cap, 1);
+    if (!buf) return -1;
+    if (dst->len > 0) memcpy(buf, dst->ptr, dst->len);
+    memcpy(buf + dst->len, data, len);
+    dst->ptr = buf;
+    dst->len += len;
+    *cap = next_cap;
+    return 0;
+}
+
+#ifndef _WIN32
+static CCResult_CCProcessOutput_CCIoError cc__process_capture_posix(CCArena* arena,
+                                                                    CCProcess* proc,
+                                                                    CCSlice input) {
+    CCProcessOutput output = {0};
+    size_t stdout_cap = 0;
+    size_t stderr_cap = 0;
+    size_t input_off = 0;
+    int stdin_open = proc->stdin_fd >= 0;
+    int stdout_open = proc->stdout_fd >= 0;
+    int stderr_open = proc->stderr_fd >= 0;
+
+    if (stdin_open && input.len == 0) {
+        /* fd 0/1/2 are the parent's stdio. Closing them here tears down
+         * an LSP (or any) JSON-RPC wire if spawn left stdin_fd at 0. */
+        if (proc->stdin_fd > 2) cc_process_close_stdin(proc);
+        else proc->stdin_fd = -1;
+        stdin_open = 0;
+    }
+
+    while (stdin_open || stdout_open || stderr_open) {
+        fd_set readfds;
+        fd_set writefds;
+        fd_set* read_ptr = NULL;
+        fd_set* write_ptr = NULL;
+        int maxfd = -1;
+        int ready;
+
+        FD_ZERO(&readfds);
+        FD_ZERO(&writefds);
+
+        if (stdout_open) {
+            FD_SET(proc->stdout_fd, &readfds);
+            read_ptr = &readfds;
+            if (proc->stdout_fd > maxfd) maxfd = proc->stdout_fd;
+        }
+        if (stderr_open) {
+            FD_SET(proc->stderr_fd, &readfds);
+            read_ptr = &readfds;
+            if (proc->stderr_fd > maxfd) maxfd = proc->stderr_fd;
+        }
+        if (stdin_open && input_off < input.len) {
+            FD_SET(proc->stdin_fd, &writefds);
+            write_ptr = &writefds;
+            if (proc->stdin_fd > maxfd) maxfd = proc->stdin_fd;
+        }
+
+        ready = select(maxfd + 1, read_ptr, write_ptr, NULL, NULL);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            return cc_err_CCResult_CCProcessOutput_CCIoError(cc_io_from_errno(errno));
+        }
+
+        if (stdin_open && write_ptr && FD_ISSET(proc->stdin_fd, &writefds)) {
+            ssize_t n;
+            do {
+                n = write(proc->stdin_fd,
+                          (const char*)input.ptr + input_off,
+                          input.len - input_off);
+            } while (n < 0 && errno == EINTR);
+            if (n < 0) {
+                cc_process_close_stdin(proc);
+                return cc_err_CCResult_CCProcessOutput_CCIoError(cc_io_from_errno(errno));
+            }
+            input_off += (size_t)n;
+            if (input_off >= input.len) {
+                cc_process_close_stdin(proc);
+                stdin_open = 0;
+            }
+        }
+
+        if (stdout_open && read_ptr && FD_ISSET(proc->stdout_fd, &readfds)) {
+            char buf[4096];
+            ssize_t n;
+            do {
+                n = read(proc->stdout_fd, buf, sizeof(buf));
+            } while (n < 0 && errno == EINTR);
+            if (n < 0) {
+                close(proc->stdout_fd);
+                proc->stdout_fd = -1;
+                return cc_err_CCResult_CCProcessOutput_CCIoError(cc_io_from_errno(errno));
+            }
+            if (n == 0) {
+                close(proc->stdout_fd);
+                proc->stdout_fd = -1;
+                stdout_open = 0;
+            } else if (cc__append_process_output(arena, &output.stdout_data, &stdout_cap, buf, (size_t)n) != 0) {
+                return cc_err_CCResult_CCProcessOutput_CCIoError(cc_io_from_errno(ENOMEM));
+            }
+        }
+
+        if (stderr_open && read_ptr && FD_ISSET(proc->stderr_fd, &readfds)) {
+            char buf[4096];
+            ssize_t n;
+            do {
+                n = read(proc->stderr_fd, buf, sizeof(buf));
+            } while (n < 0 && errno == EINTR);
+            if (n < 0) {
+                close(proc->stderr_fd);
+                proc->stderr_fd = -1;
+                return cc_err_CCResult_CCProcessOutput_CCIoError(cc_io_from_errno(errno));
+            }
+            if (n == 0) {
+                close(proc->stderr_fd);
+                proc->stderr_fd = -1;
+                stderr_open = 0;
+            } else if (cc__append_process_output(arena, &output.stderr_data, &stderr_cap, buf, (size_t)n) != 0) {
+                return cc_err_CCResult_CCProcessOutput_CCIoError(cc_io_from_errno(ENOMEM));
+            }
+        }
+    }
+
+    {
+        CCResult_CCProcessStatus_CCIoError wait_res = cc_process_wait(proc);
+        if (cc_is_err(wait_res)) {
+            return cc_err_CCResult_CCProcessOutput_CCIoError(cc_unwrap_err(wait_res));
+        }
+        output.status = cc_unwrap(wait_res);
+    }
+
+    return cc_ok_CCResult_CCProcessOutput_CCIoError(output);
+}
+#endif
+
+/* ============================================================================
+ * Process Spawning - POSIX
+ * ============================================================================ */
+
+#ifndef _WIN32
+
+CCResult_CCProcess_CCIoError cc_process_spawn(const CCProcessConfig* config) {
+    CCProcess proc = {.pid = -1, .stdin_fd = -1, .stdout_fd = -1, .stderr_fd = -1};
+
+    if (!config || !config->program || !config->args) {
+        return cc_err_CCResult_CCProcess_CCIoError(cc_io_from_errno(EINVAL));
+    }
+
+    /* Path with a slash: fail before spawn if the file is missing.
+     * Darwin's posix_spawnp returns ENOENT; Linux (and qemu-user) often
+     * returns 0 and the child exits 127 — which surfaces as Ok(127) from
+     * status() and skips !>/@errhandler. PATH lookups (no slash) unchanged. */
+    if (strchr(config->program, '/') != NULL &&
+        access(config->program, F_OK) != 0) {
+        return cc_err_CCResult_CCProcess_CCIoError(cc_io_from_errno(errno));
+    }
+
+    int stdin_pipe[2] = {-1, -1};
+    int stdout_pipe[2] = {-1, -1};
+    int stderr_pipe[2] = {-1, -1};
+
+    /* Create pipes as needed */
+    if (config->pipe_stdin) {
+        if (cc__pipe_cloexec(stdin_pipe) < 0) {
+            return cc_err_CCResult_CCProcess_CCIoError(cc_io_from_errno(errno));
+        }
+    }
+    if (config->pipe_stdout) {
+        if (cc__pipe_cloexec(stdout_pipe) < 0) {
+            if (stdin_pipe[0] >= 0) { close(stdin_pipe[0]); close(stdin_pipe[1]); }
+            return cc_err_CCResult_CCProcess_CCIoError(cc_io_from_errno(errno));
+        }
+    }
+    if (config->pipe_stderr && !config->merge_stderr) {
+        if (cc__pipe_cloexec(stderr_pipe) < 0) {
+            if (stdin_pipe[0] >= 0) { close(stdin_pipe[0]); close(stdin_pipe[1]); }
+            if (stdout_pipe[0] >= 0) { close(stdout_pipe[0]); close(stdout_pipe[1]); }
+            return cc_err_CCResult_CCProcess_CCIoError(cc_io_from_errno(errno));
+        }
+    }
+
+    /* Use posix_spawn instead of fork+exec - safer in multithreaded programs.
+     * posix_spawn doesn't have the fork() issue where only the calling thread
+     * survives and other threads' locks become permanently held. */
+    posix_spawn_file_actions_t file_actions;
+    posix_spawnattr_t attr;
+    int err;
+
+    err = posix_spawn_file_actions_init(&file_actions);
+    if (err != 0) {
+        if (stdin_pipe[0] >= 0) { close(stdin_pipe[0]); close(stdin_pipe[1]); }
+        if (stdout_pipe[0] >= 0) { close(stdout_pipe[0]); close(stdout_pipe[1]); }
+        if (stderr_pipe[0] >= 0) { close(stderr_pipe[0]); close(stderr_pipe[1]); }
+        return cc_err_CCResult_CCProcess_CCIoError(cc_io_from_errno(err));
+    }
+
+    err = posix_spawnattr_init(&attr);
+    if (err != 0) {
+        posix_spawn_file_actions_destroy(&file_actions);
+        if (stdin_pipe[0] >= 0) { close(stdin_pipe[0]); close(stdin_pipe[1]); }
+        if (stdout_pipe[0] >= 0) { close(stdout_pipe[0]); close(stdout_pipe[1]); }
+        if (stderr_pipe[0] >= 0) { close(stderr_pipe[0]); close(stderr_pipe[1]); }
+        return cc_err_CCResult_CCProcess_CCIoError(cc_io_from_errno(err));
+    }
+
+    /* Set up stdin redirection */
+    if (config->pipe_stdin) {
+        posix_spawn_file_actions_addclose(&file_actions, stdin_pipe[1]);
+        posix_spawn_file_actions_adddup2(&file_actions, stdin_pipe[0], STDIN_FILENO);
+        posix_spawn_file_actions_addclose(&file_actions, stdin_pipe[0]);
+    }
+
+    /* Set up stdout redirection */
+    if (config->pipe_stdout) {
+        posix_spawn_file_actions_addclose(&file_actions, stdout_pipe[0]);
+        posix_spawn_file_actions_adddup2(&file_actions, stdout_pipe[1], STDOUT_FILENO);
+        posix_spawn_file_actions_addclose(&file_actions, stdout_pipe[1]);
+    }
+
+    /* Set up stderr redirection */
+    if (config->merge_stderr && config->pipe_stdout) {
+        posix_spawn_file_actions_adddup2(&file_actions, STDOUT_FILENO, STDERR_FILENO);
+    } else if (config->pipe_stderr) {
+        posix_spawn_file_actions_addclose(&file_actions, stderr_pipe[0]);
+        posix_spawn_file_actions_adddup2(&file_actions, stderr_pipe[1], STDERR_FILENO);
+        posix_spawn_file_actions_addclose(&file_actions, stderr_pipe[1]);
+    }
+
+    /* Change directory if specified.
+     * macOS < 26 / glibc 2.29+: addchdir_np; macOS 26+: standardized addchdir. */
+    if (config->cwd) {
+#if defined(__APPLE__)
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 260000
+        posix_spawn_file_actions_addchdir(&file_actions, config->cwd);
+#else
+        posix_spawn_file_actions_addchdir_np(&file_actions, config->cwd);
+#endif
+#elif defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 29))
+        posix_spawn_file_actions_addchdir_np(&file_actions, config->cwd);
+#else
+        /* Older non-glibc: no portable cwd action — ignore. */
+        (void)config->cwd;
+#endif
+    }
+
+    /* Spawn the process */
+    pid_t pid;
+    char** spawn_env = config->env ? (char**)config->env : environ;
+    
+    err = posix_spawnp(&pid, config->program, &file_actions, &attr,
+                       (char* const*)config->args, spawn_env);
+
+    posix_spawn_file_actions_destroy(&file_actions);
+    posix_spawnattr_destroy(&attr);
+
+    if (err != 0) {
+        if (stdin_pipe[0] >= 0) { close(stdin_pipe[0]); close(stdin_pipe[1]); }
+        if (stdout_pipe[0] >= 0) { close(stdout_pipe[0]); close(stdout_pipe[1]); }
+        if (stderr_pipe[0] >= 0) { close(stderr_pipe[0]); close(stderr_pipe[1]); }
+        return cc_err_CCResult_CCProcess_CCIoError(cc_io_from_errno(err));
+    }
+
+    /* Parent: close unused pipe ends */
+    proc.pid = pid;
+
+    if (config->pipe_stdin) {
+        close(stdin_pipe[0]);  /* Close read end */
+        proc.stdin_fd = stdin_pipe[1];
+    }
+    if (config->pipe_stdout) {
+        close(stdout_pipe[1]);  /* Close write end */
+        proc.stdout_fd = stdout_pipe[0];
+    }
+    if (config->pipe_stderr && !config->merge_stderr) {
+        close(stderr_pipe[1]);  /* Close write end */
+        proc.stderr_fd = stderr_pipe[0];
+    }
+
+    return cc_ok_CCResult_CCProcess_CCIoError(proc);
+}
+
+CCResult_CCProcessStatus_CCIoError cc_process_wait(CCProcess* proc) {
+    CCProcessStatus status = {0};
+
+    if (!proc || proc->pid <= 0) {
+        return cc_err_CCResult_CCProcessStatus_CCIoError(cc_io_from_errno(EINVAL));
+    }
+
+    int wstatus;
+    pid_t result;
+    do {
+        result = waitpid(proc->pid, &wstatus, 0);
+    } while (result < 0 && errno == EINTR);  /* Retry on signal interruption */
+    
+    if (result < 0) {
+        return cc_err_CCResult_CCProcessStatus_CCIoError(cc_io_from_errno(errno));
+    }
+
+    if (WIFEXITED(wstatus)) {
+        status.exited = true;
+        status.exit_code = WEXITSTATUS(wstatus);
+    } else if (WIFSIGNALED(wstatus)) {
+        status.signaled = true;
+        status.exit_code = WTERMSIG(wstatus);
+    }
+
+    proc->pid = -1;  /* Mark as completed */
+    return cc_ok_CCResult_CCProcessStatus_CCIoError(status);
+}
+
+CCResult_CCProcessStatus_CCIoError cc_process_try_wait(CCProcess* proc) {
+    CCProcessStatus status = {0};
+
+    if (!proc || proc->pid <= 0) {
+        return cc_err_CCResult_CCProcessStatus_CCIoError(cc_io_from_errno(EINVAL));
+    }
+
+    int wstatus;
+    pid_t result = waitpid(proc->pid, &wstatus, WNOHANG);
+
+    if (result < 0) {
+        return cc_err_CCResult_CCProcessStatus_CCIoError(cc_io_from_errno(errno));
+    }
+
+    if (result == 0) {
+        /* Process still running */
+        CCIoError busy = cc_io_error_os(CC_IO_BUSY, 0);
+        return cc_err_CCResult_CCProcessStatus_CCIoError(busy);
+    }
+
+    if (WIFEXITED(wstatus)) {
+        status.exited = true;
+        status.exit_code = WEXITSTATUS(wstatus);
+    } else if (WIFSIGNALED(wstatus)) {
+        status.signaled = true;
+        status.exit_code = WTERMSIG(wstatus);
+    }
+
+    proc->pid = -1;
+    return cc_ok_CCResult_CCProcessStatus_CCIoError(status);
+}
+
+CCResult_CCProcessStatus_CCIoError cc_process_wait_timeout_ms(CCProcess* proc, int64_t timeout_ms) {
+    if (!proc || proc->pid <= 0) {
+        return cc_err_CCResult_CCProcessStatus_CCIoError(cc_io_from_errno(EINVAL));
+    }
+    if (timeout_ms < 0) {
+        return cc_process_wait(proc);
+    }
+    if (timeout_ms == 0) {
+        return cc_process_try_wait(proc);
+    }
+
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (;;) {
+        int wstatus;
+        pid_t result = waitpid(proc->pid, &wstatus, WNOHANG);
+        if (result < 0) {
+            return cc_err_CCResult_CCProcessStatus_CCIoError(cc_io_from_errno(errno));
+        }
+        if (result > 0) {
+            CCProcessStatus status = {0};
+            if (WIFEXITED(wstatus)) {
+                status.exited = true;
+                status.exit_code = WEXITSTATUS(wstatus);
+            } else if (WIFSIGNALED(wstatus)) {
+                status.signaled = true;
+                status.exit_code = WTERMSIG(wstatus);
+            }
+            proc->pid = -1;
+            return cc_ok_CCResult_CCProcessStatus_CCIoError(status);
+        }
+
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        int64_t elapsed_ms = (int64_t)(now.tv_sec - start.tv_sec) * 1000LL +
+                             (int64_t)(now.tv_nsec - start.tv_nsec) / 1000000LL;
+        if (elapsed_ms >= timeout_ms) {
+            return cc_err_CCResult_CCProcessStatus_CCIoError(cc_io_from_errno(ETIMEDOUT));
+        }
+
+        struct timespec sleep_ts = {.tv_sec = 0, .tv_nsec = 1000000L};
+        nanosleep(&sleep_ts, NULL);
+    }
+}
+
+CCResult_CCProcessStatus_CCIoError cc_process_wait_timeout(CCProcess* proc, int timeout_sec) {
+    if (timeout_sec < 0) {
+        return cc_process_wait(proc);
+    }
+    return cc_process_wait_timeout_ms(proc, (int64_t)timeout_sec * 1000LL);
+}
+
+CCResult_bool_CCIoError cc_process_kill(CCProcess* proc, int sig) {
+    if (!proc || proc->pid <= 0) {
+        return cc_err_CCResult_bool_CCIoError(cc_io_from_errno(EINVAL));
+    }
+
+    if (kill(proc->pid, sig) < 0) {
+        return cc_err_CCResult_bool_CCIoError(cc_io_from_errno(errno));
+    }
+
+    return cc_ok_CCResult_bool_CCIoError(true);
+}
+
+#else /* _WIN32 */
+
+/* ============================================================================
+ * Process Spawning - Windows
+ * ============================================================================ */
+
+CCResult_CCProcess_CCIoError cc_process_spawn(const CCProcessConfig* config) {
+    CCProcess proc = {.handle = NULL, .pid = 0, .stdin_fd = -1, .stdout_fd = -1, .stderr_fd = -1};
+
+    if (!config || !config->program || !config->args) {
+        return cc_err_CCResult_CCProcess_CCIoError(cc_io_from_errno(EINVAL));
+    }
+
+    HANDLE stdin_read = NULL, stdin_write = NULL;
+    HANDLE stdout_read = NULL, stdout_write = NULL;
+    HANDLE stderr_read = NULL, stderr_write = NULL;
+
+    SECURITY_ATTRIBUTES sa = {sizeof(SECURITY_ATTRIBUTES), NULL, TRUE};
+
+    /* Create pipes */
+    if (config->pipe_stdin) {
+        if (!CreatePipe(&stdin_read, &stdin_write, &sa, 0)) {
+            CCIoError e = cc_io_error_os(CC_IO_OTHER, (int)GetLastError());
+            return cc_err_CCResult_CCProcess_CCIoError(e);
+        }
+        SetHandleInformation(stdin_write, HANDLE_FLAG_INHERIT, 0);
+    }
+    if (config->pipe_stdout) {
+        if (!CreatePipe(&stdout_read, &stdout_write, &sa, 0)) {
+            if (stdin_read) CloseHandle(stdin_read);
+            if (stdin_write) CloseHandle(stdin_write);
+            CCIoError e = cc_io_error_os(CC_IO_OTHER, (int)GetLastError());
+            return cc_err_CCResult_CCProcess_CCIoError(e);
+        }
+        SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0);
+    }
+    if (config->pipe_stderr && !config->merge_stderr) {
+        if (!CreatePipe(&stderr_read, &stderr_write, &sa, 0)) {
+            if (stdin_read) CloseHandle(stdin_read);
+            if (stdin_write) CloseHandle(stdin_write);
+            if (stdout_read) CloseHandle(stdout_read);
+            if (stdout_write) CloseHandle(stdout_write);
+            CCIoError e = cc_io_error_os(CC_IO_OTHER, (int)GetLastError());
+            return cc_err_CCResult_CCProcess_CCIoError(e);
+        }
+        SetHandleInformation(stderr_read, HANDLE_FLAG_INHERIT, 0);
+    }
+
+    /* Build command line */
+    char cmdline[32768];
+    size_t off = 0;
+    for (size_t i = 0; config->args[i]; i++) {
+        if (i > 0) cmdline[off++] = ' ';
+        /* Simple quoting: wrap in quotes if contains space */
+        const char* arg = config->args[i];
+        int needs_quote = strchr(arg, ' ') != NULL;
+        if (needs_quote) cmdline[off++] = '"';
+        size_t len = strlen(arg);
+        memcpy(cmdline + off, arg, len);
+        off += len;
+        if (needs_quote) cmdline[off++] = '"';
+    }
+    cmdline[off] = '\0';
+
+    STARTUPINFOA si = {sizeof(STARTUPINFOA)};
+    PROCESS_INFORMATION pi = {0};
+
+    if (config->pipe_stdin || config->pipe_stdout || config->pipe_stderr) {
+        si.dwFlags |= STARTF_USESTDHANDLES;
+        si.hStdInput = stdin_read ? stdin_read : GetStdHandle(STD_INPUT_HANDLE);
+        si.hStdOutput = stdout_write ? stdout_write : GetStdHandle(STD_OUTPUT_HANDLE);
+        if (config->merge_stderr) {
+            si.hStdError = stdout_write ? stdout_write : GetStdHandle(STD_ERROR_HANDLE);
+        } else {
+            si.hStdError = stderr_write ? stderr_write : GetStdHandle(STD_ERROR_HANDLE);
+        }
+    }
+
+    BOOL success = CreateProcessA(
+        NULL,           /* Use command line */
+        cmdline,        /* Command line */
+        NULL,           /* Process security */
+        NULL,           /* Thread security */
+        TRUE,           /* Inherit handles */
+        0,              /* Creation flags */
+        (LPVOID)config->env,  /* Environment */
+        config->cwd,    /* Working directory */
+        &si,
+        &pi
+    );
+
+    /* Close child-side handles */
+    if (stdin_read) CloseHandle(stdin_read);
+    if (stdout_write) CloseHandle(stdout_write);
+    if (stderr_write) CloseHandle(stderr_write);
+
+    if (!success) {
+        if (stdin_write) CloseHandle(stdin_write);
+        if (stdout_read) CloseHandle(stdout_read);
+        if (stderr_read) CloseHandle(stderr_read);
+        CCIoError e = cc_io_error_os(CC_IO_OTHER, (int)GetLastError());
+        return cc_err_CCResult_CCProcess_CCIoError(e);
+    }
+
+    CloseHandle(pi.hThread);
+
+    proc.handle = pi.hProcess;
+    proc.pid = pi.dwProcessId;
+    proc.stdin_fd = stdin_write ? _open_osfhandle((intptr_t)stdin_write, 0) : -1;
+    proc.stdout_fd = stdout_read ? _open_osfhandle((intptr_t)stdout_read, 0) : -1;
+    proc.stderr_fd = stderr_read ? _open_osfhandle((intptr_t)stderr_read, 0) : -1;
+
+    return cc_ok_CCResult_CCProcess_CCIoError(proc);
+}
+
+CCResult_CCProcessStatus_CCIoError cc_process_wait(CCProcess* proc) {
+    CCProcessStatus status = {0};
+
+    if (!proc || !proc->handle) {
+        return cc_err_CCResult_CCProcessStatus_CCIoError(cc_io_from_errno(EINVAL));
+    }
+
+    WaitForSingleObject(proc->handle, INFINITE);
+
+    DWORD exit_code;
+    if (GetExitCodeProcess(proc->handle, &exit_code)) {
+        status.exited = true;
+        status.exit_code = (int)exit_code;
+    }
+
+    CloseHandle(proc->handle);
+    proc->handle = NULL;
+    proc->pid = 0;
+
+    return cc_ok_CCResult_CCProcessStatus_CCIoError(status);
+}
+
+CCResult_CCProcessStatus_CCIoError cc_process_try_wait(CCProcess* proc) {
+    CCProcessStatus status = {0};
+
+    if (!proc || !proc->handle) {
+        return cc_err_CCResult_CCProcessStatus_CCIoError(cc_io_from_errno(EINVAL));
+    }
+
+    DWORD result = WaitForSingleObject(proc->handle, 0);
+    if (result == WAIT_TIMEOUT) {
+        CCIoError busy = cc_io_error_os(CC_IO_BUSY, 0);
+        return cc_err_CCResult_CCProcessStatus_CCIoError(busy);
+    }
+
+    DWORD exit_code;
+    if (GetExitCodeProcess(proc->handle, &exit_code)) {
+        status.exited = true;
+        status.exit_code = (int)exit_code;
+    }
+
+    CloseHandle(proc->handle);
+    proc->handle = NULL;
+    proc->pid = 0;
+
+    return cc_ok_CCResult_CCProcessStatus_CCIoError(status);
+}
+
+CCResult_CCProcessStatus_CCIoError cc_process_wait_timeout_ms(CCProcess* proc, int64_t timeout_ms) {
+    if (!proc || !proc->handle) {
+        return cc_err_CCResult_CCProcessStatus_CCIoError(cc_io_from_errno(EINVAL));
+    }
+    if (timeout_ms < 0) {
+        return cc_process_wait(proc);
+    }
+    DWORD wait_ms = (timeout_ms > 0) ? (DWORD)timeout_ms : 0;
+    DWORD result = WaitForSingleObject(proc->handle, wait_ms);
+    if (result == WAIT_TIMEOUT) {
+        return cc_err_CCResult_CCProcessStatus_CCIoError(cc_io_from_errno(ETIMEDOUT));
+    }
+    if (result != WAIT_OBJECT_0) {
+        CCIoError e = cc_io_error_os(CC_IO_OTHER, (int)GetLastError());
+        return cc_err_CCResult_CCProcessStatus_CCIoError(e);
+    }
+
+    CCProcessStatus status = {0};
+    DWORD exit_code;
+    if (GetExitCodeProcess(proc->handle, &exit_code)) {
+        status.exited = true;
+        status.exit_code = (int)exit_code;
+    }
+
+    CloseHandle(proc->handle);
+    proc->handle = NULL;
+    proc->pid = 0;
+    return cc_ok_CCResult_CCProcessStatus_CCIoError(status);
+}
+
+CCResult_CCProcessStatus_CCIoError cc_process_wait_timeout(CCProcess* proc, int timeout_sec) {
+    if (timeout_sec < 0) {
+        return cc_process_wait(proc);
+    }
+    return cc_process_wait_timeout_ms(proc, (int64_t)timeout_sec * 1000LL);
+}
+
+CCResult_bool_CCIoError cc_process_kill(CCProcess* proc, int sig) {
+    if (!proc || !proc->handle) {
+        return cc_err_CCResult_bool_CCIoError(cc_io_from_errno(EINVAL));
+    }
+
+    /* On Windows, treat SIGKILL/SIGTERM as TerminateProcess */
+    (void)sig;
+    if (!TerminateProcess(proc->handle, 1)) {
+        CCIoError e = cc_io_error_os(CC_IO_OTHER, (int)GetLastError());
+        return cc_err_CCResult_bool_CCIoError(e);
+    }
+
+    return cc_ok_CCResult_bool_CCIoError(true);
+}
+
+#endif /* _WIN32 */
+
+/* ============================================================================
+ * Process I/O (shared implementation)
+ * ============================================================================ */
+
+CCResult_size_t_CCIoError cc_process_write(CCProcess* proc, CCSlice data) {
+    if (!proc || proc->stdin_fd < 0) {
+        return cc_err_CCResult_size_t_CCIoError(cc_io_from_errno(EINVAL));
+    }
+
+#ifdef _WIN32
+    DWORD written;
+    HANDLE h = (HANDLE)_get_osfhandle(proc->stdin_fd);
+    if (!WriteFile(h, data.ptr, (DWORD)data.len, &written, NULL)) {
+        CCIoError e = cc_io_error_os(CC_IO_OTHER, (int)GetLastError());
+        return cc_err_CCResult_size_t_CCIoError(e);
+    }
+    return cc_ok_CCResult_size_t_CCIoError((size_t)written);
+#else
+    ssize_t n = write(proc->stdin_fd, data.ptr, data.len);
+    if (n < 0) {
+        return cc_err_CCResult_size_t_CCIoError(cc_io_from_errno(errno));
+    }
+    return cc_ok_CCResult_size_t_CCIoError((size_t)n);
+#endif
+}
+
+CCResult_CCSlice_CCIoError cc_process_read(CCProcess* proc, CCArena* arena, size_t max_bytes) {
+    CCSlice result = {0};
+
+    if (!proc || proc->stdout_fd < 0 || !arena) {
+        return cc_err_CCResult_CCSlice_CCIoError(cc_io_from_errno(EINVAL));
+    }
+
+    char* buf = cc_arena_alloc(arena, max_bytes, 1);
+    if (!buf) {
+        return cc_err_CCResult_CCSlice_CCIoError(cc_io_from_errno(ENOMEM));
+    }
+
+#ifdef _WIN32
+    DWORD n;
+    HANDLE h = (HANDLE)_get_osfhandle(proc->stdout_fd);
+    if (!ReadFile(h, buf, (DWORD)max_bytes, &n, NULL)) {
+        CCIoError e = cc_io_error_os(CC_IO_OTHER, (int)GetLastError());
+        return cc_err_CCResult_CCSlice_CCIoError(e);
+    }
+#else
+    ssize_t n = read(proc->stdout_fd, buf, max_bytes);
+    if (n < 0) {
+        return cc_err_CCResult_CCSlice_CCIoError(cc_io_from_errno(errno));
+    }
+#endif
+
+    result.ptr = buf;
+    result.len = (size_t)n;
+    return cc_ok_CCResult_CCSlice_CCIoError(result);
+}
+
+CCResult_CCSlice_CCIoError cc_process_read_stderr(CCProcess* proc, CCArena* arena, size_t max_bytes) {
+    CCSlice result = {0};
+
+    if (!proc || proc->stderr_fd < 0 || !arena) {
+        return cc_err_CCResult_CCSlice_CCIoError(cc_io_from_errno(EINVAL));
+    }
+
+    char* buf = cc_arena_alloc(arena, max_bytes, 1);
+    if (!buf) {
+        return cc_err_CCResult_CCSlice_CCIoError(cc_io_from_errno(ENOMEM));
+    }
+
+#ifdef _WIN32
+    DWORD n;
+    HANDLE h = (HANDLE)_get_osfhandle(proc->stderr_fd);
+    if (!ReadFile(h, buf, (DWORD)max_bytes, &n, NULL)) {
+        CCIoError e = cc_io_error_os(CC_IO_OTHER, (int)GetLastError());
+        return cc_err_CCResult_CCSlice_CCIoError(e);
+    }
+#else
+    ssize_t n = read(proc->stderr_fd, buf, max_bytes);
+    if (n < 0) {
+        return cc_err_CCResult_CCSlice_CCIoError(cc_io_from_errno(errno));
+    }
+#endif
+
+    result.ptr = buf;
+    result.len = (size_t)n;
+    return cc_ok_CCResult_CCSlice_CCIoError(result);
+}
+
+void cc_process_close_stdin(CCProcess* proc) {
+    /* Never close 0/1/2 — a zeroed CCProcess has stdin_fd==0, which is
+     * the parent's stdin (LSP JSON-RPC). */
+    if (proc && proc->stdin_fd > 2) {
+#ifdef _WIN32
+        _close(proc->stdin_fd);
+#else
+        close(proc->stdin_fd);
+#endif
+        proc->stdin_fd = -1;
+    }
+}
+
+CCResult_CCSlice_CCIoError cc_process_read_all(CCProcess* proc, CCArena* arena) {
+    if (!proc || proc->stdout_fd < 0 || !arena) {
+        return cc_err_CCResult_CCSlice_CCIoError(cc_io_from_errno(EINVAL));
+    }
+
+    /* Read in chunks and accumulate */
+    size_t total_cap = 4096;
+    size_t total_len = 0;
+    char* total = cc_arena_alloc(arena, total_cap, 1);
+    if (!total) {
+        return cc_err_CCResult_CCSlice_CCIoError(cc_io_from_errno(ENOMEM));
+    }
+
+    while (1) {
+        char buf[4096];
+#ifdef _WIN32
+        DWORD n;
+        HANDLE h = (HANDLE)_get_osfhandle(proc->stdout_fd);
+        if (!ReadFile(h, buf, sizeof(buf), &n, NULL)) {
+            break;
+        }
+        if (n == 0) break;
+#else
+        ssize_t n;
+        do {
+            n = read(proc->stdout_fd, buf, sizeof(buf));
+        } while (n < 0 && errno == EINTR);  /* Retry on signal interruption */
+        if (n <= 0) break;  /* EOF or error */
+#endif
+
+        /* Grow buffer if needed */
+        while (total_len + (size_t)n > total_cap) {
+            size_t new_cap = total_cap * 2;
+            char* new_buf = cc_arena_alloc(arena, new_cap, 1);
+            if (!new_buf) {
+                CCSlice result = {.ptr = total, .len = total_len};
+                return cc_ok_CCResult_CCSlice_CCIoError(result);
+            }
+            memcpy(new_buf, total, total_len);
+            total = new_buf;
+            total_cap = new_cap;
+        }
+
+        memcpy(total + total_len, buf, (size_t)n);
+        total_len += (size_t)n;
+    }
+
+    CCSlice result = {.ptr = total, .len = total_len};
+    return cc_ok_CCResult_CCSlice_CCIoError(result);
+}
+
+CCResult_CCSlice_CCIoError cc_process_read_all_stderr(CCProcess* proc, CCArena* arena) {
+    if (!proc || proc->stderr_fd < 0 || !arena) {
+        return cc_err_CCResult_CCSlice_CCIoError(cc_io_from_errno(EINVAL));
+    }
+
+    size_t total_cap = 4096;
+    size_t total_len = 0;
+    char* total = cc_arena_alloc(arena, total_cap, 1);
+    if (!total) {
+        return cc_err_CCResult_CCSlice_CCIoError(cc_io_from_errno(ENOMEM));
+    }
+
+    while (1) {
+        char buf[4096];
+#ifdef _WIN32
+        DWORD n;
+        HANDLE h = (HANDLE)_get_osfhandle(proc->stderr_fd);
+        if (!ReadFile(h, buf, sizeof(buf), &n, NULL)) {
+            break;
+        }
+        if (n == 0) break;
+#else
+        ssize_t n;
+        do {
+            n = read(proc->stderr_fd, buf, sizeof(buf));
+        } while (n < 0 && errno == EINTR);  /* Retry on signal interruption */
+        if (n <= 0) break;  /* EOF or error */
+#endif
+
+        while (total_len + (size_t)n > total_cap) {
+            size_t new_cap = total_cap * 2;
+            char* new_buf = cc_arena_alloc(arena, new_cap, 1);
+            if (!new_buf) {
+                CCSlice result = {.ptr = total, .len = total_len};
+                return cc_ok_CCResult_CCSlice_CCIoError(result);
+            }
+            memcpy(new_buf, total, total_len);
+            total = new_buf;
+            total_cap = new_cap;
+        }
+
+        memcpy(total + total_len, buf, (size_t)n);
+        total_len += (size_t)n;
+    }
+
+    CCSlice result = {.ptr = total, .len = total_len};
+    return cc_ok_CCResult_CCSlice_CCIoError(result);
+}
+
+CCResult_CCProcessOutput_CCIoError cc_process_collect(CCProcess* proc, CCArena* arena) {
+    CCSlice empty = {0};
+    if (!proc || !arena) {
+        return cc_err_CCResult_CCProcessOutput_CCIoError(cc_io_from_errno(EINVAL));
+    }
+#ifndef _WIN32
+    return cc__process_capture_posix(arena, proc, empty);
+#else
+    {
+        CCProcessOutput output = {0};
+        if (proc->stdout_fd >= 0) {
+            CCResult_CCSlice_CCIoError stdout_res = cc_process_read_all(proc, arena);
+            if (cc_is_err(stdout_res)) {
+                return cc_err_CCResult_CCProcessOutput_CCIoError(cc_unwrap_err(stdout_res));
+            }
+            output.stdout_data = cc_unwrap(stdout_res);
+        }
+        if (proc->stderr_fd >= 0) {
+            CCResult_CCSlice_CCIoError stderr_res = cc_process_read_all_stderr(proc, arena);
+            if (cc_is_err(stderr_res)) {
+                return cc_err_CCResult_CCProcessOutput_CCIoError(cc_unwrap_err(stderr_res));
+            }
+            output.stderr_data = cc_unwrap(stderr_res);
+        }
+        {
+            CCResult_CCProcessStatus_CCIoError wait_res = cc_process_wait(proc);
+            if (cc_is_err(wait_res)) {
+                return cc_err_CCResult_CCProcessOutput_CCIoError(cc_unwrap_err(wait_res));
+            }
+            output.status = cc_unwrap(wait_res);
+        }
+        (void)empty;
+        return cc_ok_CCResult_CCProcessOutput_CCIoError(output);
+    }
+#endif
+}
+
+/* ============================================================================
+ * Convenience: Spawn Simple/Shell
+ * ============================================================================ */
+
+CCResult_CCProcess_CCIoError cc_process_spawn_simple(const char* program, const char** args) {
+    CCProcessConfig config = {
+        .program = program,
+        .args = args,
+        .env = NULL,
+        .cwd = NULL,
+        .pipe_stdin = false,
+        .pipe_stdout = false,
+        .pipe_stderr = false,
+        .merge_stderr = false
+    };
+    return cc_process_spawn(&config);
+}
+
+CCResult_CCProcess_CCIoError cc_process_spawn_shell(const char* command) {
+#ifdef _WIN32
+    const char* args[] = {"cmd", "/c", command, NULL};
+    CCProcessConfig config = {
+        .program = "cmd",
+        .args = args,
+        .pipe_stdout = true,
+        .pipe_stderr = true
+    };
+#else
+    const char* args[] = {"/bin/sh", "-c", command, NULL};
+    CCProcessConfig config = {
+        .program = "/bin/sh",
+        .args = args,
+        .pipe_stdout = true,
+        .pipe_stderr = true
+    };
+#endif
+    return cc_process_spawn(&config);
+}
+
+/* ============================================================================
+ * Convenience: Run and Capture
+ * ============================================================================ */
+
+CCResult_CCProcessOutput_CCIoError cc_process_run_config(CCArena* arena, const CCProcessConfig* config) {
+    CCSlice empty = {0};
+    return cc_process_run_with_input(arena, config, empty);
+}
+
+CCResult_CCProcessOutput_CCIoError cc_process_run_with_input(CCArena* arena,
+                                                             const CCProcessConfig* config,
+                                                             CCSlice input) {
+    CCProcessConfig run_cfg;
+    CCResult_CCProcess_CCIoError spawn_res;
+    CCProcess proc;
+
+    if (!arena || !config || !config->program || !config->args) {
+        return cc_err_CCResult_CCProcessOutput_CCIoError(cc_io_from_errno(EINVAL));
+    }
+
+    run_cfg = *config;
+    if (input.ptr || input.len > 0) run_cfg.pipe_stdin = true;
+
+    spawn_res = cc_process_spawn(&run_cfg);
+    if (cc_is_err(spawn_res)) {
+        return cc_err_CCResult_CCProcessOutput_CCIoError(cc_unwrap_err(spawn_res));
+    }
+
+    proc = cc_unwrap(spawn_res);
+
+#ifdef _WIN32
+    CCProcessOutput output = {0};
+    if (run_cfg.pipe_stdin) {
+        while (input.len > 0) {
+            CCResult_size_t_CCIoError write_res = cc_process_write(&proc, input);
+            if (cc_is_err(write_res)) {
+                cc_process_close_stdin(&proc);
+                return cc_err_CCResult_CCProcessOutput_CCIoError(cc_unwrap_err(write_res));
+            }
+            {
+                size_t wrote = cc_unwrap(write_res);
+                input = CCSlice_sub(&input, wrote, input.len);
+            }
+        }
+        cc_process_close_stdin(&proc);
+    }
+
+    if (run_cfg.pipe_stdout) {
+        CCResult_CCSlice_CCIoError stdout_res = cc_process_read_all(&proc, arena);
+        if (cc_is_err(stdout_res)) {
+            if (proc.stdout_fd >= 0) {
+                _close(proc.stdout_fd);
+                proc.stdout_fd = -1;
+            }
+            return cc_err_CCResult_CCProcessOutput_CCIoError(cc_unwrap_err(stdout_res));
+        }
+        output.stdout_data = cc_unwrap(stdout_res);
+        if (proc.stdout_fd >= 0) {
+            _close(proc.stdout_fd);
+            proc.stdout_fd = -1;
+        }
+    }
+
+    if (run_cfg.pipe_stderr && !run_cfg.merge_stderr) {
+        CCResult_CCSlice_CCIoError stderr_res = cc_process_read_all_stderr(&proc, arena);
+        if (cc_is_err(stderr_res)) {
+            if (proc.stderr_fd >= 0) {
+                _close(proc.stderr_fd);
+                proc.stderr_fd = -1;
+            }
+            return cc_err_CCResult_CCProcessOutput_CCIoError(cc_unwrap_err(stderr_res));
+        }
+        output.stderr_data = cc_unwrap(stderr_res);
+        if (proc.stderr_fd >= 0) {
+            _close(proc.stderr_fd);
+            proc.stderr_fd = -1;
+        }
+    }
+
+    {
+        CCResult_CCProcessStatus_CCIoError wait_res = cc_process_wait(&proc);
+        if (cc_is_err(wait_res)) {
+            return cc_err_CCResult_CCProcessOutput_CCIoError(cc_unwrap_err(wait_res));
+        }
+        output.status = cc_unwrap(wait_res);
+    }
+    return cc_ok_CCResult_CCProcessOutput_CCIoError(output);
+#else
+    return cc__process_capture_posix(arena, &proc, input);
+#endif
+}
+
+CCResult_CCProcessOutput_CCIoError cc_process_run(CCArena* arena, const char* program, const char** args) {
+    CCProcessConfig config = {
+        .program = program,
+        .args = args,
+        .pipe_stdout = true,
+        .pipe_stderr = true
+    };
+    return cc_process_run_config(arena, &config);
+}
+
+CCResult_CCProcessOutput_CCIoError cc_process_run_shell(CCArena* arena, const char* command) {
+#ifdef _WIN32
+    const char* args[] = {"cmd", "/c", command, NULL};
+    return cc_process_run(arena, "cmd", args);
+#else
+    const char* args[] = {"/bin/sh", "-c", command, NULL};
+    return cc_process_run(arena, "/bin/sh", args);
+#endif
+}
+
+/* ============================================================================
+ * Environment
+ * ============================================================================ */
+
+CCSlice cc_env_get(CCArena* arena, const char* name) {
+    CCSlice result = {0};
+    if (!arena || !name) return result;
+
+    const char* value = getenv(name);
+    if (!value) return result;
+
+    size_t len = strlen(value);
+    char* copy = cc_arena_alloc(arena, len + 1, 1);
+    if (!copy) return result;
+    memcpy(copy, value, len + 1);
+
+    result.ptr = copy;
+    result.len = len;
+    return result;
+}
+
+CCResult_bool_CCIoError cc_env_set(const char* name, const char* value) {
+    if (!name) {
+        return cc_err_CCResult_bool_CCIoError(cc_io_from_errno(EINVAL));
+    }
+
+#ifdef _WIN32
+    if (!SetEnvironmentVariableA(name, value)) {
+        CCIoError e = cc_io_error_os(CC_IO_OTHER, (int)GetLastError());
+        return cc_err_CCResult_bool_CCIoError(e);
+    }
+#else
+    if (setenv(name, value ? value : "", 1) < 0) {
+        return cc_err_CCResult_bool_CCIoError(cc_io_from_errno(errno));
+    }
+#endif
+
+    return cc_ok_CCResult_bool_CCIoError(true);
+}
+
+CCResult_bool_CCIoError cc_env_unset(const char* name) {
+    if (!name) {
+        return cc_err_CCResult_bool_CCIoError(cc_io_from_errno(EINVAL));
+    }
+
+#ifdef _WIN32
+    if (!SetEnvironmentVariableA(name, NULL)) {
+        CCIoError e = cc_io_error_os(CC_IO_OTHER, (int)GetLastError());
+        return cc_err_CCResult_bool_CCIoError(e);
+    }
+#else
+    if (unsetenv(name) < 0) {
+        return cc_err_CCResult_bool_CCIoError(cc_io_from_errno(errno));
+    }
+#endif
+
+    return cc_ok_CCResult_bool_CCIoError(true);
+}

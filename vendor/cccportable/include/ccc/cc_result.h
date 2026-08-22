@@ -1,0 +1,577 @@
+/*
+ * Result types and helpers.
+ *
+ * .cch source (Concurrent-C):
+ *   Types:     T !>(E)          — e.g. bool !>(CCError), CCSlice !>(CCIoError)
+ *   Returns:   cc_ok(v) / cc_err(e) or cc_err(kind, msg)  — inferred from return type
+ *   Consume:   prefer unwrap — expr !> / expr !>(e) { … }; also .value() after a check
+ *   Checks:    cc_is_ok / cc_is_err / .ok are fine; peels (.u.value) OK after a check
+ *
+ * Do not hand-write mangled spellings in .cch outside CC_DECL_RESULT_SPEC:
+ *   CCResult_T_E, cc_ok_CCResult_T_E, CCResult_T_E_is_ok, …
+ * @emit(`...`) factory/raw payloads may use T !>(E) + cc_ok/cc_err; the host
+ * lowers them at materialization (cc_emit_rewrite_result_sugar). CCRes_* remains
+ * an explicit-T,E escape hatch inside emit only.
+ *
+ * Lowered .h / emit may show CCResult_* / cc_is_ok / .ok — readability wins.
+ * Style gate: scripts/check_result_cch_style.sh
+ *
+ * CC_DECL_RESULT_SPEC(CCResult_T_E, T, E) registers the mangled ABI typedef.
+ * Layout: struct { bool ok; union { T value; E error; } u; }
+ */
+#ifndef CC_RESULT_H
+#define CC_RESULT_H
+
+#include <ccc/cc_compat.h>
+
+/* Common error type - a simple tagged enum with message. */
+typedef enum {
+    CC_ERR_NONE = 0,
+    CC_ERR_IO,
+    CC_ERR_PARSE,
+    CC_ERR_TIMEOUT,
+    CC_ERR_CANCELLED,
+    CC_ERR_INVALID_ARG,
+    CC_ERR_OUT_OF_MEMORY,
+    CC_ERR_NOT_FOUND,
+    CC_ERR_PERMISSION,
+    CC_ERR_ALREADY_EXISTS,
+    CC_ERR_WOULD_BLOCK,
+    CC_ERR_CLOSED,
+    CC_ERR_INTERRUPTED,        /* EINTR-class I/O; also CC_IO_INTERRUPTED */
+    CC_ERR_OVERFLOW,
+    CC_ERR_UNDERFLOW,
+    CC_ERR_NULL,               /* Unexpected NULL return from a pointer-returning call (synthesized by !> / ?>). */
+    CC_ERR_INTERNAL,           /* Broken invariant / emitter bug — not resource exhaustion */
+    CC_ERR_USER = 1000  /* User-defined errors start here */
+} CCErrorKind;
+
+typedef struct CCError {
+    CCErrorKind kind;
+    const char* message;  /* May be NULL; prefer cc_error_str for display */
+} CCError;
+static inline CCError __cc_error_make(CCErrorKind kind, const char* msg) {
+    CCError e = { kind, msg };
+    return e;
+}
+#define CC_ERROR(kind, msg) __cc_error_make((kind), (msg))
+
+/* Static kind label. Used when constructing faces that omit a custom message
+ * and when printing a CCError whose message is NULL/empty. */
+static inline const char* cc_error_kind_str(CCErrorKind kind) {
+    switch (kind) {
+        case CC_ERR_NONE:           return "ok";
+        case CC_ERR_IO:             return "I/O error";
+        case CC_ERR_PARSE:          return "parse error";
+        case CC_ERR_TIMEOUT:        return "timeout";
+        case CC_ERR_CANCELLED:      return "cancelled";
+        case CC_ERR_INVALID_ARG:    return "invalid argument";
+        case CC_ERR_OUT_OF_MEMORY:  return "out of memory";
+        case CC_ERR_NOT_FOUND:      return "not found";
+        case CC_ERR_PERMISSION:     return "permission denied";
+        case CC_ERR_ALREADY_EXISTS: return "already exists";
+        case CC_ERR_WOULD_BLOCK:    return "would block";
+        case CC_ERR_CLOSED:         return "closed";
+        case CC_ERR_INTERRUPTED:    return "interrupted";
+        case CC_ERR_OVERFLOW:       return "overflow";
+        case CC_ERR_UNDERFLOW:      return "underflow";
+        case CC_ERR_NULL:           return "null";
+        case CC_ERR_INTERNAL:       return "internal error";
+        default:                    return "error";
+    }
+}
+
+/* Display string for a CCError face: custom message if set, else kind label. */
+static inline const char* cc_error_str(CCError e) {
+    if (e.message && e.message[0]) return e.message;
+    return cc_error_kind_str(e.kind);
+}
+
+#include <stdio.h>
+#include <stdlib.h>
+
+/* Report a CCError to stderr. Building block for soft handlers:
+ *   @errhandler(CCError e) { cc_error_log(e); return 1; }
+ * Does not diverge — pair with return/cancel at the binding site. */
+static inline void cc_error_log(CCError e) {
+    if (fprintf(stderr, "fatal: %s\n", cc_error_str(e)) < 0) abort();
+}
+
+/* Log then return 1 — soft terminate for int-returning frames:
+ *   @errhandler(CCError e) { return cc_err_log(e); }
+ */
+static inline int cc_err_log(CCError e) {
+    cc_error_log(e);
+    return 1;
+}
+
+/* Log then exit(1). The standard named `@errhandler` terminate policy:
+ *   @errhandler(CCError e) cc_error_exit(e);
+ * Recognized as diverging for expression-position `!>;`. */
+static inline void cc_error_exit(CCError e) {
+    cc_error_log(e);
+    exit(1);
+}
+
+/*
+ * Result type layout:
+ *   r.ok       - true if success
+ *   r.u.value  - the success value (when ok is true)
+ *   r.u.error  - the error value (when ok is false)
+ *
+ * Uses named union 'u' for TCC compatibility.
+ *
+ * UFCS methods (via Type_method pattern):
+ *   r.value()     - returns value or aborts if error
+ *   r.error()     - returns error or aborts if ok
+ *   r.is_ok()     - returns true if success
+ *   r.is_err()    - returns true if error
+ *   r.unwrap_or(default) - returns value or default if error
+ */
+#define CC_DECL_RESULT_SPEC(name, OkType, ErrType)                                  \
+    typedef struct name {                                                           \
+        bool ok;                                                                    \
+        union { OkType value; ErrType error; } u;                                   \
+    } name;                                                                         \
+    static inline name cc_ok_##name(OkType v) {                                     \
+        name r;                                                                     \
+        r.ok = true;                                                                \
+        r.u.value = v;                                                              \
+        return r;                                                                   \
+    }                                                                               \
+    static inline name cc_err_##name(ErrType e) {                                   \
+        name r;                                                                     \
+        r.ok = false;                                                               \
+        r.u.error = e;                                                              \
+        return r;                                                                   \
+    }                                                                               \
+    /* UFCS method: r.value() -> name##_value(r) */                                 \
+    static inline OkType name##_value(name r) {                                     \
+        if (!r.ok) {                                                                \
+            fprintf(stderr, "CC: value failed on %s at %s:%d\n",                    \
+                    #name, __FILE__, __LINE__);                                     \
+            abort();                                                                \
+        }                                                                           \
+        return r.u.value;                                                           \
+    }                                                                               \
+    /* Internal compatibility helper for legacy lowered code. */                    \
+    static inline OkType name##_unwrap(name r) {                                    \
+        return name##_value(r);                                                     \
+    }                                                                               \
+    /* UFCS method: r.is_ok() -> name##_is_ok(r) */                                 \
+    static inline bool name##_is_ok(name r) { return r.ok; }                        \
+    /* UFCS method: r.is_err() -> name##_is_err(r) */                               \
+    static inline bool name##_is_err(name r) { return !r.ok; }                      \
+    /* UFCS method: r.unwrap_or(default) -> name##_unwrap_or(r, default) */         \
+    static inline OkType name##_unwrap_or(name r, OkType def) {                     \
+        return r.ok ? r.u.value : def;                                              \
+    }                                                                               \
+    /* UFCS method: r.error() -> name##_error(r) */                                 \
+    static inline ErrType name##_error(name r) {                                    \
+        if (r.ok) {                                                                 \
+            fprintf(stderr, "CC: error failed on %s at %s:%d\n",                    \
+                    #name, __FILE__, __LINE__);                                     \
+            abort();                                                                \
+        }                                                                           \
+        return r.u.error;                                                           \
+    }                                                                               \
+    /* Internal compatibility helper for legacy lowered code. */                    \
+    static inline ErrType name##_unwrap_err(name r) {                               \
+        return name##_error(r);                                                     \
+    }
+
+/* Generic cc_ok / cc_err macros for results */
+#define cc_ok_into(result_var, val) do {          \
+    (result_var).ok = true;                       \
+    (result_var).u.value = (val);                 \
+} while(0)
+
+#define cc_err_into(result_var, err) do {         \
+    (result_var).ok = false;                      \
+    (result_var).u.error = (err);                 \
+} while(0)
+
+/* Common result types over `CCError` - emitted in both parser mode and
+ * real mode as real distinct typed structs.  Guards allow codegen to
+ * pre-emit specific specs without
+ * duplicate definitions. */
+#ifndef CCResult_int_CCError_DEFINED
+#define CCResult_int_CCError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_int_CCError, int, CCError)
+#endif
+#ifndef CCResult_bool_CCError_DEFINED
+#define CCResult_bool_CCError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_bool_CCError, bool, CCError)
+#endif
+#ifndef CCResult_char_CCError_DEFINED
+#define CCResult_char_CCError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_char_CCError, char, CCError)
+#endif
+#ifndef CCResult_size_t_CCError_DEFINED
+#define CCResult_size_t_CCError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_size_t_CCError, size_t, CCError)
+#endif
+#ifndef CCResult_voidptr_CCError_DEFINED
+#define CCResult_voidptr_CCError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_voidptr_CCError, void*, CCError)
+#endif
+#ifndef CCResult_charptr_CCError_DEFINED
+#define CCResult_charptr_CCError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_charptr_CCError, char*, CCError)
+#endif
+
+/* Void ok type: success carries no value, so there is nothing to store and
+ * no `unwrap_or`.  Generated, never hand-written — a hand-copied spec is how
+ * a Result silently stops behaving like one. */
+#define CC_DECL_RESULT_SPEC_VOID(name, ErrType)                                     \
+    typedef struct name {                                                           \
+        bool ok;                                                                    \
+        union { char _dummy; ErrType error; } u;                                    \
+    } name;                                                                         \
+    static inline name cc_ok_##name(void) {                                         \
+        name r;                                                                     \
+        r.ok = true;                                                                \
+        r.u._dummy = 0;                                                             \
+        return r;                                                                   \
+    }                                                                               \
+    static inline name cc_err_##name(ErrType e) {                                   \
+        name r;                                                                     \
+        r.ok = false;                                                               \
+        r.u.error = e;                                                              \
+        return r;                                                                   \
+    }                                                                               \
+    /* UFCS method: r.value() -> name##_value(r); yields nothing, aborts on err. */ \
+    static inline void name##_value(name r) {                                       \
+        if (!r.ok) {                                                                \
+            fprintf(stderr, "CC: value failed on %s at %s:%d\n",                    \
+                    #name, __FILE__, __LINE__);                                     \
+            abort();                                                                \
+        }                                                                           \
+    }                                                                               \
+    static inline void name##_unwrap(name r) { name##_value(r); }                   \
+    static inline bool name##_is_ok(name r) { return r.ok; }                        \
+    static inline bool name##_is_err(name r) { return !r.ok; }                      \
+    static inline ErrType name##_error(name r) {                                    \
+        if (r.ok) {                                                                 \
+            fprintf(stderr, "CC: error failed on %s at %s:%d\n",                    \
+                    #name, __FILE__, __LINE__);                                     \
+            abort();                                                                \
+        }                                                                           \
+        return r.u.error;                                                           \
+    }                                                                               \
+    static inline ErrType name##_unwrap_err(name r) { return name##_error(r); }
+
+/* Void result (for functions that return only success/error) */
+#ifndef CCResult_void_CCError_DEFINED
+#define CCResult_void_CCError_DEFINED 1
+CC_DECL_RESULT_SPEC_VOID(CCResult_void_CCError, CCError)
+#endif /* CCResult_void_CCError_DEFINED */
+
+/*
+ * The CC preprocessor rewrites T!>(E) to __CC_RESULT(T_mangled, E_mangled).
+ * Parser mode and real compilation both preserve the concrete CCResult_T_E
+ * name; generated declarations provide the matching typed struct/helpers.
+ */
+#define __CC_RESULT(T, E) CCResult_##T##_##E
+#define __CC_RESULT_OK(T, E, v) cc_ok_CCResult_##T##_##E(v)
+#define __CC_RESULT_ERR(T, E, e) cc_err_CCResult_##T##_##E(e)
+
+#ifdef CC_PARSER_MODE
+
+/* Generic error struct for parser-mode fallback paths.
+   Guard allows parser-mode stubs to predefine this. */
+#ifndef __CC_GENERIC_ERROR_DEFINED
+#define __CC_GENERIC_ERROR_DEFINED
+typedef struct __CCGenericError {
+    int kind;
+    int os_errno;
+    int os_code;
+    const char* message;
+    char __pad[48];
+} __CCGenericError;
+#endif
+
+/* Generic result placeholder struct - used for ALL result types during parsing.
+   Field names match the real CC_DECL_RESULT_SPEC layout so user code compiles.
+   Uses named union 'u' matching the real struct layout.
+   Guard allows parser-mode stubs to predefine this. */
+#ifndef __CC_RESULT_GENERIC_DEFINED
+#define __CC_RESULT_GENERIC_DEFINED
+typedef struct __CCResultGeneric {
+    bool ok;
+    union {
+        intptr_t value;             /* intptr_t holds both ints and pointers */
+        __CCGenericError error;     /* has .kind, .os_errno, .message */
+    } u;
+} __CCResultGeneric;
+#endif
+
+/* In parser mode, result type declarations emit real distinct typed structs.
+ *
+ * Historically this redefined `CC_DECL_RESULT_SPEC` to alias every Result
+ * type to `__CCResultGeneric` (whose `u.value` is `intptr_t`).  That gave
+ * TCC a single universal shape so `T!>(E)` types declared before `T` /
+ * `E` were in scope still parsed, but the collapse cost us:
+ *
+ *   - `r.u.value` is `long`, so a struct payload `T` gets reinterpreted
+ *     as an integer by `__cc_uw_value(r)` — the `?>(e) handle(e)` ternary
+ *     in code like `RedisReply reply = execute(req) ?>(e) err_reply(e);`
+ *     tripped "type mismatch in conditional expression (have 'long' and
+ *     'struct RedisReply')".
+ *   - Every pass that touches `.u.error` has to pointer-cast through
+ *     `void*` to recover `E` (see `pass_result_unwrap.c`,
+ *     `pass_err_syntax.c`).
+ *   - The enumerated `_Generic` arms `visit_codegen.c` emits per TU had
+ *     to sit inside `#ifndef CC_PARSER_MODE` and were therefore dead in
+ *     the lowered output (which always `#define`s `CC_PARSER_MODE`).
+ *
+ * The typed emission below mirrors the non-parser path exactly — same
+ * struct layout, same inline helpers — so `_Generic` dispatch, UFCS
+ * method calls, and direct field access all see `OkType` / `ErrType`
+ * rather than `intptr_t` / `__CCGenericError`.  The preprocessor
+ * (see `preprocess.c`) arranges for `CC_DECL_RESULT_SPEC(T, E)` to be
+ * invoked at a program point where `OkType` and `ErrType` are already
+ * in scope, using the `insert_pos` post-typedef anchor.
+ *
+ * `__CCResultGeneric` is kept around as a last-resort placeholder for
+ * the internal pre-parse reparse phase when a forward reference leaves
+ * a payload or error type genuinely undeclared — but it is no longer
+ * the default shape.
+ *
+ * Irreducible core (2026-05-29): the old generic ctors
+ * (`__cc_result_generic_ok/err`) and the nine generic UFCS accessor
+ * methods (`__CCResultGeneric_value/unwrap/is_ok/is_err/...`) were
+ * verified dead and removed (465/465 both modes).  What remains is
+ * load-bearing and pinned to two things that cannot go until C3:
+ *   1. the `__CCGenericError` / `__CCResultGeneric` tags — TCC-ext's
+ *      UFCS stub emits `__CCResultGeneric` as a return type during the
+ *      stub-AST parse (see preprocess.c's `__CC_RESULT_GENERIC_FWD_DECLARED`
+ *      output), so the tag must be a complete type here; and
+ *   2. the `cc_ok` / `cc_err` stubs below, which keep an un-rewritten
+ *      `cc_ok(...)` / `cc_err(...)` parseable so the intended diagnostic
+ *      surfaces rather than "undeclared function".
+ */
+
+/*
+ * Simplified result constructors for parser mode.
+ * cc_ok(value) and cc_err(error) are inferred from context.
+ * The compiler rewrites them to typed versions based on enclosing function.
+ * Note: These are inline functions (not macros) to preserve the value in AST.
+ */
+#ifndef __CC_RESULT_CTORS_DEFINED
+#define __CC_RESULT_CTORS_DEFINED
+/* These generic stubs are the *declaration* that lets a `cc_ok(...)` /
+ * `cc_err(...)` call parse even when it is NOT inside a result-returning
+ * function (where preprocess.c rewrites it to a typed `cc_ok_CCResult_T_E`).
+ * Without them, e.g. `cc_err(e)` in a plain `int` function would be an
+ * "undeclared function" error; with them it parses and then surfaces the
+ * intended "cannot convert" type-mismatch diagnostic (see
+ * tests/try_outside_result_fn_fail).  They are the last text-matching
+ * fallback; removing them is coupled to retiring `__CCResultGeneric`. */
+static inline __CCResultGeneric cc_ok(long __v) {
+    __CCResultGeneric __r; __r.ok = 1; __r.u.value = __v; return __r;
+}
+static inline __CCResultGeneric cc_err(int __kind, const char* __msg) {
+    __CCResultGeneric __r; __r.ok = 0; __r.u.value = __kind; (void)__msg; return __r;
+}
+#endif
+
+/* `CCIoError`-keyed result types are *not* pre-declared here because
+ * `CCIoError` lives in `cc_io_error.cch`, which may or may not be
+ * included by a given TU.  When they are used, `preprocess.c` emits
+ * the typed `CC_DECL_RESULT_SPEC(CCResult_X_CCIoError, X, CCIoError)`
+ * at `insert_pos` in the TU (after the user's `#include` of the
+ * defining header), so `X` and `CCIoError` are both in scope. */
+
+#endif /* CC_PARSER_MODE */
+
+/* Synthesized `CC_ERR_NULL` CCError for the !> / ?> / @err pointer-lowering
+ * path.  The message is built by concatenating three string literals at
+ * translation phase 6, so the whole thing is a compile-time constant with
+ * no runtime allocation or formatting.  Used by the lowering passes in
+ * place of hand-stamping `(CCError){ .kind = CC_ERR_NULL, .message = "..." }`
+ * at every call site — changes to the CCError shape only need to be
+ * chased in the `CC_ERROR` macro above, which is parser-mode-aware.
+ *
+ * The `expr_lit` argument should be a C string literal whose contents
+ * have already been sanitized for embedding (whitespace collapsed,
+ * `\` / `"` escaped, overly long snippets truncated) — see
+ * `cc_sb_append_err_null_at` in `cc/src/util/text.h`. */
+#define __cc_err_null_at(expr_lit, file_lit, line_lit) \
+    CC_ERROR(CC_ERR_NULL, \
+             "NULL returned from " expr_lit " at " file_lit ":" line_lit)
+
+/* R3 — runtime hook + query API for `!>` source-location propagation chain.
+ *
+ * Forward-declared here (rather than via a separate header include) so
+ * that any TU using `!>` / `?>` / `@err` picks up the declarations via
+ * the prelude without an extra `#include`.  Implementation lives in
+ * `cc/runtime/cc_rt_diag.c`; the runtime object is linked into every
+ * CC binary by the driver, so the symbols always resolve.
+ *
+ * `record` is called via the comma operator inside `__cc_uw_err_at` (and
+ * the per-TU enumerated `_Generic` arms emitted by `visit_codegen.c`) so
+ * each `!>` propagation pushes its source site onto the chain before the
+ * error value is extracted and returned.
+ *
+ * The query/clear/print functions are part of the user-facing API — an
+ * `@errhandler` can walk the chain to render where the error trickled
+ * through, then `clear()` to scope the chain to a single error. */
+void cc_rt_diag_record_unwrap_site(const char* file, const char* line_str);
+void cc_rt_diag_clear_unwrap_chain(void);
+int  cc_rt_diag_unwrap_chain_len(void);
+int  cc_rt_diag_unwrap_site(int i, const char** out_file, const char** out_line_str);
+/* The most recent `!>` / `?>` site as "file:line" — the unwrap that routed
+ * the error a handler is holding.  Every unwrap error path records its
+ * site before extracting the error, so this is current inside any
+ * `@errhandler`, including for errors whose message carries no position
+ * of its own (a Python exception, an errno).  "" before any unwrap:
+ *
+ *     @errhandler(CCError e) {
+ *         fprintf(stderr, "fatal: %s (at %s)\n", e.message, cc_error_site());
+ *         return 1;
+ *     }
+ */
+const char* cc_error_site(void);
+
+/* ============================================================================
+ * Unified unwrap primitives: `__cc_uw_is_err(x)`, `__cc_uw_value(x)`,
+ * `__cc_uw_err_at(x, expr, file, line)`.
+ *
+ * These are the *only* primitives the lowering passes need to emit for the
+ * `!>` / `?>` / `@err` operators — they transparently dispatch at compile
+ * time (via `_Generic`) between:
+ *   - Result-struct shape:  `(x).u.value` / `(x).u.error` / `!(x).ok`
+ *   - Raw-pointer shape:    `(x)` / synthesized CC_ERR_NULL / `(x) == NULL`
+ *
+ * So the lowering pass no longer has to scan the source text of the LHS
+ * to guess whether it's pointer-typed — the generated C code asks the
+ * compiler, which always knows for sure.
+ *
+ * Baseline definitions here are the raw-pointer fallback.  When a TU
+ * uses any `T!>(E)` result type, `visit_codegen.c` `#undef`s these and
+ * re-emits enumerated `_Generic` macros with one arm per concrete
+ * `CCResult_T_E` struct in that TU, plus the pointer default arm.
+ *
+ * Same shape in both parser mode and real compilation: result structs
+ * are now real distinct typed structs in both modes (see the parser-mode
+ * rework of `CC_DECL_RESULT_SPEC` above), so the enumerated arms
+ * `visit_codegen.c` emits work unchanged in either mode.  The previous
+ * parser-mode-only `__CCResultGeneric` arm has been retired.
+ * ============================================================================ */
+#define __cc_uw_is_err(__x__) _Generic((__x__), \
+    default: (*(void* const*)(void*)&(__x__) == (void*)0))
+#define __cc_uw_value(__x__) _Generic((__x__), \
+    default: (__x__))
+/* R3: record the propagation site (comma-operator side effect) before
+ * extracting the error.  The comma expression evaluates to the right
+ * operand, so the _Generic arm's type is unchanged.  When `visit_codegen.c`
+ * `#undef`s + re-emits this macro with enumerated arms per concrete
+ * Result struct, each typed arm is wrapped in the same comma idiom so the
+ * record() call fires regardless of which arm is selected. */
+#define __cc_uw_err_at(__x__, __e__, __f__, __l__) _Generic((__x__), \
+    default: (cc_rt_diag_record_unwrap_site(__f__, __l__), \
+              __cc_err_null_at(__e__, __f__, __l__)))
+
+/*
+ * Result constructors - simplified API.
+ *
+ * cc_ok(value)  - Return success, type inferred from function return type
+ * cc_err(error) - Return error, type inferred from function return type
+ *
+ * The compiler automatically rewrites these based on the enclosing function's
+ * return type. For example, in a function returning int!>(CCIoError):
+ *   cc_ok(42)  -> cc_ok_CCResult_int_CCIoError(42)
+ *   cc_err(e)  -> cc_err_CCResult_int_CCIoError(e)
+ *
+ * Example:
+ *   int!>(CCError) read_value(void) {
+ *       if (success) return cc_ok(42);
+ *       return cc_err(CC_ERROR(CC_ERR_NOT_FOUND, "not found"));
+ *   }
+ */
+
+/*
+ * Result value accessors - for extracting values from results.
+ *
+ * cc_is_ok(res)        - Check if result is ok (same as res.ok)
+ * cc_is_err(res)       - Check if result is error
+ * cc_unwrap(res)       - Get value, abort if error (for primitives)
+ * cc_unwrap_as(res, T) - Get value cast to type T (for struct values)
+ * cc_unwrap_err(res)   - Get error value
+ *
+ * The _as variants are needed when the value is a struct and you want
+ * to access its fields:
+ *
+ *   MyData!MyError res = get_data();
+ *   if (cc_is_ok(res)) {
+ *       MyData d = cc_unwrap_as(res, MyData);
+ *       use(d.x, d.y);
+ *   }
+ */
+#define cc_is_ok(res) ((res).ok)
+#define cc_is_err(res) (!(res).ok)
+#define cc_value(res) ((res).u.value)
+#define cc_error(res) ((res).u.error)
+
+/* cc_unwrap - get value from result, abort if error.
+   For struct values, use cc_unwrap_as(res, Type) to cast to correct type.
+   For struct errors, use cc_unwrap_err_as(res, Type). */
+#define cc_unwrap(res) ({ \
+    __typeof__(res) __r = (res); \
+    if (!__r.ok) { \
+        fprintf(stderr, "cc_unwrap called on error result\n"); \
+        abort(); \
+    } \
+    __r.u.value; \
+})
+#define cc_unwrap_as(res, T) ({ \
+    __typeof__(res) __r = (res); \
+    if (!__r.ok) { \
+        fprintf(stderr, "cc_unwrap_as called on error result\n"); \
+        abort(); \
+    } \
+    *(T*)(void*)&__r.u.value; \
+})
+#define cc_unwrap_err(res) ({ \
+    __typeof__(res) __r = (res); \
+    if (__r.ok) { \
+        fprintf(stderr, "cc_unwrap_err called on ok result\n"); \
+        abort(); \
+    } \
+    __r.u.error; \
+})
+#define cc_unwrap_err_as(res, T) ({ \
+    __typeof__(res) __r = (res); \
+    if (__r.ok) { \
+        fprintf(stderr, "cc_unwrap_err_as called on ok result\n"); \
+        abort(); \
+    } \
+    *(T*)(void*)&__r.u.error; \
+})
+
+/* ============================================================================
+ * Convenience type/constructor macros for Result surfaces.
+ *
+ * Type macros expand identically in parser/codegen modes (they just form
+ * typedef names); only the constructor expansions differ.
+ *
+ *   CCRes(T, E)          -> CCResult_T_E
+ *   CCResPtr(T, E)       -> CCResult_Tptr_E
+ *   CCRes_ok(T, E, v)    -> cc_ok_CCResult_T_E(v)
+ *   CCRes_err(T, E, e)   -> cc_err_CCResult_T_E(e)
+ *   CCResPtr_ok(T, E, v) -> cc_ok_CCResult_Tptr_E(v)
+ *   CCResPtr_err(T, E, e)-> cc_err_CCResult_Tptr_E(e)
+ *
+ * (retired) The companion Optional macros (CCOpt(T), CCOpt_some, CCOpt_none,
+ * CCOptRes, CCResOpt) used to live in cc_optional.cch and are now gone; see
+ * cc/include/ccc/DEPRECATIONS.md for the migration matrix.
+ * ============================================================================ */
+#define CCRes(T, E) CCResult_##T##_##E
+#define CCResPtr(T, E) CCResult_##T##ptr_##E
+#define CCRes_ok(T, E, v) cc_ok_CCResult_##T##_##E(v)
+#define CCRes_err(T, E, e) cc_err_CCResult_##T##_##E(e)
+#define CCResPtr_ok(T, E, v) cc_ok_CCResult_##T##ptr_##E(v)
+#define CCResPtr_err(T, E, e) cc_err_CCResult_##T##ptr_##E(e)
+
+#endif /* CC_RESULT_H */

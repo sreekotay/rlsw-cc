@@ -1,0 +1,37 @@
+/*
+ * Directional channel handle wrappers (spec-level tx/rx capabilities).
+ *
+ * These are lightweight wrappers around the underlying CCChan* so C type checking
+ * can enforce “send-only” vs “recv-only” at API boundaries.
+ *
+ * NOTE: This is an ABI layer only; the compiler does not yet lower `T[~ ... >/<]`
+ * surface types into these handles. For now, users/tests can opt in manually.
+ */
+#ifndef CC_CHAN_HANDLE_H
+#define CC_CHAN_HANDLE_H
+
+struct CCChan; /* forward */
+
+/* Guard allows parser-mode stubs to predefine these */
+#ifndef __CC_CHAN_TX_DEFINED
+#define __CC_CHAN_TX_DEFINED
+typedef struct { struct CCChan* raw; } CCChanTx;
+#endif
+
+#ifndef __CC_CHAN_RX_DEFINED
+#define __CC_CHAN_RX_DEFINED
+typedef struct { struct CCChan* raw; } CCChanRx;
+#endif
+
+/* DEPRECATED: CCChanRxOrdered is no longer used - ordered is now a flag on CCChan.
+   The compiler emits CCChanRx for all receive channels, and ordered_recv()
+   checks the channel's is_ordered flag at runtime. Kept for API compatibility. */
+#ifndef __CC_CHAN_RX_ORDERED_DEFINED
+#define __CC_CHAN_RX_ORDERED_DEFINED
+typedef struct { struct CCChan* raw; } CCChanRxOrdered;
+#endif
+
+/* ordered_recv is defined in cc_channel.cch after CCTask is available */
+
+#endif // CC_CHAN_HANDLE_H
+

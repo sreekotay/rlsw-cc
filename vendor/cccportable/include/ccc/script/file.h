@@ -1,0 +1,90 @@
+/*
+ * Script file helpers: read/copy/print by path.
+ * Path arguments are CCSlice (NUL-terminated borrows).
+ */
+#ifndef CC_SCRIPT_FILE_H
+#define CC_SCRIPT_FILE_H
+
+#include <errno.h>
+#include <stdio.h>
+#include <string.h>
+
+#include <ccc/cc_arena.h>
+#include <ccc/cc_io_error.h>
+#include <ccc/cc_result.h>
+#include <ccc/cc_slice.h>
+#include <ccc/std/io.h>
+
+/* Read entire file at path into arena. Arena is last. */
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCSlice_CCError_DEFINED
+#define CCResult_CCSlice_CCError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCSlice_CCError, CCSlice, CCError)
+#endif
+static inline CCResult_CCSlice_CCError cc_file_read_path(CCSlice path, CCArena *arena) {
+    CCFile file;
+    CCResult_CCSlice_CCIoError r;
+    if (!path.ptr || !arena) {
+        return cc_err_CCResult_CCSlice_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "cc_file_read_path: bad args"));
+    }
+    if (cc_file_open(&file, path, "rb") != 0) {
+        return cc_err_CCResult_CCSlice_CCError(CC_ERROR(CC_ERR_IO, cc_io_error_str(cc_io_from_errno(errno))));
+    }
+    r = cc_file_read_all(&file, arena);
+    cc_file_close(&file);
+    if (cc_is_err(r)) {
+        return cc_err_CCResult_CCSlice_CCError(CC_ERROR(CC_ERR_IO, cc_io_error_str(cc_error(r))));
+    }
+    return cc_ok_CCResult_CCSlice_CCError(cc_value(r));
+}
+
+static inline CCResult_size_t_CCError cc_file_write_path(CCSlice path, CCSlice data) {
+    CCFile file;
+    CCResult_size_t_CCIoError r;
+    if (!path.ptr) {
+        return cc_err_CCResult_size_t_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "cc_file_write_path: bad path"));
+    }
+    if (cc_file_open(&file, path, "wb") != 0) {
+        return cc_err_CCResult_size_t_CCError(CC_ERROR(CC_ERR_IO, cc_io_error_str(cc_io_from_errno(errno))));
+    }
+    r = cc_file_write(&file, data);
+    cc_file_close(&file);
+    if (cc_is_err(r)) {
+        return cc_err_CCResult_size_t_CCError(CC_ERROR(CC_ERR_IO, cc_io_error_str(cc_error(r))));
+    }
+    return cc_ok_CCResult_size_t_CCError(cc_value(r));
+}
+
+static inline CCResult_bool_CCError cc_file_copy(CCSlice src, CCSlice dst, CCArena *arena) {
+    CCResult_CCSlice_CCError rr;
+    CCResult_size_t_CCError wr;
+    if (!arena || !src.ptr || !dst.ptr) {
+        return cc_err_CCResult_bool_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "cc_file_copy: bad args"));
+    }
+    rr = cc_file_read_path(src, arena);
+    if (cc_is_err(rr)) {
+        return cc_err_CCResult_bool_CCError(cc_error(rr));
+    }
+    wr = cc_file_write_path(dst, cc_value(rr));
+    if (cc_is_err(wr)) {
+        return cc_err_CCResult_bool_CCError(cc_error(wr));
+    }
+    return cc_ok_CCResult_bool_CCError(true);
+}
+
+static inline CCResult_size_t_CCError cc_script_print_file(CCSlice path, CCArena *arena) {
+    CCResult_CCSlice_CCError rr;
+    CCResult_size_t_CCIoError wr;
+    if (!arena || !path.ptr) {
+        return cc_err_CCResult_size_t_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "cc_script_print_file: bad args"));
+    }
+    rr = cc_file_read_path(path, arena);
+    if (cc_is_err(rr)) return cc_err_CCResult_size_t_CCError(cc_error(rr));
+    wr = cc_std_out_write(cc_value(rr));
+    if (cc_is_err(wr)) {
+        return cc_err_CCResult_size_t_CCError(CC_ERROR(CC_ERR_IO, cc_io_error_str(cc_error(wr))));
+    }
+    return cc_ok_CCResult_size_t_CCError(cc_value(wr));
+}
+
+#endif /* CC_SCRIPT_FILE_H */

@@ -1,0 +1,96 @@
+/*
+ * Temp file with Result create + @destroy cleanup.
+ *
+ *   CCTempFile tmp = cc_temp_file(&a) !> @destroy;
+ *
+ * `@typeview … { as: file; }` forwards CCFile methods. Bodyless `@destroy`
+ * / `.destroy()` run `cc_temp_file_unlink` then `cc_file_close(&tmp.file)`
+ * (`file` is a CCFile value field with a destroy hook).
+ * `cc_temp_file_destroy` is the same chain for raw C callers.
+ */
+#ifndef CC_SCRIPT_TEMP_H
+#define CC_SCRIPT_TEMP_H
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <ccc/cc_arena.h>
+#include <ccc/cc_result.h>
+#include <ccc/cc_slice.h>
+#include <ccc/cc_type.h>
+#include <ccc/std/io.h>
+
+typedef struct CCTempFile {
+    CCFile file;
+    CCSlice path;  /* NUL-terminated temp path */
+    int owns;
+} CCTempFile;
+
+
+
+
+
+#ifndef CCResult_CCTempFile_CCError_DEFINED
+#define CCResult_CCTempFile_CCError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCTempFile_CCError_DEFINED
+#define CCResult_CCTempFile_CCError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCTempFile_CCError, CCTempFile, CCError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_CCTempFile_CCError, CCTempFile, CCError)
+#endif
+
+/* Delta hook: unlink path / clear owns. Does not close the file. */
+static inline void cc_temp_file_unlink(CCTempFile *tmp) {
+    if (!tmp || !tmp->owns) return;
+    if (tmp->path.ptr && tmp->path.len)
+        unlink((const char *)tmp->path.ptr);
+    tmp->owns = 0;
+}
+
+/* Conventional full-chain destroy for raw C callers. */
+static inline void cc_temp_file_destroy(CCTempFile *tmp) {
+    if (!tmp) return;
+    cc_temp_file_unlink(tmp);
+    cc_file_close(&tmp->file);
+}
+
+static inline CCResult_CCTempFile_CCError cc_temp_file(CCArena *arena) {
+    char tmpl[] = "/tmp/cc_script.XXXXXX";
+    int fd;
+    size_t n;
+    CCSlice path;
+    CCTempFile tmp;
+    FILE *fp;
+    if (!arena) {
+        return cc_err_CCResult_CCTempFile_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "cc_temp_file: no arena"));
+    }
+    fd = mkstemp(tmpl);
+    if (fd < 0) {
+        return cc_err_CCResult_CCTempFile_CCError(CC_ERROR(CC_ERR_IO, "cc_temp_file: mkstemp failed"));
+    }
+    fp = fdopen(fd, "w+");
+    if (!fp) {
+        close(fd);
+        unlink(tmpl);
+        return cc_err_CCResult_CCTempFile_CCError(CC_ERROR(CC_ERR_IO, "cc_temp_file: fdopen failed"));
+    }
+    n = strlen(tmpl);
+    path = cc_arena_alloc_slice_bytes(arena, n + 1);
+    if (!path.ptr) {
+        fclose(fp);
+        unlink(tmpl);
+        return cc_err_CCResult_CCTempFile_CCError(CC_ERROR(CC_ERR_OUT_OF_MEMORY, "cc_temp_file: alloc"));
+    }
+    memcpy(path.ptr, tmpl, n + 1);
+    path.len = n;
+    memset(&tmp, 0, sizeof(tmp));
+    tmp.file.handle = fp;
+    tmp.path = path;
+    tmp.owns = 1;
+    return cc_ok_CCResult_CCTempFile_CCError(tmp);
+}
+
+#endif /* CC_SCRIPT_TEMP_H */

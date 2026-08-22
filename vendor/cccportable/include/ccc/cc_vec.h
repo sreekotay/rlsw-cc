@@ -1,0 +1,258 @@
+#ifndef CC_VEC_H
+#define CC_VEC_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
+#include <ccc/cc_arena.h>
+#include <ccc/cc_slice.h>
+
+
+typedef struct CCVec {
+    void *data;
+    size_t len;
+} CCVec;
+
+typedef struct CCVecHeader {
+    CCArena *arena;
+    size_t cap;
+    uint64_t provenance;
+} CCVecHeader;
+
+/* The comptime executor's TCC sysinclude does not declare max_align_t; use the
+ * conventional maximal alignment (16) there. Normal builds keep the portable
+ * _Alignof(max_align_t). See COMPTIME_CAPABILITY_MODEL.md §7b. */
+#ifdef CC_COMPTIME
+#define CC__VEC_MAX_ALIGN ((size_t)16)
+#else
+#define CC__VEC_MAX_ALIGN _Alignof(max_align_t)
+#endif
+
+static inline size_t cc__vec_header_bytes(void) {
+    size_t align = CC__VEC_MAX_ALIGN;
+    return (sizeof(CCVecHeader) + align - 1) & ~(align - 1);
+}
+
+static inline CCVecHeader *cc__vec_header(const CCVec *v) {
+    if (!v || !v->data) return NULL;
+    return (CCVecHeader *)((uint8_t *)v->data - cc__vec_header_bytes());
+}
+
+static inline size_t cc_vec_cap(const CCVec *v) {
+    CCVecHeader *h = cc__vec_header(v);
+    return h ? h->cap : 0;
+}
+
+static inline CCArena *cc_vec_arena(const CCVec *v) {
+    CCVecHeader *h = cc__vec_header(v);
+    return h ? h->arena : NULL;
+}
+
+#ifdef CC_PARSER_MODE
+
+static inline uint64_t cc_vec_provenance(const CCVec *v) {
+    CCVecHeader *h = cc__vec_header(v);
+    return h ? h->provenance : 0;
+}
+
+static inline CCSlice cc_vec_as_slice(const CCVec *v) {
+    if (!v || !v->data) return cc_slice_empty();
+    return cc_slice_from_parts(v->data,
+                               v->len,
+                               cc_slice_make_id(cc_vec_provenance(v), false, false, false));
+}
+
+static inline void cc_vec_apply_slice(CCVec *v, CCSlice slice) {
+    if (!v) return;
+    v->data = slice.ptr;
+    v->len = slice.len;
+}
+
+static inline int cc_vec_init(CCVec *v,
+                              CCArena *arena,
+                              size_t elem_size,
+                              size_t elem_align,
+                              size_t initial_cap) {
+    (void)elem_size;
+    (void)elem_align;
+    (void)initial_cap;
+    if (!v) return -1;
+    v->len = 0;
+    v->data = NULL;
+    return arena ? 0 : -1;
+}
+
+static inline int cc_vec_reserve(CCVec *v,
+                                 size_t elem_size,
+                                 size_t elem_align,
+                                 size_t need) {
+    (void)v;
+    (void)elem_size;
+    (void)elem_align;
+    (void)need;
+    return 0;
+}
+
+static inline void *cc_vec_push_slot(CCVec *v,
+                                     size_t elem_size,
+                                     size_t elem_align) {
+    (void)v;
+    (void)elem_size;
+    (void)elem_align;
+    return NULL;
+}
+
+static inline void *cc_vec_at_grow(CCVec *v,
+                                   size_t elem_size,
+                                   size_t elem_align,
+                                   size_t i) {
+    (void)v;
+    (void)elem_size;
+    (void)elem_align;
+    (void)i;
+    return NULL;
+}
+
+static inline void cc_vec_sync_len(CCVec *v) {
+    (void)v;
+}
+
+static inline void cc_vec_clear(CCVec *v) {
+    if (!v) return;
+    v->len = 0;
+}
+
+#else
+
+static inline uint64_t cc_vec_provenance(const CCVec *v) {
+    CCVecHeader *h = cc__vec_header(v);
+    return h ? h->provenance : 0;
+}
+
+static inline size_t cc__vec_alloc_size(size_t elem_size, size_t cap) {
+    if (elem_size != 0 && cap > (SIZE_MAX - cc__vec_header_bytes()) / elem_size) {
+        return 0;
+    }
+    return cc__vec_header_bytes() + elem_size * cap;
+}
+
+static inline void cc_vec_sync_len(CCVec *v) {
+    (void)v;
+}
+
+static inline CCSlice cc_vec_as_slice(const CCVec *v) {
+    if (!v || !v->data) return cc_slice_empty();
+    return cc_slice_from_parts(v->data,
+                               v->len,
+                               cc_slice_make_id(cc_vec_provenance(v), false, false, false));
+}
+
+static inline void cc_vec_apply_slice(CCVec *v, CCSlice slice) {
+    if (!v) return;
+    v->data = slice.ptr;
+    v->len = slice.len;
+}
+
+static inline int cc_vec_init(CCVec *v,
+                              CCArena *arena,
+                              size_t elem_size,
+                              size_t elem_align,
+                              size_t initial_cap) {
+    CCVecHeader *h;
+    size_t total;
+    size_t cap;
+    if (!v) return -1;
+    v->len = 0;
+    v->data = NULL;
+    if (!arena) return -1;
+
+    cap = initial_cap > 0 ? initial_cap : 8;
+    (void)elem_align;
+    total = cc__vec_alloc_size(elem_size, cap);
+    if (total == 0) return -1;
+    h = (CCVecHeader *)cc_arena_alloc(arena, total, CC__VEC_MAX_ALIGN);
+    if (!h) return -1;
+    h->arena = arena;
+    h->cap = cap;
+    h->provenance = arena->provenance;
+    v->data = (void *)((uint8_t *)h + cc__vec_header_bytes());
+    return 0;
+}
+
+static inline int cc_vec_reserve(CCVec *v,
+                                 size_t elem_size,
+                                 size_t elem_align,
+                                 size_t need) {
+    CCVecHeader *h;
+    CCArena *arena;
+    size_t old_total;
+    size_t new_total;
+    if (!v) return -1;
+    h = cc__vec_header(v);
+    if (!h || !h->arena) return -1;
+    if (need <= h->cap) return 0;
+
+    arena = h->arena;
+    (void)elem_align;
+    old_total = cc__vec_alloc_size(elem_size, h->cap);
+    new_total = cc__vec_alloc_size(elem_size, need);
+    if (old_total == 0 || new_total == 0) return -1;
+    h = (CCVecHeader *)cc_arena_realloc(arena, arena, h, old_total, new_total, CC__VEC_MAX_ALIGN);
+    if (!h) return -1;
+    h->arena = arena;
+    h->cap = need;
+    h->provenance = arena->provenance;
+    v->data = (void *)((uint8_t *)h + cc__vec_header_bytes());
+    return 0;
+}
+
+static inline void *cc_vec_push_slot(CCVec *v,
+                                     size_t elem_size,
+                                     size_t elem_align) {
+    void *slot;
+    size_t cap;
+    if (!v) return NULL;
+    cap = cc_vec_cap(v);
+    if (v->len == cap) {
+        size_t new_cap = cap ? (cap * 8) / 5 : 8;
+        if (new_cap <= cap) new_cap = cap + 1;
+        if (cc_vec_reserve(v, elem_size, elem_align, new_cap) != 0) {
+            return NULL;
+        }
+    }
+    slot = (uint8_t *)v->data + (v->len * elem_size);
+    v->len += 1;
+    return slot;
+}
+
+static inline void *cc_vec_at_grow(CCVec *v,
+                                   size_t elem_size,
+                                   size_t elem_align,
+                                   size_t i) {
+    size_t cap;
+    if (!v) return NULL;
+    cap = cc_vec_cap(v);
+    if (i >= cap) {
+        size_t new_cap = cap ? cap : 8;
+        while (new_cap <= i) {
+            size_t next = (new_cap * 8) / 5;
+            if (next <= new_cap) next = new_cap + 1;
+            new_cap = next;
+        }
+        if (cc_vec_reserve(v, elem_size, elem_align, new_cap) != 0) return NULL;
+    }
+    if (i >= v->len) {
+        v->len = i + 1;
+    }
+    return (uint8_t *)v->data + (i * elem_size);
+}
+
+static inline void cc_vec_clear(CCVec *v) {
+    if (!v) return;
+    v->len = 0;
+}
+
+#endif
+
+#endif /* CC_VEC_H */

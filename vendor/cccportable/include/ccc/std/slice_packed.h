@@ -1,0 +1,323 @@
+/*
+ * CCSlicePacked — pointer-sized held slice: inline small bytes, arena
+ * length-prefixed payload, or a short-lived borrow of foreign bytes.
+ *
+ * Dense hold twin of CCSliceHdr ({ptr,len} fat handle).  Inline forms need
+ * no free.  Heap form is `[u32 len][bytes]` from `arena`; release with
+ * `cc_slice_packed_release` when the arena uses heap-overflow (real malloc)
+ * so bytes can return.  Borrowed views are probe-only — do not insert them
+ * into maps.  CCString remains the growable owner.
+ *
+ * Tags (little-endian hosts):
+ *   inline: (w & 1) != 0; low byte = (len << 1) | 1, next len bytes payload
+ *   view:   (w & 3) == 2; w&~3 → CCSlicePackedView { len, data }
+ *   heap:   (w & 3) == 0; w → data, uint32_t len at data[-1]
+ */
+#ifndef CC_STD_SLICE_PACKED_H
+#define CC_STD_SLICE_PACKED_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+#include <ccc/cc_arena.h>
+#include <ccc/cc_slice.h>
+#include <ccc/cc_result.h>
+
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#error "CCSlicePacked requires little-endian (inline bytes live in the low address bytes)"
+#endif
+
+#ifndef CC_SLICE_PACKED_INLINE_MAX
+#define CC_SLICE_PACKED_INLINE_MAX ((int)sizeof(uintptr_t) - 1)
+#endif
+
+enum {
+    CC_SLICE_PACKED_TAG_INLINE = 1u,
+    CC_SLICE_PACKED_TAG_VIEW = 2u,
+};
+
+typedef struct CCSlicePacked {
+    uintptr_t w;
+} CCSlicePacked;
+
+/* Stack (or other short-lived) borrow target for map lookup keys. */
+typedef struct CCSlicePackedView {
+    uint32_t len;
+    const char *data;
+} CCSlicePackedView;
+
+#if UINTPTR_MAX == UINT64_MAX
+_Static_assert(sizeof(CCSlicePacked) == 8, "CCSlicePacked should be one pointer word");
+#endif
+_Static_assert(sizeof(CCSlicePacked) == sizeof(uintptr_t), "CCSlicePacked is pointer-sized");
+
+#ifndef CCResult_CCSlicePacked_CCError_DEFINED
+#define CCResult_CCSlicePacked_CCError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCSlicePacked_CCError_DEFINED
+#define CCResult_CCSlicePacked_CCError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCSlicePacked_CCError, CCSlicePacked, CCError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_CCSlicePacked_CCError, CCSlicePacked, CCError)
+#endif
+
+static inline unsigned char *cc__slice_packed_bytes(CCSlicePacked *r) {
+    return (unsigned char *)(void *)&r->w;
+}
+
+static inline const unsigned char *cc__slice_packed_bytes_const(const CCSlicePacked *r) {
+    return (const unsigned char *)(const void *)&r->w;
+}
+
+static inline CCSlicePacked cc_slice_packed_empty(void) {
+    CCSlicePacked r;
+    r.w = 0;
+    return r;
+}
+
+static inline int cc_slice_packed_is_inline(const CCSlicePacked *r) {
+    return r && (r->w & CC_SLICE_PACKED_TAG_INLINE) != 0;
+}
+
+static inline int cc_slice_packed_is_view(const CCSlicePacked *r) {
+    return r && (r->w & 3u) == CC_SLICE_PACKED_TAG_VIEW;
+}
+
+static inline int cc_slice_packed_is_empty(const CCSlicePacked *r) {
+    if (!r || r->w == 0) return 1;
+    if (cc_slice_packed_is_inline(r)) return (cc__slice_packed_bytes_const(r)[0] >> 1) == 0;
+    if (cc_slice_packed_is_view(r)) {
+        const CCSlicePackedView *v =
+            (const CCSlicePackedView *)(void *)(r->w & ~(uintptr_t)3u);
+        return !v || v->len == 0;
+    }
+    return 0;
+}
+
+/* Borrow `view` for the duration of its lifetime.  Do not insert into maps. */
+static inline CCSlicePacked cc_slice_packed_borrow(CCSlicePackedView *view) {
+    CCSlicePacked r;
+    r.w = (uintptr_t)view | CC_SLICE_PACKED_TAG_VIEW;
+    return r;
+}
+
+/* Fill `view` from `src` and return a borrow handle (same lifetime as `view`). */
+static inline CCSlicePacked cc_slice_packed_borrow_slice(CCSlicePackedView *view, CCSlice src) {
+    if (!view) return cc_slice_packed_empty();
+    view->len = (src.len > (size_t)UINT32_MAX) ? UINT32_MAX : (uint32_t)src.len;
+    view->data = (const char *)src.ptr;
+    return cc_slice_packed_borrow(view);
+}
+
+static inline int cc_slice_packed_is_durable(const CCSlicePacked *r) {
+    return r && !cc_slice_packed_is_view(r);
+}
+
+static inline CCSlicePacked cc__slice_packed_pack_inline(const char *p, uint32_t len) {
+    CCSlicePacked r;
+    unsigned char *b;
+    uint32_t i;
+    r.w = 0;
+    b = cc__slice_packed_bytes(&r);
+    b[0] = (unsigned char)((len << 1) | CC_SLICE_PACKED_TAG_INLINE);
+    for (i = 0; i < len; i++) b[1 + i] = (unsigned char)p[i];
+    return r;
+}
+
+static inline CCSlicePacked cc__slice_packed_from_heap_data(char *data) {
+    CCSlicePacked r;
+    r.w = (uintptr_t)data;
+    return r;
+}
+
+static inline uint32_t cc_slice_packed_len(const CCSlicePacked *r) {
+    if (!r || r->w == 0) return 0;
+    if (cc_slice_packed_is_inline(r)) return (uint32_t)(cc__slice_packed_bytes_const(r)[0] >> 1);
+    if (cc_slice_packed_is_view(r)) {
+        const CCSlicePackedView *v =
+            (const CCSlicePackedView *)(void *)(r->w & ~(uintptr_t)3u);
+        return v ? v->len : 0;
+    }
+    return ((uint32_t *)(void *)r->w)[-1];
+}
+
+/* Inline / view bytes are addressable only while `r` (and view) stay live. */
+static inline CCSlice cc_slice_packed_as_slice(const CCSlicePacked *r) {
+    if (!r || r->w == 0) return cc_slice_empty();
+    if (cc_slice_packed_is_inline(r)) {
+        const unsigned char *b = cc__slice_packed_bytes_const(r);
+        return cc_slice_from_buffer((void *)(uintptr_t)&b[1], (size_t)(b[0] >> 1));
+    }
+    if (cc_slice_packed_is_view(r)) {
+        const CCSlicePackedView *v =
+            (const CCSlicePackedView *)(void *)(r->w & ~(uintptr_t)3u);
+        if (!v || !v->data) return cc_slice_empty();
+        return cc_slice_from_buffer((void *)(uintptr_t)v->data, (size_t)v->len);
+    }
+    {
+        char *data = (char *)(void *)r->w;
+        uint32_t len = ((uint32_t *)(void *)data)[-1];
+        return cc_slice_from_buffer(data, (size_t)len);
+    }
+}
+
+static inline size_t CCSlicePacked_len(const CCSlicePacked *r) {
+    return (size_t)cc_slice_packed_len(r);
+}
+
+static inline CCSlice CCSlicePacked_as_slice(const CCSlicePacked *r) {
+    return cc_slice_packed_as_slice(r);
+}
+
+static inline int CCSlicePacked_is_inline(const CCSlicePacked *r) {
+    return cc_slice_packed_is_inline(r);
+}
+
+static inline int CCSlicePacked_is_empty(const CCSlicePacked *r) {
+    return cc_slice_packed_is_empty(r);
+}
+
+static inline int CCSlicePacked_is_view(const CCSlicePacked *r) {
+    return cc_slice_packed_is_view(r);
+}
+
+static inline int CCSlicePacked_is_durable(const CCSlicePacked *r) {
+    return cc_slice_packed_is_durable(r);
+}
+
+/* Copy `src` into a durable handle.  len <= INLINE_MAX stays inline (no arena).
+ * Larger payloads allocate [u32 len][bytes] in `arena` (SDS-style).
+ * Slice-first for UFCS: `src.to_packed(arena)`. */
+static inline CCResult_CCSlicePacked_CCError cc_slice_to_packed(CCSlice *src, CCArena *arena) {
+    CCSlice s;
+    CCSlicePacked r;
+    char *block;
+    char *data;
+    size_t need;
+    if (!src) {
+        return cc_err_CCResult_CCSlicePacked_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "CCSlicePacked to_packed without slice"));
+    }
+    s = *src;
+    if (s.len > (size_t)UINT32_MAX) {
+        return cc_err_CCResult_CCSlicePacked_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "CCSlicePacked length exceeds u32"));
+    }
+    if (s.len == 0) {
+        return cc_ok_CCResult_CCSlicePacked_CCError(cc_slice_packed_empty());
+    }
+    if (s.len <= (size_t)CC_SLICE_PACKED_INLINE_MAX) {
+        if (!s.ptr) {
+            return cc_err_CCResult_CCSlicePacked_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "CCSlicePacked inline without ptr"));
+        }
+        return cc_ok_CCResult_CCSlicePacked_CCError(
+            cc__slice_packed_pack_inline((const char *)s.ptr, (uint32_t)s.len));
+    }
+    if (!arena) {
+        return cc_err_CCResult_CCSlicePacked_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "CCSlicePacked heap form needs arena"));
+    }
+    if (!s.ptr) {
+        return cc_err_CCResult_CCSlicePacked_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "CCSlicePacked heap without ptr"));
+    }
+    need = sizeof(uint32_t) + s.len;
+    block = (char *)cc_arena_alloc(arena, need, sizeof(uint32_t));
+    if (!block) {
+        return cc_err_CCResult_CCSlicePacked_CCError(CC_ERROR(CC_ERR_OUT_OF_MEMORY, "CCSlicePacked arena alloc failed"));
+    }
+    {
+        uint32_t n = (uint32_t)s.len;
+        memcpy(block, &n, sizeof(n));
+    }
+    data = block + sizeof(uint32_t);
+    memcpy(data, s.ptr, s.len);
+    /* Heap tag requires (w & 3) == 0; 4-byte header keeps data 4-aligned. */
+    if (((uintptr_t)data & 3u) != 0) {
+        return cc_err_CCResult_CCSlicePacked_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "CCSlicePacked heap data misaligned"));
+    }
+    r = cc__slice_packed_from_heap_data(data);
+    return cc_ok_CCResult_CCSlicePacked_CCError(r);
+}
+
+static inline CCResult_CCSlicePacked_CCError CCSlice_to_packed(CCSlice *src, CCArena *arena) {
+    return cc_slice_to_packed(src, arena);
+}
+
+/* Release heap-form payload into `arena` (no-op for inline / empty / view).
+ * Heap block starts at `data - sizeof(u32)`; requires an arena that can
+ * release individual allocs (heap-overflow or last-live slab reclaim). */
+static inline void cc_slice_packed_release(CCArena *arena, CCSlicePacked *r) {
+    char *data;
+    char *block;
+    if (!r) return;
+    if (!arena || cc_slice_packed_is_empty(r) || cc_slice_packed_is_inline(r) ||
+        cc_slice_packed_is_view(r)) {
+        r->w = 0;
+        return;
+    }
+    data = (char *)(void *)r->w;
+    block = data - (ptrdiff_t)sizeof(uint32_t);
+    (void)cc_arena_release(arena, block);
+    r->w = 0;
+}
+
+/* Bytes + length without building a CCSlice (hot map probe path). */
+static inline const char *cc_slice_packed_data_len(const CCSlicePacked *r,
+                                                  uint32_t *out_len) {
+    if (!r || r->w == 0) {
+        if (out_len) *out_len = 0;
+        return NULL;
+    }
+    if (cc_slice_packed_is_inline(r)) {
+        const unsigned char *b = cc__slice_packed_bytes_const(r);
+        uint32_t len = (uint32_t)(b[0] >> 1);
+        if (out_len) *out_len = len;
+        return len ? (const char *)&b[1] : NULL;
+    }
+    if (cc_slice_packed_is_view(r)) {
+        const CCSlicePackedView *v =
+            (const CCSlicePackedView *)(void *)(r->w & ~(uintptr_t)3u);
+        if (!v) {
+            if (out_len) *out_len = 0;
+            return NULL;
+        }
+        if (out_len) *out_len = v->len;
+        return v->data;
+    }
+    {
+        char *data = (char *)(void *)r->w;
+        uint32_t len = ((uint32_t *)(void *)data)[-1];
+        if (out_len) *out_len = len;
+        return data;
+    }
+}
+
+static inline size_t cc_map_hash_slice_packed(CCSlicePacked r) {
+    uint32_t len = 0;
+    const unsigned char *p =
+        (const unsigned char *)cc_slice_packed_data_len(&r, &len);
+    size_t h = 2166136261U;
+    size_t i;
+    for (i = 0; i < (size_t)len; ++i) h ^= p[i], h *= 16777619;
+    /* Murmur-style finalizer so high bits (ArrayMap hash frag) avalanche. */
+    h ^= h >> 16;
+    h *= (size_t)0x85ebca6bu;
+    h ^= h >> 13;
+    h *= (size_t)0xc2b2ae35u;
+    h ^= h >> 16;
+    return h;
+}
+
+static inline int cc_map_eq_slice_packed(CCSlicePacked a, CCSlicePacked b) {
+    uint32_t la = 0;
+    uint32_t lb = 0;
+    const char *pa;
+    const char *pb;
+    if (a.w == b.w) return 1;
+    /* Inline packs full payload in `w`; unequal words ⇒ unequal keys. */
+    if (cc_slice_packed_is_inline(&a) && cc_slice_packed_is_inline(&b)) return 0;
+    pa = cc_slice_packed_data_len(&a, &la);
+    pb = cc_slice_packed_data_len(&b, &lb);
+    if (la != lb) return 0;
+    if (la == 0) return 1;
+    return pa && pb && memcmp(pa, pb, (size_t)la) == 0;
+}
+
+#endif /* CC_STD_SLICE_PACKED_H */

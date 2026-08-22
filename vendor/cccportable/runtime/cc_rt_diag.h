@@ -1,0 +1,98 @@
+#ifndef CC_RT_DIAG_H
+#define CC_RT_DIAG_H
+
+#include <stdint.h>
+#include <stdio.h>
+
+typedef struct CCRuntimeSourceLoc {
+    const char* file;
+    int line;
+    int col;
+    const char* construct;
+    const char* user_name;
+} CCRuntimeSourceLoc;
+
+/* R0: load serialized source map companion (.ccs.map) */
+int cc_rt_diag_load_map(const char* map_path);
+
+int cc_rt_resolve_pc(void* pc, CCRuntimeSourceLoc* out);
+
+void cc_rt_diag_set_async_name(const char* cc_name, const char* file, int line);
+void cc_rt_diag_set_channel_meta(const char* name, const char* topology,
+                                 const char* file, int line);
+
+/* R1 — answer "what async task am I running inside?" from any code that
+ * runs on a CC scheduler fiber.  Reads the per-fiber metadata stamped
+ * by `cc_nursery_spawn_async_named` (via `cc__nursery_async_runner` on
+ * fiber entry).  Falls back to the process-global `g_last_async` slot
+ * (set by `cc_rt_diag_set_async_name`) when called outside fiber
+ * context, so the API still gives useful answers from main/tests.
+ *
+ * Returns 1 if any field was populated, 0 if no name is currently
+ * associated with the caller's fiber and the global slot is empty.
+ * Either out_* pointer may be NULL. */
+int cc_rt_diag_current_async_info(const char** out_name,
+                                  const char** out_file,
+                                  int* out_line);
+
+/* R2 — query the creation-site diagnostic metadata recorded on a
+ * channel.  The setter `cc_chan_set_diag_meta` is invoked once per
+ * channel by the spawn-site lowering (`pass_channel_syntax.c`); the
+ * deadlock detector (`sched_v2_check_deadlock`) prints the meta when
+ * a parked fiber's `park_reason` starts with `chan_`.  This function
+ * exposes the same data to user code (e.g. a custom diagnostic print)
+ * without needing to include the runtime's private channel header.
+ *
+ * Returns 1 if any field was populated, 0 if the channel was created
+ * outside the lowered path (e.g. via `cc_chan_create` directly from
+ * C code) or `ch` is NULL.  Any out_* pointer may be NULL. */
+struct CCChan;
+int cc_rt_diag_channel_meta(const struct CCChan* ch,
+                            const char** out_name,
+                            const char** out_file,
+                            int* out_line);
+
+/* ----------------------------------------------------------------------
+ * R3 — `!>` source-location propagation chain.
+ *
+ * Every `!>` propagation site emits a call to `cc_rt_diag_record_unwrap_site`
+ * (wired in `cc_result.cch`'s `__cc_uw_err_at` macro and the per-TU
+ * enumerated `_Generic` arms in `visit_codegen.c`).  The chain records the
+ * `(file, line)` pairs of the most recent N propagation sites in
+ * chronological push order, so when an error bubbles up to an
+ * `@errhandler` (or to `main`), the handler can walk the chain and show
+ * the user *where* the error trickled through.
+ *
+ * Strings are not copied — callers pass C string literals embedded in the
+ * lowered C (so they live for the program's lifetime).  No allocation,
+ * no formatting on the hot propagation path; just two pointer stores.
+ *
+ * The chain is a process-global ring buffer for now.  Multi-threaded
+ * programs will see interleaving; revisit with `_Thread_local` storage
+ * once we have a real multi-thread test.  Single-thread fiber programs
+ * (the common case today) get the natural chain.
+ *
+ * `line_str` is the line number as a C string literal (matches the
+ * other unwrap-site macros which already produce a stringified line).
+ * Storing it as a string avoids re-parsing/formatting at print time. */
+
+#ifndef CC_RT_DIAG_UNWRAP_CHAIN_MAX
+#define CC_RT_DIAG_UNWRAP_CHAIN_MAX 16
+#endif
+
+void cc_rt_diag_record_unwrap_site(const char* file, const char* line_str);
+void cc_rt_diag_clear_unwrap_chain(void);
+int  cc_rt_diag_unwrap_chain_len(void);
+/* Returns 0 on success, -1 if i is out of range.  Either out_* pointer may be NULL. */
+int  cc_rt_diag_unwrap_site(int i, const char** out_file, const char** out_line_str);
+/* Print "  propagated through <file>:<line>\n" for each chain entry (oldest first).
+ * No-op for an empty chain.  `fp` may be NULL (defaults to stderr). */
+void cc_rt_diag_print_unwrap_chain(FILE* fp);
+
+/* The most recent `!>` / `?>` site as "file:line" — the unwrap that routed
+ * the error the handler is holding, which is always current even when the
+ * chain carries older propagations.  "" when nothing has been recorded.
+ * The pointer is a process-static buffer, valid until the next call. */
+const char* cc_error_site(void);
+
+#endif

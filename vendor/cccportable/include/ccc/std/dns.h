@@ -1,0 +1,46 @@
+/*
+ * Concurrent-C DNS Resolution
+ * <std/dns.h>
+ *
+ * Async DNS resolution. Uses system resolver by default.
+ */
+#ifndef CC_STD_DNS_H
+#define CC_STD_DNS_H
+
+#include <ccc/cc_arena.h>
+#include <ccc/cc_slice.h>
+#include "net.h"
+
+#include <stdint.h>
+#include <stddef.h>
+
+/* ============================================================================
+ * DNS Resolution
+ * ============================================================================ */
+
+/* Resolve hostname to IP addresses.
+ * Returns slice of CCIpAddr allocated in arena.
+ * Empty slice (len=0) means no addresses found. */
+CCSlice cc_dns_lookup(CCArena* arena, const char* hostname, size_t hostname_len, CCNetError* out_err);
+
+/* Async DNS lookup */
+/* @async CCSlice cc_dns_lookup_async(CCArena* arena, const char* hostname, size_t hostname_len, CCNetError* out_err); */
+
+/* Resolve with specific address family preference */
+typedef enum CCDnsFamily {
+    CC_DNS_ANY = 0,     /* Return all addresses */
+    CC_DNS_IPV4 = 4,    /* Prefer/filter IPv4 */
+    CC_DNS_IPV6 = 6,    /* Prefer/filter IPv6 */
+} CCDnsFamily;
+
+CCSlice cc_dns_lookup_family(CCArena* arena, const char* hostname, size_t hostname_len,
+                              CCDnsFamily family, CCNetError* out_err);
+
+/* ============================================================================
+ * Reverse DNS
+ * ============================================================================ */
+
+/* Reverse lookup: IP address to hostname */
+CCSlice cc_dns_reverse(CCArena* arena, const CCIpAddr* addr, CCNetError* out_err);
+
+#endif /* CC_STD_DNS_H */

@@ -1,0 +1,210 @@
+/*
+ * CC closure ABI (early, minimal).
+ *
+ * This is the foundation for:
+ * - `() => { ... }` closures (capture-by-copy)
+ * - passing closures into runtimes (nursery spawn, blocking executor, etc.)
+ *
+ * NOTE: For now we only standardize a 0-arg closure returning void* (like pthread).
+ * Higher-arity + typed closures will layer on top as compiler support grows.
+ */
+#ifndef CC_CLOSURE_H
+#define CC_CLOSURE_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#if !defined(CC_PARSER_MODE) && !defined(CC_TASK_DEFINED)
+typedef struct CCTask CCTask;
+#endif
+
+/* TSan annotations for closure make functions */
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+#if defined(__SANITIZE_THREAD__) || __has_feature(thread_sanitizer)
+extern void __tsan_write8(void* addr);
+extern void __tsan_read8(void* addr);
+/* Mark writes to local struct as benign - these are thread-local stack writes */
+#define TSAN_IGNORE_LOCAL_WRITE(addr) do { \
+    __tsan_write8(addr); \
+    __tsan_read8(addr); \
+} while(0)
+#else
+#define TSAN_IGNORE_LOCAL_WRITE(addr) ((void)0)
+#endif
+
+/* Forward declaration to avoid include cycles (`cc_nursery.cch` may include runtime types). */
+typedef struct CCNurseryHost CCNurseryHost;
+
+#if defined(CC_PARSER_MODE)
+/* TCC parse-to-stub-AST runs after preprocessing. For CC syntax like `() => {}`,
+   we intentionally use a dummy type so the C parser doesn't reject otherwise-valid CC code.
+   The real ABI type is used for the final emitted C compilation.
+   Using intptr_t allows pointer return values without warnings. */
+typedef intptr_t CCClosure0;
+#define CCClosure1 CCClosure0
+#define CCClosure2 CCClosure0
+#define CCAsyncClosure0 CCClosure0
+#else
+typedef struct {
+    void* (*fn)(void* env);
+    void* env;
+    void (*drop)(void* env); /* optional; can be NULL */
+} CCClosure0;
+
+typedef struct {
+    void* (*fn)(void* env, intptr_t arg0);
+    void* env;
+    void (*drop)(void* env); /* optional; can be NULL */
+} CCClosure1;
+
+typedef struct {
+    void* (*fn)(void* env, intptr_t arg0, intptr_t arg1);
+    void* env;
+    void (*drop)(void* env); /* optional; can be NULL */
+} CCClosure2;
+
+typedef struct {
+    void (*start)(void* env, void* out_task); /* writes a CCTask into out_task */
+    void* env;
+    void (*drop)(void* env); /* optional; can be NULL */
+} CCAsyncClosure0;
+#endif
+
+#if defined(__SANITIZE_THREAD__) || (defined(__has_feature) && __has_feature(thread_sanitizer))
+/* TSan can report false positives on local stack writes in tiny inline helpers.
+   These helpers only touch a local struct, so suppressing TSan here is safe.
+   
+   To validate this suppression is safe:
+   1. Run tests/tsan_closure_make_stress.c with TSan enabled
+   2. If TSan reports races, investigate: either the suppression is masking a real
+      race, or TSAN_IGNORE_LOCAL_WRITE usage needs adjustment
+   3. Expected: No TSan errors (suppression is safe for thread-local stack writes) */
+#define CC_TSAN_NOSAN_FN __attribute__((no_sanitize("thread")))
+#else
+#define CC_TSAN_NOSAN_FN
+#endif
+
+/* Run a closure on a blocking OS thread and wait for completion.
+   Early stub: implemented via pthread spawn + join. */
+int cc_run_blocking_closure0(CCClosure0 c);
+
+/* Run a closure on a blocking OS thread and return its `void*` result. */
+void* cc_run_blocking_closure0_ptr(CCClosure0 c);
+
+
+/* Pooled allocator for closure-literal environments: CCArenaPool size
+ * classes (thread-local, cross-thread free safe), malloc above the largest
+ * class.  The generated make/drop pair calls these with sizeof(env), so no
+ * per-block header is needed.  Runtime-owned; user code does not call
+ * these directly. */
+void* cc_closure_env_alloc(size_t size);
+void cc_closure_env_free(void* p, size_t size);
+
+/* Closures are single-shot: cc_closureN_call invokes fn once and then
+ * releases the environment via drop.  A closure that is never called must
+ * instead be released exactly once with cc_closureN_drop — otherwise a
+ * pooled environment (the closure-literal lowering) leaks. */
+static inline void cc_closure0_drop(CCClosure0 c) {
+#if defined(CC_PARSER_MODE)
+    (void)c;
+#else
+    if (c.drop) (c.drop)(c.env);
+#endif
+}
+static inline void cc_closure1_drop(CCClosure1 c) {
+#if defined(CC_PARSER_MODE)
+    (void)c;
+#else
+    if (c.drop) (c.drop)(c.env);
+#endif
+}
+static inline void cc_closure2_drop(CCClosure2 c) {
+#if defined(CC_PARSER_MODE)
+    (void)c;
+#else
+    /* Parenthesize the field: `c.drop(c.env)` is a UFCS site and rewrites
+     * to `cc_closureN_drop(&c, c.env)` when another header's call site
+     * makes the wrapper look like a real callee. */
+    if (c.drop) (c.drop)(c.env);
+#endif
+}
+
+/* Invoke a 0-arg closure.  Useful when the closure is stored in a struct
+ * field or any expression the compiler's closure-call rewriter does not
+ * recognize (it only rewrites bare-identifier callees — see
+ * cc/src/visitor/pass_closure_calls.c).  Prefer this over `c.fn(c.env)`
+ * so the call site compiles in parser mode, where CCClosure0 is stubbed
+ * to intptr_t. */
+void* cc_closure0_call(CCClosure0 c);
+/* Invoke a 1-arg closure. */
+void* cc_closure1_call(CCClosure1 c, intptr_t arg0);
+/* Invoke a 2-arg closure. */
+void* cc_closure2_call(CCClosure2 c, intptr_t arg0, intptr_t arg1);
+
+/* Spawn arity-1/2 closures in a nursery (bridge for `spawn(c, arg...)`). */
+int cc_nursery_spawn_closure1(CCNurseryHost* n, CCClosure1 c, intptr_t arg0);
+int cc_nursery_spawn_closure2(CCNurseryHost* n, CCClosure2 c, intptr_t arg0, intptr_t arg1);
+
+static inline CC_TSAN_NOSAN_FN CCClosure0 cc_closure0_make(void* (*fn)(void*), void* env, void (*drop)(void*)) {
+#if defined(CC_PARSER_MODE)
+    (void)fn; (void)env; (void)drop;
+    return 0;
+#else
+    CCClosure0 c;
+    /* TSan: Mark writes to local struct as benign (thread-local stack memory) */
+    TSAN_IGNORE_LOCAL_WRITE(&c);
+    c.fn = fn;
+    c.env = env;
+    c.drop = drop;
+    return c;
+#endif
+}
+
+static inline CC_TSAN_NOSAN_FN CCClosure1 cc_closure1_make(void* (*fn)(void*, intptr_t), void* env, void (*drop)(void*)) {
+#if defined(CC_PARSER_MODE)
+    (void)fn; (void)env; (void)drop;
+    return 0;
+#else
+    CCClosure1 c;
+    /* TSan: Mark writes to local struct as benign (thread-local stack memory) */
+    TSAN_IGNORE_LOCAL_WRITE(&c);
+    c.fn = fn;
+    c.env = env;
+    c.drop = drop;
+    return c;
+#endif
+}
+
+static inline CC_TSAN_NOSAN_FN CCClosure2 cc_closure2_make(void* (*fn)(void*, intptr_t, intptr_t), void* env, void (*drop)(void*)) {
+#if defined(CC_PARSER_MODE)
+    (void)fn; (void)env; (void)drop;
+    return 0;
+#else
+    CCClosure2 c;
+    /* TSan: Mark writes to local struct as benign (thread-local stack memory) */
+    TSAN_IGNORE_LOCAL_WRITE(&c);
+    c.fn = fn;
+    c.env = env;
+    c.drop = drop;
+    return c;
+#endif
+}
+
+static inline CC_TSAN_NOSAN_FN CCAsyncClosure0 cc_async_closure0_make(void (*start)(void*, void*), void* env, void (*drop)(void*)) {
+#if defined(CC_PARSER_MODE)
+    (void)start; (void)env; (void)drop;
+    return 0;
+#else
+    CCAsyncClosure0 c;
+    TSAN_IGNORE_LOCAL_WRITE(&c);
+    c.start = start;
+    c.env = env;
+    c.drop = drop;
+    return c;
+#endif
+}
+
+#endif /* CC_CLOSURE_H */
+

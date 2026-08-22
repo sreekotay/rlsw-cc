@@ -1,0 +1,640 @@
+/*
+ * Slice ABI and helpers.
+ *
+ * Layout matches the codegen contract: {ptr,len,id} (24 bytes on 64-bit).
+ * - ptr  : data pointer (`char*` so `s.ptr[i]` indexes bytes; ABI width matches `T*`)
+ * - len  : logical length of the view
+ * - id   : provenance/uniqueness token (0 if not tracked)
+ *
+ * Capacity of a backing allocation is not part of this ABI. Subslice /
+ * send_take eligibility uses `id` flags (`CC_SLICE_ID_SUBSLICE`, uniqueness,
+ * transferability) plus `len` — not a preserved available-length field.
+ *
+ * Most helpers are header-only. FFI adopt (`cc_adopt`) + `cc_slice_destroy`
+ * need a small runtime registry (see cc/runtime/slice_adopt.c).
+ *
+ * Provenance axes:
+ * - Untracked (id==0 / from_buffer): no lifetime help; raw ptr+len.
+ * - Arena/static views: tracked, no per-slice destructor.
+ * - adopt(): unique + registered deleter; s.destroy() / !> @destroy calls it
+ *   once. The deleter itself is trusted (wrong free is still expressible).
+ */
+#ifndef CC_SLICE_H
+#define CC_SLICE_H
+
+#include <ccc/cc_compat.h>
+#include <stddef.h>
+#include <string.h>
+#include <ctype.h>
+
+// Explicit "untracked" id - signals this slice has no provenance tracking.
+// Use sparingly: passing untracked slices through channels or storing them
+// in data structures can lead to use-after-free if the backing memory is freed.
+#ifndef CC_SLICE_ID_UNTRACKED
+#define CC_SLICE_ID_UNTRACKED 0ULL
+#endif
+
+// Slice id bit layout (matches spec):
+// Bits 0–60 : allocation id (non-zero for tracked allocations)
+// Bit 61    : is_transferable
+// Bit 62    : is_subslice
+// Bit 63    : is_unique (has destructor, move-only)
+#define CC_SLICE_ID_ALLOC_MASK 0x1FFFFFFFFFFFFFFFULL
+#define CC_SLICE_ID_TRANSFERABLE (1ULL << 61)
+#define CC_SLICE_ID_SUBSLICE     (1ULL << 62)
+#define CC_SLICE_ID_UNIQUE       (1ULL << 63)
+/* Distinguished static/build-time canonical allocation class for `@slice("...")`
+   and other interned sentinel string views. */
+#define CC_SLICE_ID_CANONICAL_ALLOC CC_SLICE_ID_ALLOC_MASK
+
+typedef struct {
+    /* `char*` so `s.ptr[i]` is a well-formed byte Gap (not void-typed). */
+    char *ptr;
+    size_t len;
+    uint64_t id;   // allocation id | flags
+} CCSlice;
+
+/* Unnamed facet (enforced by shadow_lower for the whole slice family —
+ * CCSlice / Unique / Shared / Packed / Hdr / CCSlice_T). Ordinary sites:
+ * field loads + UFCS OK; field stores denied. First-param CCSlice* bodies
+ * are trusted (stdlib + user methods). Equivalent surface:
+ *   @typeview on CCSlice { r: *; };
+ * (Not written live here: angle-includes are host-C passthrough.) */
+
+/* Surface type sugar:
+   - `T[:]`   lowers to `CCSlice`
+   - `T[n:]`  lowers to `CCSlice`
+   - `T[:k]`  lowers to `CCSlice`
+   - `T[:k!]` lowers to `CCSliceUnique`
+   - legacy `T[:!]` still lowers to `CCSliceUnique` (ABI-identical to CCSlice)
+   - `CCSliceShared` is a semantic marker for shared tracked slices; both
+     marker types use the common `cc_slice_*` ABI. */
+typedef CCSlice CCSliceUnique;
+typedef CCSlice CCSliceShared;
+
+/* Typed slice instances — generic over the element type. `T[:]` with a
+ * non-char element type (and `CCSlice::[T]`) names `CCSlice_<mangled T>`,
+ * a distinct struct embedding the erased core:
+ *
+ *   typedef struct CCSlice_double { CCSlice base; } CCSlice_double;
+ *
+ * The instance name carries the element type at compile time; `.base`
+ * is the visible erasure spelling; one family face
+ * `@typeview on CCSlice_* { as: base; }` (after the scalar instances)
+ * supplies method retry into the byte helpers and arg-position autocast.
+ * Element-wise methods and the scaled `bytes()` view come from the
+ * `CC_GENERIC_FACTORY(CCSlice, 1)` body below, with sizeof(T) in hand.
+ * `len` on a typed slice counts ELEMENTS; `bytes()` converts to an
+ * honestly byte-measured CCSlice. char slices stay bare CCSlice
+ * (bytes are their elements).
+ *
+ * Common scalar instances are pre-declared below. Any other element
+ * type auto-instantiates at first `T[:]` / `CCSlice::[T]` use — the
+ * compiler splices the factory body after the element's definition.
+ * Hand instantiation (for plain-C consumers, or multi-token element
+ * spellings) is one line and suppresses the splice:
+ *
+ *   CC_DECL_SLICE(Point)                            single-token element
+ *   CC_DECL_SLICE_SPEC(CCSlice_long_long, long long)  explicit instance name
+ *
+ * Members are `NAME##_<member>` — the same instance-prefix convention
+ * as Vec and Map families. Header lowering strips `@typeview` and
+ * `CC_GENERIC_FACTORY` from `.h` (faces and the factory remain
+ * Concurrent-C / shadow facts). */
+#define CC_DECL_SLICE_SPEC(NAME, T)                                            \
+    typedef struct NAME {                                                      \
+        CCSlice base;                                                          \
+    } NAME;                                                                    \
+    static inline NAME NAME##_from_buffer(T *p, size_t count) {                \
+        NAME s;                                                                \
+        s.base = cc_slice_from_buffer((void *)p, count);                       \
+        return s;                                                              \
+    }                                                                          \
+    static inline size_t NAME##_len(NAME *s) { return s ? s->base.len : 0; }   \
+    static inline T NAME##_at(NAME *s, size_t i) {                             \
+        return ((T *)s->base.ptr)[i];                                          \
+    }                                                                          \
+    static inline NAME NAME##_sub(NAME *s, size_t a, size_t b) {               \
+        NAME r;                                                                \
+        size_t n = s ? s->base.len : 0;                                        \
+        if (a > n) a = n;                                                      \
+        if (b > n) b = n;                                                      \
+        if (b < a) b = a;                                                      \
+        r.base.ptr = s ? s->base.ptr + a * sizeof(T) : 0;                      \
+        r.base.len = b - a;                                                    \
+        r.base.id = s ? ((s->base.id & ~CC_SLICE_ID_UNIQUE) |                  \
+                         ((a != 0 || b != n ||                                 \
+                           (s->base.id & CC_SLICE_ID_SUBSLICE))                \
+                              ? CC_SLICE_ID_SUBSLICE                           \
+                              : 0))                                            \
+                      : 0;                                                     \
+        return r;                                                              \
+    }                                                                          \
+    /* Honest byte view: len scales by sizeof(T). */                           \
+    static inline CCSlice NAME##_bytes(NAME *s) {                              \
+        CCSlice r = {0};                                                       \
+        if (!s) return r;                                                      \
+        r = s->base;                                                           \
+        r.len *= sizeof(T);                                                    \
+        return r;                                                              \
+    }
+
+/* Single-token convenience: CC_DECL_SLICE(Point) → CCSlice_Point. */
+#define CC_DECL_SLICE(T) CC_DECL_SLICE_SPEC(CCSlice_##T, T)
+
+/* Factory bodies are harvested from this `.cch` (blanked from the lowered `.h`).
+ * `T[:]` and `CCSlice::[T]` instantiate this family; char stays bare CCSlice.
+ * The body matches `CC_DECL_SLICE_SPEC(${mangled}, ${arg(0)})`. */
+                                
+                  
+                           
+                                               
+                                                               
+                                                               
+                                                                
+ 
+                          
+                               
+                                 
+      
+      
+                           
+                 
+             
+                                                                             
+                 
+                                                    
+             
+ 
+                                                                                  
+                                                                
+                                         
+ 
+                                                                            
+                 
+                                   
+                     
+                     
+                     
+                                                             
+                       
+                                                         
+                                          
+                                                           
+                                                
+                               
+                      
+             
+ 
+                                                       
+                    
+                     
+                
+                               
+             
+           
+ 
+
+/* Scalar instances are declared after cc_slice_from_buffer below. */
+
+/* Untracked {ptr,len} view — the lean wire/borrow face.
+ * Schema `bytes` binds emit this (no id). Convert with:
+ *   s.hdr()           CCSlice → CCSliceHdr   (drop provenance)
+ *   h.as_slice()      CCSliceHdr → CCSlice   (untracked widen; family twin of
+ *                                            packed/vec/string `.as_slice()`)
+ *   h.slice()         alias of as_slice
+ *   hdr_from_buffer   construct Hdr without a full CCSlice detour */
+typedef struct {
+    char *ptr;
+    size_t len;
+} CCSliceHdr;
+
+static inline CCSliceHdr cc_slice_hdr_from_buffer(void *ptr, size_t len) {
+    CCSliceHdr h = { (char *)ptr, len };
+    return h;
+}
+
+static inline CCSliceHdr cc_slice_hdr(CCSlice *s) {
+    CCSliceHdr h = {0};
+    if (!s) return h;
+    h.ptr = s->ptr;
+    h.len = s->len;
+    return h;
+}
+
+/* UFCS: `slice.hdr()` → `CCSlice_hdr(&slice)`. */
+static inline CCSliceHdr CCSlice_hdr(CCSlice *s) { return cc_slice_hdr(s); }
+
+static inline CCSlice cc_slice_empty(void) {
+    CCSlice s = {0};
+    return s;
+}
+
+static inline uint64_t cc_slice_make_id(uint64_t alloc_id, bool unique, bool transferable, bool is_sub) {
+    uint64_t id = (alloc_id & CC_SLICE_ID_ALLOC_MASK);
+    if (unique) id |= CC_SLICE_ID_UNIQUE;
+    if (transferable) id |= CC_SLICE_ID_TRANSFERABLE;
+    if (is_sub) id |= CC_SLICE_ID_SUBSLICE;
+    return id;
+}
+
+static inline uint64_t cc_slice_clear_flags(uint64_t id, uint64_t flags) {
+    return id & ~flags;
+}
+
+static inline bool cc_slice_is_unique_id(uint64_t id) { return (id & CC_SLICE_ID_UNIQUE) != 0; }
+static inline bool cc_slice_is_transferable_id(uint64_t id) { return (id & CC_SLICE_ID_TRANSFERABLE) != 0; }
+static inline bool cc_slice_is_subslice_id(uint64_t id) { return (id & CC_SLICE_ID_SUBSLICE) != 0; }
+static inline bool cc_slice_is_canonical_id(uint64_t id) {
+    return (id & CC_SLICE_ID_ALLOC_MASK) == CC_SLICE_ID_CANONICAL_ALLOC;
+}
+static inline uint64_t cc_slice_alloc_id(uint64_t id) { return id & CC_SLICE_ID_ALLOC_MASK; }
+static inline bool cc_slice_is_untracked_id(uint64_t id) { return id == CC_SLICE_ID_UNTRACKED; }
+static inline bool cc_slice_is_unique(CCSlice s) { return cc_slice_is_unique_id(s.id); }
+static inline bool cc_slice_is_transferable(CCSlice s) { return cc_slice_is_transferable_id(s.id); }
+static inline bool cc_slice_is_subslice(CCSlice s) { return cc_slice_is_subslice_id(s.id); }
+static inline bool cc_slice_is_canonical(CCSlice s) { return cc_slice_is_canonical_id(s.id); }
+static inline bool cc_slice_is_untracked(CCSlice s) { return cc_slice_is_untracked_id(s.id); }
+
+static inline CCSlice cc_slice_from_buffer(void *ptr, size_t len) {
+    // Creates an UNTRACKED slice. Treat this as unknown lifetime at channel or
+    // async boundaries; use cc_slice_from_static for immortal/static storage.
+    CCSlice s = {ptr, len, CC_SLICE_ID_UNTRACKED};
+    return s;
+}
+
+static inline CCSlice cc_slice_from_static(void *ptr, size_t len) {
+    CCSlice s = {ptr, len, cc_slice_make_id(CC_SLICE_ID_CANONICAL_ALLOC, false, false, false)};
+    return s;
+}
+
+/* Widen Hdr → untracked CCSlice (id=0). Family name matches
+ * packed/vec/string `.as_slice()`. */
+static inline CCSlice cc_slice_hdr_as_slice(const CCSliceHdr *sh) {
+    if (!sh) return cc_slice_empty();
+    return cc_slice_from_buffer(sh->ptr, sh->len);
+}
+
+static inline CCSlice CCSliceHdr_as_slice(const CCSliceHdr *sh) {
+    return cc_slice_hdr_as_slice(sh);
+}
+
+/* Aliases: older spelling + short UFCS `.slice()`. */
+static inline CCSlice cc_slice_hdr_slice(const CCSliceHdr *sh) {
+    return cc_slice_hdr_as_slice(sh);
+}
+static inline CCSlice CCSliceHdr_slice(const CCSliceHdr *sh) {
+    return cc_slice_hdr_as_slice(sh);
+}
+
+CC_DECL_SLICE(short)
+CC_DECL_SLICE(int)
+CC_DECL_SLICE(long)
+CC_DECL_SLICE_SPEC(CCSlice_long_long, long long)
+CC_DECL_SLICE(int16_t)
+CC_DECL_SLICE(int32_t)
+CC_DECL_SLICE(int64_t)
+CC_DECL_SLICE(uint16_t)
+CC_DECL_SLICE(uint32_t)
+CC_DECL_SLICE(uint64_t)
+CC_DECL_SLICE(float)
+CC_DECL_SLICE(double)
+
+/* Family is-a face: every `CCSlice_*` instance embeds `CCSlice base`. */
+
+
+static inline CCSlice cc_slice_from_parts(void *ptr, size_t len, uint64_t id) {
+    CCSlice s = {ptr, len, id};
+    return s;
+}
+
+/* Counted char* → untracked view. Prefer for buffers with a known length.
+ * UFCS: `p->to_slice_n(n)` → char_to_slice_n / const_char_to_slice_n. */
+static inline CCSlice char_to_slice_n(const char *p, size_t n) {
+    if (!p) return cc_slice_empty();
+    return cc_slice_from_buffer((void *)p, n);
+}
+
+static inline CCSlice const_char_to_slice_n(const char *p, size_t n) {
+    return char_to_slice_n(p, n);
+}
+
+/* Multi-word / signedness variants from UFCS type mangling. */
+static inline CCSlice unsigned_char_to_slice_n(const unsigned char *p, size_t n) {
+    return char_to_slice_n((const char *)p, n);
+}
+static inline CCSlice signed_char_to_slice_n(const signed char *p, size_t n) {
+    return char_to_slice_n((const char *)p, n);
+}
+static inline CCSlice const_unsigned_char_to_slice_n(const unsigned char *p,
+                                                    size_t n) {
+    return unsigned_char_to_slice_n(p, n);
+}
+static inline CCSlice const_signed_char_to_slice_n(const signed char *p,
+                                                  size_t n) {
+    return signed_char_to_slice_n(p, n);
+}
+
+/* NUL-terminated C string → untracked view (strlen). No UFCS — call this
+ * only at a trust boundary where the pointer is known to be a cstr. Prefer
+ * literal init / @slice for literals and to_slice_n for counted buffers. */
+static inline CCSlice cc_slice_cstr(const char *cstr) {
+    if (!cstr) return cc_slice_empty();
+    return cc_slice_from_buffer((void *)cstr, strlen(cstr));
+}
+
+/* String literal → canonical static slice. `lit` must be a string literal
+ * token so sizeof(lit) is the array size (includes NUL). Concurrent-C surface
+ * prefers `char[:0] s = "…"` (or `@slice("…")`); both lower to this form.
+ * Host C may call `CC_SLICE_LIT` directly. */
+#define CC_SLICE_LIT(lit) \
+    cc_slice_from_static((void *)(lit), sizeof(lit) - 1u)
+
+static inline bool CCSlice_is_empty(CCSlice* s) {
+    return !s || s->len == 0;
+}
+static inline bool cc_slice_is_empty(CCSlice* s) { return CCSlice_is_empty(s); }
+
+static inline CCSlice cc__slice_sub_value(CCSlice s, size_t start, size_t end) {
+    if (start > end || end > s.len) {
+        return cc_slice_empty();
+    }
+    uint8_t *base = (uint8_t *)s.ptr;
+    uint64_t id = cc_slice_clear_flags(s.id, CC_SLICE_ID_UNIQUE);
+    /* Full-range of a non-subslice keeps is_subslice clear; any proper
+     * subrange, or a full-range of an existing subslice, sets it. */
+    bool covers_full = (start == 0) && (end == s.len) && !cc_slice_is_subslice_id(s.id);
+    if (covers_full) {
+        id = cc_slice_clear_flags(id, CC_SLICE_ID_SUBSLICE);
+    } else {
+        id |= CC_SLICE_ID_SUBSLICE;
+    }
+    CCSlice sub = {
+        .ptr = base ? (char *)(base + start) : NULL,
+        .len = end - start,
+        .id = id,
+    };
+    return sub;
+}
+
+/* Typed accessors for common uses (UFCS: s.str(), s.bytes()) */
+static inline const char* cc_slice_str(CCSlice* s) {
+    return (const char*)s->ptr;
+}
+
+static inline const uint8_t* cc_slice_bytes(CCSlice* s) {
+    return (const uint8_t*)s->ptr;
+}
+
+/* ---- Aggregate slice array ---- */
+
+#ifndef CC_CCSLICEARRAY_DEFINED
+#define CC_CCSLICEARRAY_DEFINED 1
+typedef struct {
+    CCSlice *items;
+    size_t len;
+} CCSliceArray;
+#endif
+
+/* UFCS: arr.len(), arr.get(i) → element char[:0] / CCSlice (empty if OOB). */
+static inline size_t cc_slice_array_len(const CCSliceArray *a) {
+    return a ? a->len : 0;
+}
+
+static inline CCSlice cc_slice_array_get(const CCSliceArray *a, size_t i) {
+    if (!a || !a->items || i >= a->len) return cc_slice_empty();
+    return a->items[i];
+}
+
+/* ---- Slice query helpers ---- */
+
+static inline bool cc_slice_is_ascii(CCSlice s) {
+    const unsigned char *p = (const unsigned char *)s.ptr;
+    for (size_t i = 0; i < s.len; ++i) {
+        if (p[i] > 0x7F) return false;
+    }
+    return true;
+}
+
+static inline bool cc_slice_get(CCSlice s, size_t idx, char *out) {
+    if (idx >= s.len || !s.ptr) return false;
+    if (out) *out = ((char *)s.ptr)[idx];
+    return true;
+}
+
+static inline size_t cc_slice_index_of(CCSlice s, CCSlice needle, bool *found) {
+    if (needle.len == 0 || needle.len > s.len) { if (found) *found = false; return 0; }
+    const uint8_t *hay = (const uint8_t *)s.ptr;
+    for (size_t i = 0; i + needle.len <= s.len; ++i) {
+        if (memcmp(hay + i, needle.ptr, needle.len) == 0) {
+            if (found) *found = true; return i;
+        }
+    }
+    if (found) *found = false; return 0;
+}
+
+/* UFCS: s.has(needle) — substring presence (wraps index_of).
+ * Pointer receiver matches other CCSlice method spellings (len/fprintln). */
+static inline bool cc_slice_has(CCSlice *s, CCSlice needle) {
+    bool found = false;
+    if (!s) return false;
+    (void)cc_slice_index_of(*s, needle, &found);
+    return found;
+}
+
+/* UFCS: s.has_ci(needle) — ASCII case-insensitive substring (grep -qi). */
+static inline bool cc_slice_has_ci(CCSlice *s, CCSlice needle) {
+    size_t i, j;
+    const unsigned char *hay;
+    const unsigned char *nd;
+    if (!s || !s->ptr) return false;
+    if (needle.len == 0) return true;
+    if (needle.len > s->len || !needle.ptr) return false;
+    hay = (const unsigned char *)s->ptr;
+    nd = (const unsigned char *)needle.ptr;
+    for (i = 0; i + needle.len <= s->len; i++) {
+        for (j = 0; j < needle.len; j++) {
+            unsigned char a = hay[i + j], b = nd[j];
+            if (a >= 'A' && a <= 'Z') a = (unsigned char)(a - 'A' + 'a');
+            if (b >= 'A' && b <= 'Z') b = (unsigned char)(b - 'A' + 'a');
+            if (a != b) break;
+        }
+        if (j == needle.len) return true;
+    }
+    return false;
+}
+
+static inline size_t cc_slice_last_index_of(CCSlice s, CCSlice needle, bool *found) {
+    if (needle.len == 0 || needle.len > s.len) { if (found) *found = false; return 0; }
+    const uint8_t *hay = (const uint8_t *)s.ptr;
+    for (size_t i = s.len - needle.len + 1; i-- > 0;) {
+        if (memcmp(hay + i, needle.ptr, needle.len) == 0) {
+            if (found) *found = true; return i;
+        }
+        if (i == 0) break;
+    }
+    if (found) *found = false; return 0;
+}
+
+static inline size_t cc_slice_count(CCSlice s, CCSlice needle) {
+    bool found = false;
+    size_t idx = 0, cnt = 0;
+    while (idx < s.len) {
+        size_t pos = cc_slice_index_of(cc__slice_sub_value(s, idx, s.len), needle, &found);
+        if (!found) break;
+        cnt++;
+        idx += pos + (needle.len ? needle.len : 1);
+        if (needle.len == 0) break;
+    }
+    return cnt;
+}
+
+/* ---- Trim helpers ---- */
+
+static inline size_t cc__trim_left_idx(CCSlice s) {
+    size_t i = 0;
+    const unsigned char *p = (const unsigned char *)s.ptr;
+    while (i < s.len && isspace(p[i])) i++;
+    return i;
+}
+
+static inline size_t cc__trim_right_idx(CCSlice s) {
+    if (s.len == 0) return 0;
+    const unsigned char *p = (const unsigned char *)s.ptr;
+    size_t i = s.len;
+    while (i > 0 && isspace(p[i-1])) i--;
+    return i;
+}
+
+static inline bool cc__in_set(char c, CCSlice set) {
+    const char *p = (const char *)set.ptr;
+    for (size_t i = 0; i < set.len; ++i) {
+        if (p[i] == c) return true;
+    }
+    return false;
+}
+
+static inline CCSlice cc_slice_trim_set(CCSlice s, CCSlice chars) {
+    size_t start = 0, end = s.len;
+    const char *p = (const char *)s.ptr;
+    while (start < end && cc__in_set(p[start], chars)) start++;
+    while (end > start && cc__in_set(p[end-1], chars)) end--;
+    return cc__slice_sub_value(s, start, end);
+}
+
+/* ---- Hash and equality ---- */
+
+static inline uint64_t cc_fnv1a64(const void *data, size_t len) {
+    const uint8_t *p = (const uint8_t *)data;
+    uint64_t hash = 14695981039346656037ULL;
+    for (size_t i = 0; i < len; ++i) {
+        hash ^= p[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+static inline uint64_t cc_slice_hash64(CCSlice s) {
+    if (!s.ptr || s.len == 0) return 0xcbf29ce484222325ULL;
+    return cc_fnv1a64(s.ptr, s.len);
+}
+
+static inline bool cc__slice_eq(CCSlice a, CCSlice b) {
+    if (a.len != b.len) return false;
+    if (a.ptr == b.ptr) return true;
+    if (!a.ptr || !b.ptr) return false;
+    return memcmp(a.ptr, b.ptr, a.len) == 0;
+}
+
+/* ---- UFCS methods (receiver is CCSlice*) ---- */
+
+static inline size_t cc_slice_len(CCSlice* s) { return s ? s->len : 0; }
+static inline size_t CCSlice_len(CCSlice* s) { return cc_slice_len(s); }
+
+static inline CCSlice cc_slice_trim(CCSlice* s) {
+    if (!s) return cc_slice_empty();
+    size_t start = cc__trim_left_idx(*s);
+    CCSlice sub = cc__slice_sub_value(*s, start, s->len);
+    size_t end = cc__trim_right_idx(sub);
+    return cc__slice_sub_value(sub, 0, end);
+}
+static inline CCSlice CCSlice_trim(CCSlice* s) { return cc_slice_trim(s); }
+
+static inline CCSlice cc_slice_trim_left(CCSlice* s) {
+    if (!s) return cc_slice_empty();
+    return cc__slice_sub_value(*s, cc__trim_left_idx(*s), s->len);
+}
+static inline CCSlice CCSlice_trim_left(CCSlice* s) { return cc_slice_trim_left(s); }
+
+static inline CCSlice cc_slice_trim_right(CCSlice* s) {
+    if (!s) return cc_slice_empty();
+    size_t end = cc__trim_right_idx(*s);
+    return cc__slice_sub_value(*s, 0, end);
+}
+static inline CCSlice CCSlice_trim_right(CCSlice* s) { return cc_slice_trim_right(s); }
+
+/* Indexed get/set live in <ccc/std/slice.h> as Result-returning
+ * `cc_slice_at` / `cc_slice_get_checked` / `cc_slice_set` (no soft-zero at). */
+
+static inline CCSlice cc__slice_sub_ptr(CCSlice* s, size_t start, size_t end) {
+    return s ? cc__slice_sub_value(*s, start, end) : cc_slice_empty();
+}
+static inline CCSlice cc__slice_sub_const_ptr(const CCSlice* s, size_t start, size_t end) {
+    return s ? cc__slice_sub_value(*s, start, end) : cc_slice_empty();
+}
+static inline CCSlice CCSlice_sub(CCSlice* s, size_t start, size_t end) { return cc__slice_sub_ptr(s, start, end); }
+
+static inline bool cc_slice_starts_with(CCSlice* s, CCSlice prefix) {
+    if (!s) return false;
+    return s->len >= prefix.len && memcmp(s->ptr, prefix.ptr, prefix.len) == 0;
+}
+static inline bool CCSlice_starts_with(CCSlice* s, CCSlice prefix) { return cc_slice_starts_with(s, prefix); }
+
+static inline bool cc_slice_ends_with(CCSlice* s, CCSlice suffix) {
+    if (!s) return false;
+    return s->len >= suffix.len &&
+        memcmp((uint8_t *)s->ptr + (s->len - suffix.len), suffix.ptr, suffix.len) == 0;
+}
+static inline bool CCSlice_ends_with(CCSlice* s, CCSlice suffix) { return cc_slice_ends_with(s, suffix); }
+
+static inline bool cc_slice_eq(CCSlice* s, CCSlice other) {
+    if (!s) return false;
+    return cc__slice_eq(*s, other);
+}
+static inline bool CCSlice_eq(CCSlice* s, CCSlice other) { return cc_slice_eq(s, other); }
+
+static inline bool cc_slice_eq_cstr(CCSlice* s, const char* cstr) {
+    if (!s) return false;
+    size_t len = cstr ? strlen(cstr) : 0;
+    if (!cstr) return false;
+    if (s->len != len) return false;
+    if (s->len == 0) return true;
+    if (!s->ptr) return false;
+    return memcmp(s->ptr, cstr, len) == 0;
+}
+static inline bool CCSlice_eq_cstr(CCSlice* s, const char* cstr) { return cc_slice_eq_cstr(s, cstr); }
+
+#define cc_slice_sub(s, start, end) \
+    _Generic((s), \
+        CCSlice*: cc__slice_sub_ptr, \
+        const CCSlice*: cc__slice_sub_const_ptr, \
+        default: cc__slice_sub_value \
+    )((s), (start), (end))
+
+/* ---- FFI adopt (unique, non-transferable) ----
+ *
+ *   CCSliceUnique s = cc_adopt(malloc(n), n, free) !> @destroy;
+ *   // or: s.destroy();
+ *
+ * Mint unique|!transferable provenance and register `deleter` for the base
+ * pointer. `cc_slice_destroy` / UFCS `s.destroy()` runs the deleter once when
+ * the slice is still unique and registered; moved-away / unregistered unique
+ * slices (e.g. grammar COW) are no-ops. Deleter must match the allocator. */
+typedef void (*CCSliceDeleter)(void*);
+
+CCSliceUnique cc_adopt(void* ptr, size_t nbytes, CCSliceDeleter deleter);
+void cc_slice_destroy(CCSlice* s);
+static inline void CCSlice_destroy(CCSlice* s) { cc_slice_destroy(s); }
+static inline void CCSliceUnique_destroy(CCSliceUnique* s) { cc_slice_destroy((CCSlice*)s); }
+
+#endif // CC_SLICE_H

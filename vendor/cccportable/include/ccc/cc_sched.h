@@ -1,0 +1,194 @@
+/*
+ * Minimal task scheduler facade for early runtime bring-up.
+ * Backed by pthreads; supports deadlines and cancellation checks.
+ */
+#ifndef CC_SCHED_H
+#define CC_SCHED_H
+
+#include <ccc/cc_compat.h>
+#include <time.h>
+
+#include <ccc/cc_closure.h>
+
+typedef struct {
+    struct timespec deadline; // absolute; tv_sec=0 means no deadline
+    int cancelled;            // cooperative flag
+} CCDeadline;
+
+/* Deadline function declarations */
+CCDeadline cc_deadline_none(void);
+CCDeadline cc_deadline_after_ms(uint64_t ms);
+bool cc_deadline_expired(const CCDeadline* d);
+const struct timespec* cc_deadline_as_timespec(const CCDeadline* d, struct timespec* out);
+
+/* Scheduler configuration - call before any spawn/fiber operations */
+void cc_sched_set_num_workers(size_t n);
+size_t cc_sched_get_num_workers(void);
+
+/* Forward declaration for CCSpawnTask (internal handle for OS-thread spawned tasks) */
+struct CCSpawnTask;
+
+/* ============================================================================
+ * CCTask - Unified task type for all task kinds
+ * ============================================================================ */
+#ifndef CC_TASK_DEFINED
+#define CC_TASK_DEFINED
+
+#if defined(CC_PARSER_MODE)
+/* Parse-only dummy type: TCC doesn't like assigning/returning structs during stub-AST parsing. */
+typedef int CCTask;
+typedef int CCTaskIntptr;
+typedef int CCAsyncVoidRet;
+typedef int CCTaskKind;
+typedef int CCTaskIntptrKind;
+#define CC_TASK_KIND_INVALID 0
+#define CC_TASK_KIND_SPAWN   1
+#define CC_TASK_KIND_FUTURE  2
+#define CC_TASK_KIND_POLL    3
+#define CC_TASK_KIND_FIBER   4
+#define CC_TASK_KIND_POOL    5
+#define CC_TASK_KIND_FIBER_V2 6
+#define CC_TASK_INTPTR_KIND_INVALID 0
+#define CC_TASK_INTPTR_KIND_FUTURE  2
+#define CC_TASK_INTPTR_KIND_POLL    3
+#else
+
+typedef enum {
+    CC_TASK_KIND_INVALID = 0,
+    CC_TASK_KIND_SPAWN = 1,   /* OS thread (from cc_thread_spawn) */
+    CC_TASK_KIND_FUTURE = 2,  /* Executor pool */
+    CC_TASK_KIND_POLL = 3,    /* State machine (from @async) */
+    CC_TASK_KIND_FIBER = 4,   /* M:N fiber (from cc_fiber_spawn_task) */
+    CC_TASK_KIND_POOL  = 5,   /* M:N pool task (transparent runtime pooling) */
+    CC_TASK_KIND_FIBER_V2 = 6, /* V2 hybrid scheduler fiber */
+} CCTaskKind;
+
+/* Opaque CCTask struct - the actual layout is implementation detail.
+   This struct is 128 bytes to fit all variants. */
+typedef struct CCTask {
+    CCTaskKind kind;
+    char _data[124];  /* Opaque storage for union members */
+} CCTask;
+
+/* Backward compatibility type aliases */
+typedef CCTask CCTaskIntptr;
+/* Marker typedef: used by the compiler to preserve the originally-declared
+ * `@async void` return type through phase-3 reparse.  Functionally identical
+ * to `CCTaskIntptr` (an @async function always returns a poll task handle),
+ * but the distinct spelling lets the async lowering detect that the source
+ * declared the function as void-returning so that bare `return;` inside the
+ * body is accepted. */
+typedef CCTaskIntptr CCAsyncVoidRet;
+typedef CCTaskKind CCTaskIntptrKind;
+#define CC_TASK_INTPTR_KIND_INVALID CC_TASK_KIND_INVALID
+#define CC_TASK_INTPTR_KIND_FUTURE  CC_TASK_KIND_FUTURE
+#define CC_TASK_INTPTR_KIND_POLL    CC_TASK_KIND_POLL
+
+#endif /* CC_PARSER_MODE */
+#endif /* CC_TASK_DEFINED */
+
+typedef struct {
+    size_t workers;
+    size_t queue_cap;
+    size_t queue_len;
+} CCSchedulerStats;
+
+// Initialize/shutdown scheduler (no-op for pthread-backed stub).
+int cc_scheduler_init(void);
+void cc_scheduler_shutdown(void);
+
+/* ============================================================================
+ * NEW unified CCTask API (returns CCTask value from task.cch)
+ * ============================================================================ */
+
+/* Spawn an OS-thread task. Returns a CCTask value with kind=CC_TASK_KIND_SPAWN.
+   Use cc_block_on_intptr(task) to wait and get the result.
+   On failure, returns CCTask with kind=CC_TASK_KIND_INVALID. */
+CCTask cc_thread_spawn(void* (*fn)(void*), void* arg);
+/* Spawn a 0-arg closure (env freed via drop, if provided). */
+CCTask cc_thread_spawn_closure0(CCClosure0 c);
+
+/* Spawn an M:N fiber task. Returns a CCTask value with kind=CC_TASK_KIND_FIBER.
+   Fibers are lightweight cooperative tasks multiplexed onto worker threads.
+   Use cc_block_on_intptr(task) to wait and get the result.
+   On failure, returns CCTask with kind=CC_TASK_KIND_INVALID. */
+CCTask cc_fiber_spawn_task(void* (*fn)(void*), void* arg);
+/* Spawn a fiber from a 0-arg closure. */
+CCTask cc_fiber_spawn_closure0(CCClosure0 c);
+
+/* Legacy hybrid entrypoints. These run on the distinct V2 scheduler backend
+   while preserving a suspendable stack, so hybrid-spawned tasks can park/yield. */
+CCTask cc_fiber_spawn_task_v2(void* (*fn)(void*), void* arg);
+CCTask cc_fiber_spawn_closure0_v2(CCClosure0 c);
+/* Materialize an async closure into a task. */
+CCTask cc_async_closure0_start(CCAsyncClosure0 c);
+/* Materialize an async closure and run it on the hybrid fiber path. */
+CCTask cc_async_closure0_start_v2(CCAsyncClosure0 c);
+
+/* Get pointer to fiber-local result buffer (48 bytes max).
+   Use this to store struct results without malloc - the buffer is valid
+   until the task completes and cc_block_on_intptr returns.
+   Returns NULL if not in fiber context or size > 48. */
+void* cc_task_result_ptr(size_t size);
+
+/* ============================================================================
+ * DEPRECATED legacy API (pointer-based, for backward compatibility)
+ * ============================================================================ */
+
+// Legacy spawn returning task via out-pointer (deprecated, use cc_thread_spawn() instead)
+int cc_thread_spawn_legacy(struct CCSpawnTask** out_task, void* (*fn)(void*), void* arg);
+
+// Join a legacy thread task; returns 0 on success.
+int cc_thread_task_join(struct CCSpawnTask* task);
+
+// Join a legacy thread task and retrieve its return value.
+int cc_thread_task_join_result(struct CCSpawnTask* task, void** out_result);
+
+// Free legacy thread task handle.
+void cc_thread_task_free(struct CCSpawnTask* task);
+
+// Snapshot scheduler stats; returns 0 on success.
+int cc_scheduler_stats(CCSchedulerStats* out);
+
+/* @parallel spawn/join. Spawn refuses (INVALID) when in-flight @parallel
+ * fibers reach 256 * online processors. n.spawn is uncapped. */
+CCTask cc_parallel_spawn(void* (*fn)(void*), void* arg);
+void cc_parallel_join(CCTask t);
+
+// Sleep for at least ms milliseconds (best-effort).
+int cc_sleep_ms(unsigned int ms);
+
+// Cooperative yield: give other fibers a chance to run.
+// In a fiber context, re-enqueues the current fiber on the local worker queue
+// and switches to the scheduler — equivalent to Go's runtime.Gosched().
+// Outside a fiber context, falls back to sched_yield().
+void cc_yield(void);
+
+// Deadline helpers
+CCDeadline cc_deadline_none(void);
+CCDeadline cc_deadline_after_ms(uint64_t ms);
+bool cc_deadline_expired(const CCDeadline* d);
+void cc_cancel(CCDeadline* d);
+bool cc_is_cancelled(const CCDeadline* d);
+const struct timespec* cc_deadline_as_timespec(const CCDeadline* d, struct timespec* out);
+
+/*
+ * Duration helpers for spec-aligned deadline syntax.
+ * Usage: @with_deadline(seconds(30)) { ... }
+ *        @with_deadline(millis(500)) { ... }
+ * These return milliseconds for use with cc_deadline_after_ms().
+ */
+static inline uint64_t seconds(uint64_t s) { return s * 1000; }
+static inline uint64_t millis(uint64_t ms) { return ms; }
+static inline uint64_t micros(uint64_t us) { return us / 1000; }  /* truncates to ms */
+
+// Thread-local "current deadline" scope (used by `with_deadline(...) {}` lowering).
+// These are runtime helpers; the language-level `cc_cancel()`/`cc_is_cancelled()` are provided
+// as macros in cc_runtime.cch to avoid colliding with the existing cc_cancel(CCDeadline*) API.
+CCDeadline* cc_current_deadline(void);
+CCDeadline* cc_deadline_push(CCDeadline* d);
+void cc_deadline_pop(CCDeadline* prev);
+void cc_cancel_current(void);
+bool cc_is_cancelled_current(void);
+
+#endif // CC_SCHED_H

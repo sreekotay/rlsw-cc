@@ -1,0 +1,99 @@
+/*
+ * Fiber types and API for M:N scheduling.
+ * Used by channel.c for fiber-aware blocking.
+ */
+#ifndef CC_FIBER_INTERNAL_H
+#define CC_FIBER_INTERNAL_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include <stdatomic.h>
+#include <time.h>
+
+/* Opaque fiber handle - actual definition in fiber_sched.c */
+typedef struct fiber_task cc__fiber;
+
+/* Wait node for channel blocking */
+typedef struct cc__fiber_wait_node {
+    cc__fiber* fiber;
+    uint64_t wait_ticket;
+    _Atomic uint64_t wait_start_ns;
+    _Atomic uint64_t wake_publish_ns;
+    struct cc__fiber_wait_node* next;
+    struct cc__fiber_wait_node* prev;
+    void* data;
+    _Atomic int notified;
+    void* select_group;
+    size_t select_index;
+    int is_select;
+    int in_wait_list;
+} cc__fiber_wait_node;
+
+/* Fiber API - implemented in fiber_sched.c */
+int cc__fiber_in_context(void);
+void* cc__fiber_current(void);
+void cc__fiber_park(void);
+void cc__fiber_park_reason(const char* reason, const char* file, int line);
+void cc__fiber_park_if(_Atomic int* flag, int expected, const char* reason, const char* file, int line);
+int cc__fiber_park_if_until(_Atomic int* flag, int expected, const struct timespec* abs_deadline,
+                            const char* reason, const char* file, int line);
+void cc__fiber_suspend_until_ready(_Atomic int* flag, int expected,
+                                   const char* reason, const char* file, int line);
+int cc__fiber_suspend_until_ready_or_cancel(_Atomic int* flag, int expected,
+                                            const char* reason, const char* file, int line);
+int cc__fiber_suspend_until_ready_or_cancel_until(_Atomic int* flag, int expected,
+                                                  const struct timespec* abs_deadline,
+                                                  const char* reason,
+                                                  const char* file,
+                                                  int line);
+void cc__fiber_unpark(void* fiber);
+typedef enum {
+    CC_FIBER_UNPARK_REASON_GENERIC = 0,
+    CC_FIBER_UNPARK_REASON_SCHED_API,
+    CC_FIBER_UNPARK_REASON_SOCKET_SIGNAL,
+    CC_FIBER_UNPARK_REASON_IO_KQUEUE_PERSISTENT,
+    CC_FIBER_UNPARK_REASON_IO_KQUEUE_ONESHOT,
+    CC_FIBER_UNPARK_REASON_IO_POLL,
+    CC_FIBER_UNPARK_REASON_TASK_DONE,
+    CC_FIBER_UNPARK_REASON_TIMER,
+    CC_FIBER_UNPARK_REASON_JOIN,
+    CC_FIBER_UNPARK_REASON_ENQUEUE,
+    CC_FIBER_UNPARK_REASON_COUNT
+} cc__fiber_unpark_reason;
+void cc__fiber_unpark_tagged(void* fiber, cc__fiber_unpark_reason reason);
+void cc__fiber_dump_unpark_reason_stats(void);
+enum {
+    CC_FIBER_UNPARK_ATTR_NONE = 0u,
+    CC_FIBER_UNPARK_ATTR_CONTENTION_LOCAL = 1u << 0,
+};
+void cc__fiber_unpark_channel_attrib(uint32_t attrib_flags);
+void cc__fiber_yield(void);         /* Cooperative yield - push to local queue */
+void cc__fiber_yield_global(void);  /* Yield to global queue for fairness */
+void cc__fiber_sched_enqueue(void* fiber);
+void cc_fiber_dump_state(const char* reason);  /* Debug: dump scheduler state */
+int cc__fiber_sched_active(void);
+void cc__fiber_set_park_obj(void* obj);
+void cc__fiber_clear_pending_unpark(void);  /* Clear stale pending_unpark before new wait */
+void cc__fiber_sleep_park(unsigned int ms); /* Park fiber on sleep queue with timer */
+uint64_t cc__fiber_publish_wait_ticket(void* fiber_ptr);
+int cc__fiber_wait_ticket_matches(void* fiber_ptr, uint64_t ticket);
+void cc_external_wait_enter(void);
+void cc_external_wait_leave(void);
+
+/* Channel direct-handoff helpers — implemented in fiber_sched.c */
+int  cc__sched_current_worker_id(void);
+void cc__chan_debug_dump_state(void* ch_obj, const char* prefix);
+
+/* Convenience macro to park with source location */
+#define CC_FIBER_PARK(reason) cc__fiber_park_reason(reason, __FILE__, __LINE__)
+#define CC_FIBER_PARK_IF(flag, expected, reason) cc__fiber_park_if(flag, expected, reason, __FILE__, __LINE__)
+#define CC_FIBER_PARK_IF_UNTIL(flag, expected, deadline, reason) \
+    cc__fiber_park_if_until(flag, expected, deadline, reason, __FILE__, __LINE__)
+#define CC_FIBER_SUSPEND_UNTIL_READY(flag, expected, reason) \
+    cc__fiber_suspend_until_ready(flag, expected, reason, __FILE__, __LINE__)
+#define CC_FIBER_SUSPEND_UNTIL_READY_OR_CANCEL(flag, expected, reason) \
+    cc__fiber_suspend_until_ready_or_cancel(flag, expected, reason, __FILE__, __LINE__)
+#define CC_FIBER_SUSPEND_UNTIL_READY_OR_CANCEL_UNTIL(flag, expected, deadline, reason) \
+    cc__fiber_suspend_until_ready_or_cancel_until(flag, expected, deadline, reason, __FILE__, __LINE__)
+
+#endif /* CC_FIBER_INTERNAL_H */

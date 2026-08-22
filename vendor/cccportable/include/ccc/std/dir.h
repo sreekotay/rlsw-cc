@@ -1,0 +1,157 @@
+/*
+ * Directory and filesystem operations for Concurrent-C stdlib.
+ * Cross-platform: POSIX (macOS, Linux, BSD) and Windows.
+ * Path parameters are CCSlice ABI for NUL-terminated borrows (char[:0] in CC).
+ */
+#ifndef CC_STD_DIR_H
+#define CC_STD_DIR_H
+
+#include <ccc/cc_compat.h>
+#include <ccc/cc_arena.h>
+#include <ccc/cc_slice.h>
+#include <ccc/cc_result.h>
+#include <ccc/cc_io_error.h>
+
+/* Directory entry type */
+typedef enum {
+    CC_DIRENT_FILE,
+    CC_DIRENT_DIR,
+    CC_DIRENT_SYMLINK,
+    CC_DIRENT_OTHER
+} CCDirEntryType;
+
+/* Directory entry */
+typedef struct {
+    CCSlice name;          /* Entry name (NUL-terminated), arena-backed */
+    CCDirEntryType type;    /* Type of entry */
+} CCDirEntry;
+
+/* UFCS accessors for CCDirEntry: e.name_str(), e.is_dir(), e.is_file() */
+static inline const char* cc_dir_entry_name_str(const CCDirEntry* e) {
+    return e ? (const char*)e->name.ptr : NULL;
+}
+
+static inline bool cc_dir_entry_is_dir(const CCDirEntry* e) {
+    return e && e->type == CC_DIRENT_DIR;
+}
+
+static inline bool cc_dir_entry_is_file(const CCDirEntry* e) {
+    return e && e->type == CC_DIRENT_FILE;
+}
+
+static inline bool cc_dir_entry_is_symlink(const CCDirEntry* e) {
+    return e && e->type == CC_DIRENT_SYMLINK;
+}
+
+/* Directory iterator (opaque handle) */
+typedef struct CCDirIter CCDirIter;
+
+/* Result types - use CC_DECL_RESULT_SPEC for canonical names with helper functions */
+CC_DECL_RESULT_SPEC(CCResult_CCDirIterptr_CCIoError, CCDirIter*, CCIoError)
+CC_DECL_RESULT_SPEC(CCResult_CCDirEntry_CCIoError, CCDirEntry, CCIoError)
+#ifndef CCResult_CCSliceArray_CCIoError_DEFINED
+#define CCResult_CCSliceArray_CCIoError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCSliceArray_CCIoError_DEFINED
+#define CCResult_CCSliceArray_CCIoError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCSliceArray_CCIoError, CCSliceArray, CCIoError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_CCSliceArray_CCIoError, CCSliceArray, CCIoError)
+#endif
+/* bool !>(CCIoError) is declared in cc_io_error.cch (unified I/O result type) */
+
+/* ============================================================================
+ * Directory Iteration
+ * ============================================================================ */
+
+/*
+ * Open directory for iteration.
+ * Returns iterator that must be closed with cc_dir_close().
+ * Path can be relative or absolute.
+ */
+CCResult_CCDirIterptr_CCIoError cc_dir_open(CCArena* arena, CCSlice path);
+
+/*
+ * Read next directory entry.
+ * Returns entry with name allocated in arena.
+ * Returns error with CC_IO_EOF when no more entries.
+ */
+CCResult_CCDirEntry_CCIoError cc_dir_next(CCDirIter* iter, CCArena* arena);
+
+/*
+ * Close directory iterator.
+ */
+void cc_dir_close(CCDirIter* iter);
+
+/* ============================================================================
+ * Directory Operations
+ * ============================================================================ */
+
+/*
+ * Check if path exists.
+ */
+bool cc_path_exists(CCSlice path);
+
+/*
+ * Check if path is a directory.
+ */
+bool cc_path_is_dir(CCSlice path);
+
+/*
+ * Check if path is a regular file.
+ */
+bool cc_path_is_file(CCSlice path);
+
+/*
+ * Create directory. Does not create parents.
+ * Returns 0 on success, IoError on failure.
+ */
+CCResult_bool_CCIoError cc_dir_create(CCSlice path);
+
+/*
+ * Create directory and all parents.
+ * Returns 0 on success, IoError on failure.
+ */
+CCResult_bool_CCIoError cc_dir_create_all(CCSlice path);
+
+/*
+ * Remove empty directory.
+ * Returns 0 on success, IoError on failure.
+ */
+CCResult_bool_CCIoError cc_dir_remove(CCSlice path);
+
+/*
+ * Remove file.
+ * Returns 0 on success, IoError on failure.
+ */
+CCResult_bool_CCIoError cc_file_remove(CCSlice path);
+
+/*
+ * Get current working directory.
+ * Allocates a NUL-terminated CCSlice in arena.
+ */
+CCSlice cc_dir_cwd(CCArena* arena);
+
+/*
+ * Change current working directory.
+ */
+CCResult_bool_CCIoError cc_dir_chdir(CCSlice path);
+
+/* ============================================================================
+ * Glob Pattern Matching
+ * ============================================================================ */
+
+/* Find files matching glob pattern.
+ * Supports: * (any chars), ? (single char), ** (recursive).
+ * On success: arena-backed CCSliceArray of NUL-terminated path borrows
+ * (char[:0] / CCSlice); empty array means no matches.
+ * On failure: CCIoError (bad args, I/O, or OOM) — not an empty array. */
+CCResult_CCSliceArray_CCIoError cc_glob(CCSlice pattern, CCArena* arena);
+
+/*
+ * Check if filename matches glob pattern (no directory traversal).
+ * Supports: * (any chars), ? (single char)
+ */
+bool cc_glob_match(CCSlice pattern, CCSlice name);
+
+#endif /* CC_STD_DIR_H */

@@ -1,0 +1,188 @@
+/*
+ * Grammar / SERDES call-site operations — the STABLE surface over the code
+ * the @grammar engines emit.
+ *
+ * `@grammar(rules) Json { ... }` and `@grammar(schema) Tweet { ... }` lower
+ * to per-name functions (Json_match, Tweet_parse, TweetReader, ...).
+ * `@grammar(cli) Opts { ... }` (include `<ccc/std/cli.h>`) emits
+ * Opts_parse_args / Opts_prepare / Opts_print_usage. Those names are the
+ * LOWERING CONTRACT — deterministic and callable — but the language surface
+ * is these operations, uniform across every grammar and schema and greppable
+ * in one place:
+ *
+ *   cc_match(Json, s, n)                    full-input recognition (rules)
+ *   cc_parse(Json, s, n, arena)             rules: tape DOM -> JsonNode*
+ *   cc_parse(Tweet, s, n, arena, &out)      schema: direct-to-struct
+ *   cc_collect(Json, s, n, arena, cb, env)  rules: leaves through a closure
+ *   cc_read(Tweet, s, n, &pos, arena, &out) schema: one value, advances pos
+ *   cc_try_read(Cmd, s, n, &pos, arena, &o)  schema: the STREAMING face, in
+ *                                           the same Result contract as
+ *                                           channel recv —
+ *                                           Ok(true)  frame parsed, pos moved
+ *                                           Ok(false) clean end at a frame
+ *                                                     boundary (pos == n)
+ *                                           Err(CC_ERR_WOULD_BLOCK) partial
+ *                                                     frame: refill + retry,
+ *                                                     pos unmoved; caller
+ *                                                     escalates if the source
+ *                                                     is closed (truncation)
+ *                                           Err(CC_ERR_PARSE) malformed
+ *   cc_reader(Tweet, s, n, arena)           schema: -> TweetReader cursor
+ *   cc_next(Tweet, &r, &out)                schema: next value from a cursor
+ *   cc_at_end(Tweet, &r)                    schema: clean EOF vs mid-input
+ *   cc_write(Cmd, &v, dst, cap)             schema: FORMAT (inverted parse) ->
+ *                                           bytes written, 0 = didn't fit;
+ *                                           length/count fields are DERIVED
+ *   cc_write_unchecked(Cmd, &v, dst)        schema: same bytes as cc_write when
+ *                                           capacity is already proven
+ *                                           (measure / reserved buffer);
+ *                                           UFCS: v.write_unchecked(dst)
+ *   cc_measure(Cmd, &v)                     schema: exact encoded size with no
+ *                                           destination (0 = cannot emit /
+ *                                           invalid kind); same derivation as
+ *                                           cc_write. UFCS: v.measure()
+ *   cc_format(Cmd, &v, arena)               schema: -> CCString (Cmd_to_str);
+ *                                           composes with @string templates
+ *                                           (`${cmd.to_str(&a)}`) and the
+ *                                           language's x.to_str(arena) idiom
+ *   cc_dom(Json, s, n, reg, arena, &out)    rules: SHAPED DOM -> CCShapeVal.
+ *                                           Hidden classes (<ccc/cc_shape.h>):
+ *                                           instances carry 16 B value slots
+ *                                           only; keys live in the caller's
+ *                                           persistent CCShapeReg trie. Member-
+ *                                           list containers (derived from the
+ *                                           grammar's own rules) build objects,
+ *                                           everything else arrays; map-shaped
+ *                                           data degrades to per-instance
+ *                                           dictionaries, never fails.
+ *                                           cc_shape_get(&v, "key") to read.
+ *   cc_get(Tweet, &v, "id", &out)           schema: field by NAME -> CCGramValue.
+ *                                           Instances stay packed C; the
+ *                                           key->field map is per TYPE (the
+ *                                           comptime hidden class): a static
+ *                                           Tweet__fields[] {name,kind,offset}
+ *                                           table plus a compiled dispatch —
+ *                                           length switch + memcmp, the same
+ *                                           structure the parser uses.
+ *   cc_field(Tweet, "id", 2)                -> const CCGramField* (reflection)
+ *   cc_parse_args(Opts, argc, argv, arena, &o)  cli: fill typed options
+ *   cc_print_usage(Opts, argv0, f)          cli: generated usage
+ *   cc_prepare_args(Opts, argc, argv, arena, &o, f)
+ *                                           cli: parse + usage; bool !>(CCError)
+ *
+ * UFCS forms work too — the lowered names follow receiver conventions:
+ *   Tweet.parse(s, n, &arena, &out)   type-scoped -> Tweet_parse(...)
+ *   Json.match(s, n)                  type-scoped -> Json_match(...)
+ *   r.next(&out) / r.at_end()         instance    -> TweetReader_next(&r, ...)
+ *   nd->first() / nd->next(parent)    instance    -> JsonNode_first(nd), ...
+ * Instance dispatch is registered NATIVELY by the engines for every
+ * generated Reader and Node type — no user-written registration.
+ *
+ * Every generated splice begins with a manifest comment listing exactly
+ * which of these its declaration supports.
+ */
+#ifndef CCC_CC_GRAMMAR_CCH
+#define CCC_CC_GRAMMAR_CCH
+
+#include <ccc/cc_slice.h>
+#include <stddef.h>
+
+/* Field descriptor: one row of a schema's static Name__fields[] table —
+ * the keys, separated from the values. Emitted on demand per schema. */
+typedef enum { CC_GK_INT = 1, CC_GK_SLICE, CC_GK_BYTES, CC_GK_ITEMS, CC_GK_FLOAT } CCGramFieldKind;
+typedef struct {
+    const char* name;
+    unsigned kind;                /* CCGramFieldKind */
+    unsigned off;                 /* byte offset of the value in the struct */
+    unsigned off_n;               /* CC_GK_ITEMS: offset of the size_t count */
+    const char* etype;            /* CC_GK_ITEMS: element schema type name */
+} CCGramField;
+
+/* What Name_get(&v, "field", &out) fills. `present` is real for schemas
+ * with conditional members (a presence bitmap is set during parse); product
+ * schemas always report 1. Manually constructed values have no bitmap set —
+ * presence describes PARSES, not literals. */
+typedef struct {
+    unsigned kind;                /* CCGramFieldKind */
+    int present;
+    long long i;                  /* CC_GK_INT */
+    double f;                     /* CC_GK_FLOAT */
+    CCSlice s;                    /* CC_GK_SLICE; CC_GK_BYTES widened from Hdr */
+    const void* items;            /* CC_GK_ITEMS: elements (of field->etype) */
+    size_t items_n;
+    const CCGramField* field;
+} CCGramValue;
+
+#define cc_match(T, ...)   T##_match(__VA_ARGS__)
+#define cc_parse(T, ...)   T##_parse(__VA_ARGS__)
+#define cc_collect(T, ...) T##_collect(__VA_ARGS__)
+#define cc_read(T, ...)    T##_read(__VA_ARGS__)
+#define cc_reader(T, ...)  T##_reader(__VA_ARGS__)
+#define cc_next(T, ...)    T##Reader_next(__VA_ARGS__)
+#define cc_at_end(T, ...)  T##Reader_at_end(__VA_ARGS__)
+#define cc_write(T, ...)   T##_write(__VA_ARGS__)
+#define cc_write_unchecked(T, ...) T##_write_unchecked(__VA_ARGS__)
+#define cc_measure(T, ...) T##_measure(__VA_ARGS__)
+#define cc_format(T, ...)  T##_to_str(__VA_ARGS__)
+#define cc_get(T, ...)     T##_get(__VA_ARGS__)
+#define cc_field(T, ...)   T##_field(__VA_ARGS__)
+#define cc_dom(T, ...)     T##_dom(__VA_ARGS__)
+#define cc_try_read(T, ...) T##_try_read(__VA_ARGS__)
+#define cc_fail_pos()       cc_grammar_fail_pos()
+
+/* High-water byte offset of the last `cc_match` / `cc_parse` miss in this
+ * thread (0 if the last call succeeded or never ran). Recognition failure
+ * is still boolean; this is the cursor, not a second result channel.
+ * Generated matchers emit the same helpers when this header is not in
+ * scope (a rules-only TU). */
+#ifndef CC__GR_FAIL_CURSOR
+#define CC__GR_FAIL_CURSOR
+/* Host TCC has no _Thread_local; keep a pthread cell so concurrent
+ * parsers on that backend still do not share a cursor. */
+#if defined(__TINYC__)
+#include <pthread.h>
+#include <stdlib.h>
+static pthread_key_t cc__gr_fail_pos_key;
+static pthread_once_t cc__gr_fail_pos_once = PTHREAD_ONCE_INIT;
+static size_t cc__gr_fail_pos_oom;
+static void cc__gr_fail_pos_key_init(void) {
+    (void)pthread_key_create(&cc__gr_fail_pos_key, free);
+}
+static size_t *cc__gr_fail_pos_slot(void) {
+    size_t *p;
+    (void)pthread_once(&cc__gr_fail_pos_once, cc__gr_fail_pos_key_init);
+    p = (size_t *)pthread_getspecific(cc__gr_fail_pos_key);
+    if (!p) {
+        p = (size_t *)calloc(1, sizeof(*p));
+        if (p) (void)pthread_setspecific(cc__gr_fail_pos_key, p);
+        else p = &cc__gr_fail_pos_oom;
+    }
+    return p;
+}
+#define cc__gr_fail_pos (*cc__gr_fail_pos_slot())
+#else
+static _Thread_local size_t cc__gr_fail_pos;
+#endif
+static inline void cc_grammar_fail_reset(void) { cc__gr_fail_pos = 0; }
+static inline void cc_grammar_note_fail(size_t p) {
+    if (p > cc__gr_fail_pos) cc__gr_fail_pos = p;
+}
+static inline size_t cc_grammar_fail_pos(void) { return cc__gr_fail_pos; }
+#endif
+/* @grammar(cli): fill typed options from argc/argv; print generated usage;
+ * prepare = parse + usage with bool !>(CCError) (Ok true/false / Err). */
+#define cc_parse_args(T, ...)    T##_parse_args(__VA_ARGS__)
+#define cc_print_usage(T, ...)   T##_print_usage(__VA_ARGS__)
+#define cc_prepare_args(T, ...)  T##_prepare(__VA_ARGS__)
+
+/* Host hook for `ppkind Ident` terminals in @grammar(rules). Return 1 and
+ * advance *io past one matching pp-token; return 0 on miss. Byte-tape hosts
+ * leave the weak default (always miss). Token-tape / serdes hosts override. */
+__attribute__((weak))
+int cc_grammar_ppkind_at(const unsigned char* s, size_t n, size_t* io,
+                         const char* kind) {
+    (void)s; (void)n; (void)io; (void)kind;
+    return 0;
+}
+
+#endif /* CCC_CC_GRAMMAR_CCH */

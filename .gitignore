@@ -1,0 +1,6 @@
+out/
+bin/
+.cc-build/
+.cache/
+.DS_Store
+*.user

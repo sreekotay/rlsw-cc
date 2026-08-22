@@ -1,0 +1,206 @@
+/*
+ * cc_instantiate.cch — comptime instantiation API (track B1).
+ *
+ * Built-in monomorphs (Vec/Map/ArrayMap/CCSlice/Result/Chan) are collected
+ * from surface syntax (`Vec::[T]`, `Map::[K,V]`, `T[:]`, etc.) into the
+ * per-TU type graph. Vec, Map, ArrayMap, and non-char slices instantiate
+ * `CC_GENERIC_FACTORY`. User code normally does not call these directly.
+ *
+ * `@comptime` blocks call cc_instantiate / cc_emit_* / cc_generic_* to define
+ * user generic factories (spec §12, §14).  The compiler auto-provides real
+ * host bindings in comptime TUs (libtcc executor + compiled-factory dylibs);
+ * the declarations here are the public surface only.
+ */
+#ifndef CC_INSTANTIATE_CCH
+#define CC_INSTANTIATE_CCH
+
+#include <stddef.h>
+#include <string.h>
+#include <ccc/cc_emit_tpl.h>
+
+typedef enum CCEmitAnchor {
+    CC_EMIT_AFTER_PRELUDE = 0,
+    CC_EMIT_BEFORE_FIRST_USE = 1,
+    CC_EMIT_AT_COMPTIME_SITE = 2,
+} CCEmitAnchor;
+
+/* Host-provided in comptime TUs; never called from runtime code after blanking. */
+extern void cc_instantiate_vec(const char* elem_mangled);
+extern void cc_instantiate_map(const char* key_mangled, const char* val_mangled);
+extern void cc_instantiate_chan(const char* elem_mangled);
+extern void cc_emit_raw(int anchor, const char* ptr, size_t len);
+extern int cc_reflect_field_count(const char* type_name);
+extern int cc_reflect_field_name(const char* type_name, int idx, char* buf, int buf_sz);
+extern int cc_reflect_field_type(const char* type_name, int idx, char* buf, int buf_sz);
+extern int cc_reflect_field_is_as(const char* type_name, int idx);
+extern int cc_result_box_name(const char* ok_type, const char* err_type, char* buf, int buf_sz);
+extern int cc_reflect_method_count(const char* type_name);
+extern int cc_reflect_method_name(const char* type_name, int idx, char* buf, int buf_sz);
+extern int cc_reflect_param_count(const char* params);
+extern int cc_reflect_param_name(const char* params, int idx, char* buf, int buf_sz);
+extern int cc_reflect_param_type(const char* params, int idx, char* buf, int buf_sz);
+extern int cc_reflect_param_default(const char* params, int idx, char* buf, int buf_sz);
+extern int cc_reflect_params_c_abi(const char* params, char* buf, int buf_sz);
+extern int cc_reflect_method_member(const char* type_name, int idx, char* buf, int buf_sz);
+extern int cc_reflect_method_params(const char* type_name, int idx, char* buf, int buf_sz);
+extern int cc_reflect_method_args(const char* type_name, int idx, char* buf, int buf_sz);
+extern int cc_reflect_method_ret(const char* type_name, int idx, char* buf, int buf_sz);
+extern int cc_reflect_method_err(const char* type_name, int idx, char* buf, int buf_sz);
+extern int cc_reflect_enum_count(const char* enum_name);
+extern int cc_reflect_enum_name(const char* enum_name, int idx, char* buf, int buf_sz);
+extern int cc_reflect_enum_value(const char* enum_name, int idx, long long* out);
+extern int cc_reflect_kind(const char* type_name);
+extern int cc_canonical_name(const char* base, const char** args, int nargs, char* out, int out_sz);
+extern int cc_reflect_tagged_count(const char* tag);
+extern int cc_reflect_tagged_name(const char* tag, int idx, char* buf, int buf_sz);
+extern void cc_emit_raw_at(int anchor, const char* file, int line, const char* ptr, size_t len);
+extern void cc_emit_error(const char* msg);
+extern void cc_emit_warning(const char* msg);
+extern void cc_emit_error_at(const char* file, int line, const char* msg);
+extern void cc_emit_warning_at(const char* file, int line, const char* msg);
+
+/* Type-kind codes for cc_reflect_kind (edge-push #2).  Keep in sync with
+ * enum CCReflectKind in cc/src/preprocess/preprocess.h. */
+enum {
+    CC_REFLECT_KIND_UNKNOWN   = 0,
+    CC_REFLECT_KIND_PRIMITIVE = 1,
+    CC_REFLECT_KIND_POINTER   = 2,
+    CC_REFLECT_KIND_STRUCT    = 3,
+    CC_REFLECT_KIND_ENUM      = 4
+};
+
+static inline void cc_instantiate_result(const char* ok_mangled, const char* err_mangled) {
+    (void)ok_mangled; (void)err_mangled;
+}
+
+/* Value-based reflection sugar over cc_reflect_field_* (compiled factories). */
+typedef struct CCReflectField {
+    char name[128];
+    char type[128];
+    int index;
+    int is_as;
+} CCReflectField;
+
+static inline int cc_reflect_field_at(const char* type_name, int idx, CCReflectField* out) {
+    int as;
+    if (!out || idx < 0) return -1;
+    out->index = idx;
+    out->is_as = 0;
+    if (cc_reflect_field_name(type_name, idx, out->name, (int)sizeof(out->name)) < 0) return -1;
+    if (cc_reflect_field_type(type_name, idx, out->type, (int)sizeof(out->type)) < 0) return -1;
+    as = cc_reflect_field_is_as(type_name, idx);
+    if (as < 0) return -1;
+    out->is_as = as ? 1 : 0;
+    return 0;
+}
+
+/* Value-based reflection sugar over cc_reflect_enum_* (enum <-> string). */
+typedef struct CCReflectEnumMember {
+    char name[128];
+    long long value;
+    int index;
+} CCReflectEnumMember;
+
+static inline int cc_reflect_enum_at(const char* enum_name, int idx, CCReflectEnumMember* out) {
+    if (!out || idx < 0) return -1;
+    out->index = idx;
+    if (cc_reflect_enum_name(enum_name, idx, out->name, (int)sizeof(out->name)) < 0) return -1;
+    if (cc_reflect_enum_value(enum_name, idx, &out->value) < 0) return -1;
+    return 0;
+}
+
+#ifdef CC_COMPTIME_EXEC
+#include <stdarg.h>
+#include <stdio.h>
+static inline int cc_emit_format(CCEmitAnchor anchor, const char* fmt, ...) {
+    char buf[16384];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    cc_emit_raw((int)anchor, buf, strlen(buf));
+    return 0;
+}
+#else
+static inline int cc_emit_format(CCEmitAnchor anchor, const char* fmt, ...) {
+    (void)anchor; (void)fmt;
+    return 0;
+}
+#endif
+
+static inline int cc_emit_cstr(CCEmitAnchor anchor, const char* c_fragment) {
+    if (!c_fragment) return 0;
+    cc_emit_raw((int)anchor, c_fragment, strlen(c_fragment));
+    return 0;
+}
+
+/* User generic factories: register how a library generic lowers to C.
+ *
+ * Canonical style — `CC_GENERIC_FACTORY(Name[, arity]) { ... }`:
+ *
+ *     CC_GENERIC_FACTORY(Pair, 2) {
+ *         return @emit(`typedef struct { ${arg(0)} first;
+ *                        ${arg(1)} second; } ${mangled};`, arena);
+ *     }
+ *
+ * The body has implicit `generic_name`, `mangled`, `type_args`, and `arena`
+ * parameters and returns the definition fragment as a CCSlice built with
+ * `@emit(`...`, arena)` — the fragment is allocated into `arena` (the host passes
+ * a stack-backed scratch arena).  The seam lowers this to a `@comptime` factory
+ * function plus a `cc_generic_register` call, so there is one registration verb
+ * and one grammar.
+ *
+ * Ergonomics:
+ *   - The implicit params are auto-voided, so a body that ignores one needn't
+ *     write `(void)...`.
+ *   - `arg(i)` is shorthand for `type_args.items[i]` (C type spelling such as
+ *     `long long`, or a decimal integer literal, as a string slice).
+ *   - The optional arity `CC_GENERIC_FACTORY(Name, N)` injects the standard guard
+ *     `if (type_args.len < N || !mangled.ptr) return cc_slice_empty();`; omit it
+ *     (`CC_GENERIC_FACTORY(Name)`) to do your own argument checking.
+ *
+ * `cc_generic_register("Name", handler)` is the underlying primitive; the
+ * sugar above is the preferred form. */
+static inline int cc_generic_register(const char* name, void* factory) {
+    (void)name; (void)factory;
+    return 0;
+}
+
+/* Extending a generic — `CC_GENERIC_FACTORY_EXTEND(Name[, arity]) { ... }`:
+ *
+ *     // core.cch — defines the type
+ *     CC_GENERIC_FACTORY(Box, 1) {
+ *         return @emit(`typedef struct { ${arg(0)} value; } ${mangled};`, arena);
+ *     }
+ *
+ *     // box_ops.cch — adds operations, without editing the base factory
+ *     CC_GENERIC_FACTORY_EXTEND(Box, 1) {
+ *         return @emit(`static inline ${arg(0)} ${mangled}_get(${mangled} b)
+ *                       { return b.value; }`, arena);
+ *     }
+ *
+ * An *extend* factory has the same body shape and implicit params as the base
+ * (`generic_name`, `mangled`, `type_args`, `arena`; `arg(i)` shorthand; optional
+ * arity guard).  At a `Name::[args]` use site the seam runs the base factory
+ * first (it must define the type), then every extension in registration order,
+ * and concatenates the fragments into one definition emitted once per mangled
+ * name.  Because the base runs first, extensions may reference `${mangled}`.
+ *
+ * Rules:
+ *   - One generic name has exactly one *base* (`CC_GENERIC_FACTORY` /
+ *     `cc_generic_register`) and any number of *extensions*.
+ *   - Extending a name that is never defined is an error at the use site
+ *     ("generic 'X' is extended but never defined").  Registration order across
+ *     files does not matter; the base requirement is checked at instantiation.
+ *   - A base factory must return a non-empty fragment; an extension may return
+ *     an empty fragment (`cc_slice_empty()`) to emit nothing — useful for
+ *     conditional specialization (e.g. only emit `_inverse` when R == C).
+ *
+ * `cc_generic_register_extend("Name", handler)` is the underlying primitive; the
+ * `CC_GENERIC_FACTORY_EXTEND` sugar lowers to it (mirroring the base pair). */
+static inline int cc_generic_register_extend(const char* name, void* factory) {
+    (void)name; (void)factory;
+    return 0;
+}
+
+#endif /* CC_INSTANTIATE_CCH */

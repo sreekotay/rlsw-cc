@@ -1,0 +1,128 @@
+/*
+ * Task functions for the unified CCTask type (defined in cc_sched.cch).
+ *
+ * CCTask can represent:
+ * - OS-thread spawned tasks (CC_TASK_KIND_SPAWN)
+ * - Executor pool tasks (CC_TASK_KIND_FUTURE)
+ * - Poll-based state machines from @async (CC_TASK_KIND_POLL)
+ *
+ * Use cc_block_on() or cc_block_on_intptr() to wait for completion.
+ */
+#ifndef CC_STD_TASK_INTPTR_H
+#define CC_STD_TASK_INTPTR_H
+
+#include <stdint.h>
+#include <ccc/cc_exec.h>
+#include "future.h"
+
+/* CCTask is defined in cc_sched.cch */
+
+#if defined(CC_PARSER_MODE)
+/* Parse-only stubs: avoid type errors from using @async before lowering rewrites kick in.
+   In particular, allow `cc_block_on_intptr(f())` where `f` is still seen as `void` by TCC. */
+typedef CCFutureStatus (*cc_task_poll_fn)(void* frame, intptr_t* out_val, int* out_err);
+#define cc_run_blocking_task(c) ((void)(c), (CCTask){0})
+#define cc_task_yield_once() ((CCTask){0})
+#define cc_task_make_poll(poll, frame, drop) ((CCTask){0})
+#define cc_block_on_intptr(t) (0)
+#define cc_block_on(T, task_expr) ((T)0)
+#define cc_await(T, task_expr) ((T)0)
+static inline int cc_blocking_pool_stats(CCExecStats* out_exec, uint64_t* out_submit_failures) {
+    (void)out_exec;
+    if (out_submit_failures) *out_submit_failures = 0;
+    return 0;
+}
+static inline CCFutureStatus cc_task_poll(CCTask* t, intptr_t* out_val, int* out_err) {
+    (void)t;
+    if (out_val) *out_val = 0;
+    if (out_err) *out_err = 0;
+    return CC_FUTURE_READY;
+}
+static inline void cc_task_free(CCTask* t) { (void)t; }
+#else
+
+typedef CCFutureStatus (*cc_task_poll_fn)(void* frame, intptr_t* out_val, int* out_err);
+
+/* Full type definitions for internal use */
+typedef struct {
+    CCFuture fut;
+    void* heap; /* owned by runtime; freed by cc_task_free or block_on */
+} CCTaskFuture;
+
+typedef struct {
+    cc_task_poll_fn poll;
+    int (*wait)(void* frame); /* optional: block until poll can make progress (no busy-spin) */
+    void* frame;
+    void (*drop)(void* frame);
+} CCTaskPoll;
+
+/* Start a blocking closure on the runtime executor thread pool.
+   The closure must return a value encoded as (void*)(intptr_t)result or a pointer cast.
+   On failure returns an invalid task with kind == CC_TASK_KIND_INVALID. */
+CCTask cc_run_blocking_task(CCClosure0 c);
+
+/* Construct a task that yields once before becoming ready. */
+CCTask cc_task_yield_once(void);
+
+/* Construct a task backed by a poll-based state machine. */
+CCTask cc_task_make_poll(cc_task_poll_fn poll, void* frame, void (*drop)(void* frame));
+/* Like cc_task_make_poll, but also provides an optional wait hook for block_on. */
+CCTask cc_task_make_poll_ex(cc_task_poll_fn poll, int (*wait)(void* frame), void* frame, void (*drop)(void* frame));
+
+/* Block current OS thread until task completes and return result. Frees task resources. */
+intptr_t cc_block_on_intptr(CCTask t);
+
+/* Best-effort non-blocking poll. Returns CC_FUTURE_PENDING/READY/etc; if READY, stores result. */
+CCFutureStatus cc_task_poll(CCTask* t, intptr_t* out_val, int* out_err);
+
+/* Free task resources without waiting (unsafe if still running). */
+void cc_task_free(CCTask* t);
+
+/* Cancel a task and wake up anyone blocked on it.
+   For future-based tasks, closes the done channel causing block_on to return. */
+void cc_task_cancel(CCTask* t);
+
+/* Block until all tasks complete. Runs them concurrently.
+   Returns 0 on success, errno on error. Results stored in results array. */
+int cc_block_all(int count, CCTask* tasks, intptr_t* results);
+
+/* Block until FIRST task completes (race). Returns immediately when any finishes.
+   winner: index of task that completed first. result: its return value. */
+int cc_block_race(int count, CCTask* tasks, int* winner, intptr_t* result);
+
+/* Block until first SUCCESSFUL task completes. Only fails if ALL tasks fail.
+   winner: index of first success. result: its return value.
+   Returns 0 if any succeeded, ECANCELED if all failed. */
+int cc_block_any(int count, CCTask* tasks, int* winner, intptr_t* result);
+
+/* Snapshot blocking pool stats (executor + submit failures). */
+int cc_blocking_pool_stats(CCExecStats* out_exec, uint64_t* out_submit_failures);
+
+/* ============================================================================
+ * Backward compatibility aliases (deprecated)
+ * ============================================================================ */
+typedef CCTaskFuture CCTaskIntptrFuture;
+typedef CCTaskPoll CCTaskIntptrPoll;
+typedef cc_task_poll_fn cc_task_intptr_poll_fn;
+
+#define cc_run_blocking_task_intptr cc_run_blocking_task
+#define cc_task_intptr_make_poll    cc_task_make_poll
+#define cc_task_intptr_make_poll_ex cc_task_make_poll_ex
+#define cc_task_intptr_poll         cc_task_poll
+#define cc_task_intptr_free         cc_task_free
+#define cc_task_intptr_cancel       cc_task_cancel
+
+#endif /* !CC_PARSER_MODE */
+
+#if !defined(CC_PARSER_MODE)
+/* Typed convenience wrapper: `T` is the desired result type (e.g. `int`, `intptr_t`, `void*`).
+   Guarded because the parser-mode stub block above already defines
+   both macros to zero-return variants so struct-by-value CCTask never
+   appears in an expression TCC might try to type-check. */
+#define cc_block_on(T, task_expr) ((T)(intptr_t)cc_block_on_intptr((task_expr)))
+/* Temporary ergonomic alias until we have first-class `await` lowering for all expressions. */
+#define cc_await(T, task_expr) cc_block_on(T, (task_expr))
+#endif
+
+#endif /* CC_STD_TASK_INTPTR_H */
+

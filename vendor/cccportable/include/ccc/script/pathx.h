@@ -1,0 +1,113 @@
+/*
+ * Script path helpers: repo root discovery and path join.
+ * Path arguments are NUL-terminated borrows (char[:0] / CCSlice ABI).
+ */
+#ifndef CC_SCRIPT_PATHX_H
+#define CC_SCRIPT_PATHX_H
+
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <ccc/cc_arena.h>
+#include <ccc/cc_result.h>
+#include <ccc/cc_slice.h>
+#include <ccc/std/dir.h>
+#include <ccc/std/io.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+static inline int cc__script_is_repo_root(CCSlice dir) {
+    /* Bounding the directory leaves room for the longest marker suffix,
+     * so the append can never truncate (a path that long is past
+     * PATH_MAX and no repo root anyway) — and the bound is what keeps
+     * -Wformat-truncation quiet on toolchains that prove the overflow. */
+    char marker[PATH_MAX];
+    enum { CC__SCRIPT_DIR_MAX = PATH_MAX - 40 };
+    if (!dir.ptr || dir.len == 0) return 0;
+    snprintf(marker, sizeof(marker), "%.*s/cc/src/cc_main.c",
+             CC__SCRIPT_DIR_MAX, (const char *)dir.ptr);
+    if (cc_path_exists(cc_slice_cstr(marker))) return 1;
+    snprintf(marker, sizeof(marker), "%.*s/perf/compiler_baseline.txt",
+             CC__SCRIPT_DIR_MAX, (const char *)dir.ptr);
+    if (cc_path_exists(cc_slice_cstr(marker))) return 1;
+    snprintf(marker, sizeof(marker), "%.*s/.git",
+             CC__SCRIPT_DIR_MAX, (const char *)dir.ptr);
+    return cc_path_exists(cc_slice_cstr(marker)) ? 1 : 0;
+}
+
+static inline CCSlice cc__script_dup_cstr(CCArena *arena, const char *s) {
+    size_t n = s ? strlen(s) : 0;
+    CCSlice out = cc_arena_alloc_slice_bytes(arena, n + 1);
+    if (!out.ptr) return cc_slice_empty();
+    if (n) memcpy(out.ptr, s, n);
+    ((char *)out.ptr)[n] = '\0';
+    out.len = n;
+    return out;
+}
+
+/*
+ * Resolve the Concurrent-C repo root (walk cwd, then dirname(argv0)).
+ * Arena is last. Returned path is NUL-terminated CCSlice.
+ */
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCSlice_CCError_DEFINED
+#define CCResult_CCSlice_CCError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCSlice_CCError, CCSlice, CCError)
+#endif
+static inline CCResult_CCSlice_CCError cc_script_repo_root(CCSlice argv0,
+                                                          CCArena *arena) {
+    char start[PATH_MAX];
+    char cur[PATH_MAX];
+    if (!arena) {
+        return cc_err_CCResult_CCSlice_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "cc_script_repo_root: no arena"));
+    }
+    start[0] = '\0';
+    if (getcwd(start, sizeof(start)) == NULL) start[0] = '\0';
+    if ((!start[0] || !cc__script_is_repo_root(cc_slice_cstr(start)))
+        && argv0.ptr && argv0.len) {
+        char tmp[PATH_MAX];
+        if (realpath((const char *)argv0.ptr, tmp)) {
+            char *slash = strrchr(tmp, '/');
+            if (slash) {
+                *slash = '\0';
+                strncpy(start, tmp, sizeof(start) - 1);
+                start[sizeof(start) - 1] = '\0';
+            }
+        }
+    }
+    if (!start[0]) {
+        return cc_err_CCResult_CCSlice_CCError(CC_ERROR(CC_ERR_NOT_FOUND, "cc_script_repo_root: no start path"));
+    }
+    strncpy(cur, start, sizeof(cur) - 1);
+    cur[sizeof(cur) - 1] = '\0';
+    for (;;) {
+        if (cc__script_is_repo_root(cc_slice_cstr(cur))) {
+            CCSlice out = cc__script_dup_cstr(arena, cur);
+            if (!out.ptr) {
+                return cc_err_CCResult_CCSlice_CCError(CC_ERROR(CC_ERR_OUT_OF_MEMORY, "cc_script_repo_root: alloc"));
+            }
+            return cc_ok_CCResult_CCSlice_CCError(out);
+        }
+        char *slash = strrchr(cur, '/');
+        if (!slash || slash == cur) break;
+        *slash = '\0';
+    }
+    return cc_err_CCResult_CCSlice_CCError(CC_ERROR(CC_ERR_NOT_FOUND, "cc_script_repo_root: not found"));
+}
+
+/* Join path segments; arena last. Result is NUL-terminated CCSlice. */
+static inline CCSlice cc_script_path_join(CCSlice a, CCSlice b, CCArena *arena) {
+    return cc_path_join(arena, a, b);
+}
+
+static inline bool cc_script_path_exists(CCSlice path) {
+    if (!path.ptr || path.len == 0) return false;
+    return cc_path_exists(path);
+}
+
+#endif /* CC_SCRIPT_PATHX_H */

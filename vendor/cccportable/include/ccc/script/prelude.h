@@ -1,0 +1,18 @@
+/*
+ * Auto-included by the driver for every .shcc translation unit.
+ * Default @errhandler is injected by the script entry rewrite (Concurrent-C
+ * surface that must not pass through .cch → .h lowering).
+ */
+#ifndef CC_SCRIPT_PRELUDE_H
+#define CC_SCRIPT_PRELUDE_H
+
+#include <stdio.h>
+#include <ccc/std/prelude.h>
+#include <ccc/script/stdio.h>
+#include <ccc/std/cli.h>
+#include <ccc/script/pathx.h>
+#include <ccc/script/file.h>
+#include <ccc/script/sh.h>
+#include <ccc/script/temp.h>
+
+#endif /* CC_SCRIPT_PRELUDE_H */

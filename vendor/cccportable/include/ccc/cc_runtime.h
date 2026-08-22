@@ -1,0 +1,80 @@
+#ifndef CC_RUNTIME_H
+#define CC_RUNTIME_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
+#include <ccc/cc_atomic.h>
+#include <ccc/cc_slice.h>
+#include <ccc/cc_arena.h>
+#include <ccc/cc_io_error.h>
+#include <ccc/cc_result.h>
+#include <ccc/cc_channel.h>
+#include <ccc/cc_sched.h>
+#include <ccc/cc_nursery.h>
+#include <ccc/std/task.h>
+
+/* Surface channel helpers (ergonomic layer over CCChanTx/CCChanRx).
+   Canonical lowered/manual-C surface uses the `cc_channel_*` family.
+   Legacy `channel_pair` / `chan_*` spellings remain as compatibility aliases. */
+
+/* Surface constructor marker. This is lowered by the CC frontend; the runtime does not implement it.
+   Declared here to avoid implicit-declaration warnings if the lowering misses a call site. */
+CCChan* channel_pair(CCChanTx* tx, CCChanRx* rx);
+CCChan* cc_channel_pair(CCChanTx* tx, CCChanRx* rx);
+
+/* Legacy compatibility aliases over the canonical channel family. */
+#define chan_send(tx, value) cc_channel_send((tx), (value))
+#define chan_recv(rx, out_ptr) cc_channel_recv((rx), (out_ptr))
+#define chan_try_send(tx, value) cc_channel_try_send((tx), (value))
+#define chan_try_recv(rx, out_ptr) cc_channel_try_recv((rx), (out_ptr))
+#define chan_close(h) cc_channel_close((h))
+#define chan_free(h) cc_channel_free((h))
+#define chan_send_take(tx, value) cc_channel_send_take((tx), (value))
+#define chan_send_task(tx, value) cc_channel_send_task((tx), (value))
+/* Generated closure bodies can still emit these transitional nursery-aware names. */
+#define cc_nursery_send(tx_ptr, value) cc_channel_send(*(tx_ptr), (value))
+#define cc_nursery_recv(rx_ptr, out_ptr) cc_channel_recv(*(rx_ptr), (out_ptr))
+#define cc_nursery_close(h_ptr) cc_channel_close(*(h_ptr))
+
+/* Language-level cancellation helpers.
+   The runtime already provides cc_cancel(CCDeadline*) / cc_is_cancelled(const CCDeadline*).
+   At the language surface, `cc_cancel()` / `cc_is_cancelled()` refer to the current deadline scope
+   established by `with_deadline(...) { ... }` lowering. */
+#define cc_cancel() cc_cancel_current()
+#define cc_is_cancelled() cc_is_cancelled_current()
+
+/* Narrow deadlock-detector suppression for the current dynamic scope.
+   Intended for cases like an intentional parked wait at the edge of the system.
+   Use with `@defer cc_deadlock_suppress_leave();` to keep suppression lexical. */
+void cc_deadlock_suppress_enter(void);
+void cc_deadlock_suppress_leave(void);
+int cc_deadlock_suppressed(void);
+
+/* Mark the current dynamic scope as waiting on external progress.
+   Deadlock detection excludes waits in this scope from the internal graph while
+   the scope is active. This is primarily for runtime wait sites like accept()
+   or direct thread-side I/O waits that depend on outside-world activity. */
+void cc_external_wait_enter(void);
+void cc_external_wait_leave(void);
+int cc_external_wait_active(void);
+
+// Forward declarations for runtime handles.
+typedef struct CCChan CCChan;
+/* CCTask is now defined in <ccc/std/task.h> as a value type */
+
+/* Explicit move primitive.
+   Best-effort: uses GNU statement-expr supported by Clang/GCC.
+   For now we "poison" the moved-from value by zeroing it.
+   The compiler will enforce use-after-move for certain move-only values (e.g. unique slices) over time. */
+#if defined(CC_PARSER_MODE)
+/* During TCC parse-to-stub-AST, macros expand before recording. We emit a real call the recorder can see. */
+static inline void cc__move_marker_impl(void* p) { (void)p; }
+#define cc_move(x) (cc__move_marker_impl(&(x)), (x))
+#else
+#define cc_move(x) ({ __typeof__(x) __cc_tmp = (x); memset(&(x), 0, sizeof(x)); __cc_tmp; })
+#endif
+
+#endif // CC_RUNTIME_H
+

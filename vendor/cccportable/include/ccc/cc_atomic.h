@@ -1,0 +1,116 @@
+/*
+ * Portable atomic operations for Concurrent-C
+ *
+ * Provides a consistent interface across:
+ *   - C11 stdatomic (GCC/Clang; vendored TCC with -std=c11)
+ *   - GCC __sync builtins (older GCC/Clang)
+ *   - Non-atomic fallback (last resort — not thread-safe)
+ *
+ * Usage:
+ *   #include <ccc/cc_atomic.h>
+ *
+ *   cc_atomic_int counter = 0;
+ *   cc_atomic_fetch_add(&counter, 1);
+ *   int val = cc_atomic_load(&counter);
+ *   cc_atomic_store(&counter, 42);
+ *
+ * Vendored TCC: use C11 stdatomic (real CAS under -std=c11). The old
+ * `__TINYC__` non-atomic macros corrupted lock-free structures (e.g.
+ * CCArenaPool freelist) under multi-thread hammer tests.
+ */
+#ifndef CC_ATOMIC_CCH
+#define CC_ATOMIC_CCH
+
+#include <stdint.h>
+#include <stddef.h>
+
+/* Detect stdatomic availability */
+#ifndef __has_include
+#define __has_include(x) 0
+#endif
+
+/* TCC ships a working stdatomic.h once language mode is C11+ (driver adds
+ * -std=c11 for host TCC). Keep the version gate so a bare pre-C11 TCC
+ * build does not pick up a header it cannot honor. */
+#if __has_include(<stdatomic.h>) && \
+    (!defined(__TINYC__) || (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L))
+/* C11 stdatomic - full support */
+#include <stdatomic.h>
+
+typedef _Atomic int cc_atomic_int;
+typedef _Atomic unsigned int cc_atomic_uint;
+typedef _Atomic size_t cc_atomic_size;
+typedef _Atomic int64_t cc_atomic_i64;
+typedef _Atomic uint64_t cc_atomic_u64;
+typedef _Atomic intptr_t cc_atomic_intptr;
+
+#define cc_atomic_fetch_add(ptr, val) atomic_fetch_add_explicit((ptr), (val), memory_order_seq_cst)
+#define cc_atomic_fetch_sub(ptr, val) atomic_fetch_sub_explicit((ptr), (val), memory_order_seq_cst)
+#define cc_atomic_load(ptr) atomic_load_explicit((ptr), memory_order_seq_cst)
+#define cc_atomic_store(ptr, val) atomic_store_explicit((ptr), (val), memory_order_seq_cst)
+#define cc_atomic_cas(ptr, expected_ptr, desired) \
+    atomic_compare_exchange_strong_explicit((ptr), (expected_ptr), (desired), memory_order_seq_cst, memory_order_seq_cst)
+
+#define CC_ATOMIC_HAVE_REAL_ATOMICS 1
+
+#elif defined(__TINYC__)
+/* Bare / pre-C11 TCC: non-atomic CAS. Host driver always passes -std=c11 so
+ * the real-atomics branch above is taken; compiling emitted C outside the
+ * driver without -std=c11 silently picks this and corrupts Treiber freelists. */
+#warning "TINYC without C11: non-atomic CAS fallback. Pass -std=c11 (ccc does)."
+typedef volatile int cc_atomic_int;
+typedef volatile unsigned int cc_atomic_uint;
+typedef volatile size_t cc_atomic_size;
+typedef volatile int64_t cc_atomic_i64;
+typedef volatile uint64_t cc_atomic_u64;
+typedef volatile intptr_t cc_atomic_intptr;
+
+#define cc_atomic_fetch_add(ptr, val) ((*(ptr)) += (val), (*(ptr)) - (val))
+#define cc_atomic_fetch_sub(ptr, val) ((*(ptr)) -= (val), (*(ptr)) + (val))
+#define cc_atomic_load(ptr) (*(ptr))
+#define cc_atomic_store(ptr, val) ((*(ptr)) = (val))
+#define cc_atomic_cas(ptr, expected_ptr, desired) \
+    ((*(ptr) == *(expected_ptr)) ? (*(ptr) = (desired), 1) : (*(expected_ptr) = *(ptr), 0))
+
+#define CC_ATOMIC_HAVE_REAL_ATOMICS 0
+
+#elif defined(__GNUC__) || defined(__clang__)
+/* GCC/Clang __sync builtins - legacy but widely supported */
+typedef volatile int cc_atomic_int;
+typedef volatile unsigned int cc_atomic_uint;
+typedef volatile size_t cc_atomic_size;
+typedef volatile int64_t cc_atomic_i64;
+typedef volatile uint64_t cc_atomic_u64;
+typedef volatile intptr_t cc_atomic_intptr;
+
+#define cc_atomic_fetch_add(ptr, val) __sync_fetch_and_add((ptr), (val))
+#define cc_atomic_fetch_sub(ptr, val) __sync_fetch_and_sub((ptr), (val))
+#define cc_atomic_load(ptr) __sync_fetch_and_add((ptr), 0)
+#define cc_atomic_store(ptr, val) do { __sync_synchronize(); *(ptr) = (val); __sync_synchronize(); } while(0)
+#define cc_atomic_cas(ptr, expected_ptr, desired) \
+    __sync_bool_compare_and_swap((ptr), *(expected_ptr), (desired))
+
+#define CC_ATOMIC_HAVE_REAL_ATOMICS 1
+
+#else
+/* Unknown compiler - non-atomic fallback */
+typedef volatile int cc_atomic_int;
+typedef volatile unsigned int cc_atomic_uint;
+typedef volatile size_t cc_atomic_size;
+typedef volatile int64_t cc_atomic_i64;
+typedef volatile uint64_t cc_atomic_u64;
+typedef volatile intptr_t cc_atomic_intptr;
+
+#define cc_atomic_fetch_add(ptr, val) ((*(ptr)) += (val), (*(ptr)) - (val))
+#define cc_atomic_fetch_sub(ptr, val) ((*(ptr)) -= (val), (*(ptr)) + (val))
+#define cc_atomic_load(ptr) (*(ptr))
+#define cc_atomic_store(ptr, val) ((*(ptr)) = (val))
+#define cc_atomic_cas(ptr, expected_ptr, desired) \
+    ((*(ptr) == *(expected_ptr)) ? (*(ptr) = (desired), 1) : (*(expected_ptr) = *(ptr), 0))
+
+#define CC_ATOMIC_HAVE_REAL_ATOMICS 0
+#warning "Unknown compiler - using non-atomic fallback. Not thread-safe!"
+
+#endif
+
+#endif /* CC_ATOMIC_CCH */

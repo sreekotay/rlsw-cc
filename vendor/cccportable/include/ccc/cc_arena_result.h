@@ -1,0 +1,72 @@
+/*
+ * Result surface for arena checkpoint/restore.
+ *
+ * Lives outside cc_arena.cch because that header is seeded as host C for the
+ * compiler. C twins (`cc_arena_checkpoint` / `cc_arena_restore`) stay in
+ * cc_arena.cch for `@scratch`. CCS: `a.try_checkpoint() !>` /
+ * `cp.try_restore() !>` (or `@destroy` on the handle, which restores).
+ */
+#ifndef CC_ARENA_RESULT_H
+#define CC_ARENA_RESULT_H
+
+#include <ccc/cc_arena.h>
+#include <ccc/cc_result.h>
+
+#ifndef CCResult_CCArenaCheckpoint_CCError_DEFINED
+#define CCResult_CCArenaCheckpoint_CCError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCArenaCheckpoint_CCError_DEFINED
+#define CCResult_CCArenaCheckpoint_CCError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCArenaCheckpoint_CCError, CCArenaCheckpoint, CCError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_CCArenaCheckpoint_CCError, CCArenaCheckpoint, CCError)
+#endif
+
+static inline CCResult_CCArenaCheckpoint_CCError cc_arena_try_checkpoint(CCArena *arena) {
+    CCArenaCheckpoint cp = cc_arena_checkpoint(arena);
+    if (!cp.arena) {
+        return cc_err_CCResult_CCArenaCheckpoint_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "cc_arena_checkpoint: refused"));
+    }
+    return cc_ok_CCResult_CCArenaCheckpoint_CCError(cp);
+}
+
+static inline CCResult_void_CCError cc_arena_try_restore(CCArenaCheckpoint checkpoint) {
+    if (!cc_arena_restore(checkpoint)) {
+        return cc_err_CCResult_void_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "cc_arena_restore: refused"));
+    }
+    return cc_ok_CCResult_void_CCError();
+}
+
+#ifndef CCResult_CCArenaPtr_CCError_DEFINED
+#define CCResult_CCArenaPtr_CCError_DEFINED 1
+typedef CCArena* CCArenaPtr;
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCArenaPtr_CCError_DEFINED
+#define CCResult_CCArenaPtr_CCError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCArenaPtr_CCError, CCArenaPtr, CCError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_CCArenaPtr_CCError, CCArenaPtr, CCError)
+#endif
+
+/* Result face over cc_arena_adopt (which reports the specific refusal and
+ * returns NULL; the plain form already composes with `!>` as a nullable
+ * pointer). CCS: `parent->try_adopt(&a) !>`. */
+static inline CCResult_CCArenaPtr_CCError cc_arena_try_adopt(CCArena* parent, CCArena* src) {
+    CCArena* h = cc_arena_adopt(parent, src);
+    if (!h) {
+        return cc_err_CCResult_CCArenaPtr_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "cc_arena_adopt: refused"));
+    }
+    return cc_ok_CCResult_CCArenaPtr_CCError(h);
+}
+
+static inline CCResult_void_CCError cc_arena_checkpoint_try_restore(CCArenaCheckpoint *cp) {
+    if (!cp || !cp->arena) {
+        return cc_err_CCResult_void_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "cc_arena_restore: already consumed"));
+    }
+    if (!cc_arena_checkpoint_restore(cp)) {
+        return cc_err_CCResult_void_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "cc_arena_restore: refused"));
+    }
+    return cc_ok_CCResult_void_CCError();
+}
+
+#endif /* CC_ARENA_RESULT_H */

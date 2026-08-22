@@ -1,0 +1,300 @@
+#!ccc ccs
+/* rlsw-cc phase 2: emit triangle-level integer span pipelines.
+ *
+ * Each sw_gen_span_* is a complete span fill (affine blocks + pixels) with
+ * depth/blend/tex/filter/wrap baked in — PB/rlsw template style. The triangle
+ * edge walk calls it by direct name (no function-pointer in the hot loop).
+ *
+ * Regenerate: ./tools/gen.sh
+ *
+ * Emit strings are indented as the lowered C should read (levenshtein style).
+ */
+#pragma(@prelude) off
+#ifdef CC_PARSER_MODE
+#include "span_kernels_host.h"
+#endif
+
+@comptime {
+    /* Host stubs (CC_PARSER_MODE) for ccc typecheck; inert when #included from rlsw.h. */
+
+    for (int depth = 0; depth < 2; depth++) {
+        for (int blend = 0; blend < 2; blend++) {
+            const char *dname = depth ? "d1" : "d0";
+            const char *bname = blend ? "b1" : "b0";
+
+            /* ---- color-only pipeline ---- */
+            @emit(CC_EMIT_AT_COMPTIME_SITE, `
+                static void sw_gen_span_${dname}_${bname}_c(sw_fill_ctx_t *fc, const sw_vertex_t *start, const sw_vertex_t *end,
+                                                            float dUdy, float dVdy)
+                {
+                    (void)dUdy; (void)dVdy;
+                    int xStart = (int)start->position[0];
+                    int xEnd = (int)end->position[0];
+                    if (xStart == xEnd || !fc->planes->valid) return;
+                    int y = (int)start->position[1];
+                    int baseOffset = y*RLSW.colorBuffer->width + xStart;
+                    uint8_t *cPtr = (uint8_t *)(RLSW.colorBuffer->pixels) + baseOffset*SW_FRAMEBUFFER_COLOR_SIZE;
+            `);
+            if (depth) {
+                @emit(CC_EMIT_AT_COMPTIME_SITE, `
+                    uint8_t *dPtr = (uint8_t *)(RLSW.depthBuffer->pixels) + baseOffset*SW_FRAMEBUFFER_DEPTH_SIZE;
+                `);
+            }
+            @emit(CC_EMIT_AT_COMPTIME_SITE, `
+                    int64_t bu = 0, bv = 0;
+                    float fu = 0.0f, fv = 0.0f, dfu = 0.0f, dfv = 0.0f;
+                    float dWdxN, wA, uA, vA, cA[4];
+                    if (fc->planes->baryFix) {
+                        sw_tri_bary_at(fc->planes, xStart, y, &bu, &bv);
+                        dWdxN = sw_tri_dwdx(fc->planes);
+                        sw_tri_attrib(fc->planes, bu, bv, &wA, &uA, &vA, cA);
+                    } else {
+                        float xs = (float)(xStart - fc->planes->xplane);
+                        float ys = (float)(y - fc->planes->yplane);
+                        fu = fc->planes->buf + xs*fc->planes->dbudxf + ys*fc->planes->dbudyf;
+                        fv = fc->planes->bvf + xs*fc->planes->dbvdxf + ys*fc->planes->dbvdyf;
+                        dfu = fc->planes->dbudxf; dfv = fc->planes->dbvdxf;
+                        dWdxN = dfu*fc->planes->p1.position[3] + dfv*fc->planes->p2.position[3]
+                                + (-dfu - dfv)*fc->planes->p3.position[3];
+                        sw_tri_attrib_f(fc->planes, fu, fv, &wA, &uA, &vA, cA);
+                    }
+                    (void)uA; (void)vA;
+                    int x = xStart;
+                    while (x < xEnd) {
+                        int remain = xEnd - x;
+                        int block = 16;
+                        if (RLSW.adaptiveAffine && remain >= 16) {
+                            float adw = (dWdxN < 0.0f) ? -dWdxN : dWdxN;
+                            if (adw > 1e-8f) {
+                                float aw = (wA < 0.0f) ? -wA : wA;
+                                float adapt = sqrtf(4.0f + 3.0f*(aw/adw));
+                                if (adapt < 4.0f) adapt = 4.0f;
+                                if (adapt > 64.0f) adapt = 64.0f;
+                                block = (int)adapt;
+                            }
+                        }
+                        int blockEnd = x + block;
+                        if (blockEnd > xEnd) blockEnd = xEnd;
+                        int len = blockEnd - x;
+                        float lenRcp = 1.0f/(float)len;
+                        float wB, uB, vB, cB[4];
+                        int64_t buB = bu, bvB = bv;
+                        if (fc->planes->baryFix) {
+                            buB = bu + (int64_t)len*fc->planes->dbudx;
+                            bvB = bv + (int64_t)len*fc->planes->dbvdx;
+                            sw_tri_attrib(fc->planes, buB, bvB, &wB, &uB, &vB, cB);
+                        } else {
+                            sw_tri_attrib_f(fc->planes, fu + (float)len*dfu, fv + (float)len*dfv, &wB, &uB, &vB, cB);
+                        }
+                        (void)uB; (void)vB;
+                        float wRcpA = 1.0f/wA, wRcpB = 1.0f/wB;
+                        int32_t cr = sw_to_8_24(cA[0]*wRcpA);
+                        int32_t cg = sw_to_8_24(cA[1]*wRcpA);
+                        int32_t cb = sw_to_8_24(cA[2]*wRcpA);
+                        int32_t ca = sw_to_8_24(cA[3]*wRcpA);
+                        int32_t dcr = sw_to_8_24((cB[0]*wRcpB - cA[0]*wRcpA)*lenRcp);
+                        int32_t dcg = sw_to_8_24((cB[1]*wRcpB - cA[1]*wRcpA)*lenRcp);
+                        int32_t dcb = sw_to_8_24((cB[2]*wRcpB - cA[2]*wRcpA)*lenRcp);
+                        int32_t dca = sw_to_8_24((cB[3]*wRcpB - cA[3]*wRcpA)*lenRcp);
+            `);
+            if (depth) {
+                @emit(CC_EMIT_AT_COMPTIME_SITE, `
+                        float pw = wA;
+                        for (; x < blockEnd; x++) {
+                            float depthv = SW_FRAMEBUFFER_DEPTH_GET(dPtr, 0);
+                            if (pw < depthv) goto discard_c_${dname}_${bname};
+                            SW_FRAMEBUFFER_DEPTH_SET(dPtr, pw, 0);
+                            uint32_t src = sw_rgba8_from_color24(cr, cg, cb, ca);
+                `);
+            } else {
+                @emit(CC_EMIT_AT_COMPTIME_SITE, `
+                        for (; x < blockEnd; x++) {
+                            uint32_t src = sw_rgba8_from_color24(cr, cg, cb, ca);
+                `);
+            }
+            if (blend) {
+                @emit(CC_EMIT_AT_COMPTIME_SITE, `
+                            *(uint32_t *)cPtr = sw_blend_src_over_rgba8(*(const uint32_t *)cPtr, src);
+                `);
+            } else {
+                @emit(CC_EMIT_AT_COMPTIME_SITE, `
+                            *(uint32_t *)cPtr = src;
+                `);
+            }
+            @emit(CC_EMIT_AT_COMPTIME_SITE, `
+                        discard_c_${dname}_${bname}:
+                            cr += dcr; cg += dcg; cb += dcb; ca += dca;
+                            cPtr += SW_FRAMEBUFFER_COLOR_SIZE;
+            `);
+            if (depth) {
+                @emit(CC_EMIT_AT_COMPTIME_SITE, `
+                            pw += dWdxN;
+                            dPtr += SW_FRAMEBUFFER_DEPTH_SIZE;
+                `);
+            }
+            @emit(CC_EMIT_AT_COMPTIME_SITE, `
+                        }
+                        if (fc->planes->baryFix) { bu = buB; bv = bvB; }
+                        else { fu += (float)len*dfu; fv += (float)len*dfv; }
+                        wA = wB;
+                        cA[0] = cB[0]; cA[1] = cB[1]; cA[2] = cB[2]; cA[3] = cB[3];
+                    }
+                }
+            `);
+        }
+    }
+
+    const char *wrap_fetch_near[3] = {
+        "sw_texel_nearest_pot(texels, tw, umask, vmask, iu, iv)",
+        "sw_texel_nearest_npot(texels, tw, th, iu, iv)",
+        "sw_texel_nearest_clamp(texels, tw, th, iu, iv)",
+    };
+    const char *wrap_fetch_lin[3] = {
+        "sw_texel_bilerp_pot(texels, tw, umask, vmask, iu, iv)",
+        "sw_texel_bilerp_npot(texels, tw, th, iu, iv)",
+        "sw_texel_bilerp_clamp(texels, tw, th, iu, iv)",
+    };
+    const char *wname[3] = { "w0", "w1", "w2" };
+
+    for (int depth = 0; depth < 2; depth++) {
+        for (int blend = 0; blend < 2; blend++) {
+            for (int filter = 0; filter < 2; filter++) {
+                for (int wrap = 0; wrap < 3; wrap++) {
+                    const char *dname = depth ? "d1" : "d0";
+                    const char *bname = blend ? "b1" : "b0";
+                    const char *fname = filter ? "f1" : "f0";
+                    const char *fetch = filter ? wrap_fetch_lin[wrap] : wrap_fetch_near[wrap];
+                    @emit(CC_EMIT_AT_COMPTIME_SITE, `
+                        static void sw_gen_span_${dname}_${bname}_t_${fname}_${wname[wrap]}(sw_fill_ctx_t *fc, const sw_vertex_t *start, const sw_vertex_t *end,
+                                                                    float dUdy, float dVdy)
+                        {
+                            (void)dUdy; (void)dVdy;
+                            int xStart = (int)start->position[0];
+                            int xEnd = (int)end->position[0];
+                            if (xStart == xEnd || !fc->planes->valid) return;
+                            const sw_texture_t *itex = sw_fill_tex(fc);
+                            if (itex == NULL) return;
+                            const uint32_t *texels = (const uint32_t *)itex->pixels;
+                            int tw = itex->width, th = itex->height;
+                            int umask = itex->wMinus1, vmask = itex->hMinus1;
+                            float twf = (float)tw, thf = (float)th;
+                            int y = (int)start->position[1];
+                            int baseOffset = y*RLSW.colorBuffer->width + xStart;
+                            uint8_t *cPtr = (uint8_t *)(RLSW.colorBuffer->pixels) + baseOffset*SW_FRAMEBUFFER_COLOR_SIZE;
+                    `);
+                    if (depth) {
+                        @emit(CC_EMIT_AT_COMPTIME_SITE, `
+                            uint8_t *dPtr = (uint8_t *)(RLSW.depthBuffer->pixels) + baseOffset*SW_FRAMEBUFFER_DEPTH_SIZE;
+                        `);
+                    }
+                    @emit(CC_EMIT_AT_COMPTIME_SITE, `
+                            int64_t bu = 0, bv = 0;
+                            float fu = 0.0f, fv = 0.0f, dfu = 0.0f, dfv = 0.0f;
+                            float dWdxN, wA, uA, vA, cA[4];
+                            if (fc->planes->baryFix) {
+                                sw_tri_bary_at(fc->planes, xStart, y, &bu, &bv);
+                                dWdxN = sw_tri_dwdx(fc->planes);
+                                sw_tri_attrib(fc->planes, bu, bv, &wA, &uA, &vA, cA);
+                            } else {
+                                float xs = (float)(xStart - fc->planes->xplane);
+                                float ys = (float)(y - fc->planes->yplane);
+                                fu = fc->planes->buf + xs*fc->planes->dbudxf + ys*fc->planes->dbudyf;
+                                fv = fc->planes->bvf + xs*fc->planes->dbvdxf + ys*fc->planes->dbvdyf;
+                                dfu = fc->planes->dbudxf; dfv = fc->planes->dbvdxf;
+                                dWdxN = dfu*fc->planes->p1.position[3] + dfv*fc->planes->p2.position[3]
+                                        + (-dfu - dfv)*fc->planes->p3.position[3];
+                                sw_tri_attrib_f(fc->planes, fu, fv, &wA, &uA, &vA, cA);
+                            }
+                            int x = xStart;
+                            while (x < xEnd) {
+                                int remain = xEnd - x;
+                                int block = 16;
+                                if (RLSW.adaptiveAffine && remain >= 16) {
+                                    float adw = (dWdxN < 0.0f) ? -dWdxN : dWdxN;
+                                    if (adw > 1e-8f) {
+                                        float aw = (wA < 0.0f) ? -wA : wA;
+                                        float adapt = sqrtf(4.0f + 3.0f*(aw/adw));
+                                        if (adapt < 4.0f) adapt = 4.0f;
+                                        if (adapt > 64.0f) adapt = 64.0f;
+                                        block = (int)adapt;
+                                    }
+                                }
+                                int blockEnd = x + block;
+                                if (blockEnd > xEnd) blockEnd = xEnd;
+                                int len = blockEnd - x;
+                                float lenRcp = 1.0f/(float)len;
+                                float wB, uB, vB, cB[4];
+                                int64_t buB = bu, bvB = bv;
+                                if (fc->planes->baryFix) {
+                                    buB = bu + (int64_t)len*fc->planes->dbudx;
+                                    bvB = bv + (int64_t)len*fc->planes->dbvdx;
+                                    sw_tri_attrib(fc->planes, buB, bvB, &wB, &uB, &vB, cB);
+                                } else {
+                                    sw_tri_attrib_f(fc->planes, fu + (float)len*dfu, fv + (float)len*dfv, &wB, &uB, &vB, cB);
+                                }
+                                float wRcpA = 1.0f/wA, wRcpB = 1.0f/wB;
+                                float u0 = uA*wRcpA, v0 = vA*wRcpA;
+                                float u1 = uB*wRcpB, v1 = vB*wRcpB;
+                                int32_t iu = sw_to_16_16(u0*twf);
+                                int32_t iv = sw_to_16_16(v0*thf);
+                                int32_t diu = sw_to_16_16((u1 - u0)*lenRcp*twf);
+                                int32_t div = sw_to_16_16((v1 - v0)*lenRcp*thf);
+                                int32_t cr = sw_to_8_24(cA[0]*wRcpA);
+                                int32_t cg = sw_to_8_24(cA[1]*wRcpA);
+                                int32_t cb = sw_to_8_24(cA[2]*wRcpA);
+                                int32_t ca = sw_to_8_24(cA[3]*wRcpA);
+                                int32_t dcr = sw_to_8_24((cB[0]*wRcpB - cA[0]*wRcpA)*lenRcp);
+                                int32_t dcg = sw_to_8_24((cB[1]*wRcpB - cA[1]*wRcpA)*lenRcp);
+                                int32_t dcb = sw_to_8_24((cB[2]*wRcpB - cA[2]*wRcpA)*lenRcp);
+                                int32_t dca = sw_to_8_24((cB[3]*wRcpB - cA[3]*wRcpA)*lenRcp);
+                    `);
+                    if (depth) {
+                        @emit(CC_EMIT_AT_COMPTIME_SITE, `
+                                float pw = wA;
+                                for (; x < blockEnd; x++) {
+                                    float depthv = SW_FRAMEBUFFER_DEPTH_GET(dPtr, 0);
+                                    if (pw < depthv) goto discard_t_${dname}_${bname}_${fname}_${wname[wrap]};
+                                    SW_FRAMEBUFFER_DEPTH_SET(dPtr, pw, 0);
+                                    uint32_t src = sw_modulate_rgba8(${fetch}, cr, cg, cb, ca);
+                        `);
+                    } else {
+                        @emit(CC_EMIT_AT_COMPTIME_SITE, `
+                                for (; x < blockEnd; x++) {
+                                    uint32_t src = sw_modulate_rgba8(${fetch}, cr, cg, cb, ca);
+                        `);
+                    }
+                    if (blend) {
+                        @emit(CC_EMIT_AT_COMPTIME_SITE, `
+                                    *(uint32_t *)cPtr = sw_blend_src_over_rgba8(*(const uint32_t *)cPtr, src);
+                        `);
+                    } else {
+                        @emit(CC_EMIT_AT_COMPTIME_SITE, `
+                                    *(uint32_t *)cPtr = src;
+                        `);
+                    }
+                    @emit(CC_EMIT_AT_COMPTIME_SITE, `
+                                discard_t_${dname}_${bname}_${fname}_${wname[wrap]}:
+                                    cr += dcr; cg += dcg; cb += dcb; ca += dca;
+                                    iu += diu; iv += div;
+                                    cPtr += SW_FRAMEBUFFER_COLOR_SIZE;
+                    `);
+                    if (depth) {
+                        @emit(CC_EMIT_AT_COMPTIME_SITE, `
+                                    pw += dWdxN;
+                                    dPtr += SW_FRAMEBUFFER_DEPTH_SIZE;
+                        `);
+                    }
+                    @emit(CC_EMIT_AT_COMPTIME_SITE, `
+                                }
+                                if (fc->planes->baryFix) { bu = buB; bv = bvB; }
+                                else { fu += (float)len*dfu; fv += (float)len*dfv; }
+                                wA = wB; uA = uB; vA = vB;
+                                cA[0] = cB[0]; cA[1] = cB[1]; cA[2] = cB[2]; cA[3] = cB[3];
+                            }
+                        }
+                    `);
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,16 @@
+/*
+ * Arena-backed hash map for Concurrent-C stdlib (inline open-addressing).
+ *
+ * For wide values prefer <ccc/std/array_map.h> (u32 probe index + dense rows).
+ *
+ * Full API: include this header directly, or use prelude (map_forward only)
+ * plus compiler-emitted map_impl at CC_EMIT_AFTER_PRELUDE.
+ *
+ * See map_forward.cch / map_impl.cch and COMPTIME_INSTANTIATION_SEAM.md.
+ */
+#ifndef CC_STD_MAP_H
+#define CC_STD_MAP_H
+
+#include "map_forward.h"
+
+#endif /* CC_STD_MAP_H */

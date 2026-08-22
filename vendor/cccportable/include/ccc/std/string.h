@@ -1,0 +1,1186 @@
+/*
+ * Header-only string builder and arena-backed helpers for Concurrent-C stdlib.
+ * Pure slice operations live in cc_slice.cch.
+ */
+#ifndef CC_STD_STRING_H
+#define CC_STD_STRING_H
+
+#include <ccc/cc_compat.h>
+#include <ctype.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <errno.h>
+#include <limits.h>
+#include <stdint.h>
+#include <math.h>
+
+/* CC_COMPTIME: the comptime executor includes the stdlib headers to get their
+ * inline vocabulary, but its standalone TCC TU can't link the compiled runtime.
+ * Under the flag we (a) skip the heavy transitive headers (cc_runtime/cc_type/
+ * cc_ufcs/vec) — which is also what transitively pulls channel/future symbols
+ * the comptime TU can never call — and the machinery that needs them (CCVec_char,
+ * result specs, parse helpers), and (b) provide the otherwise runtime-backed
+ * cc_string_* functions as `static inline` (see the matching block below).
+ * The builder itself only needs the inline slice/arena vocabulary, already in
+ * the comptime prelude. See cc/docs/COMPTIME_CAPABILITY_MODEL.md §7b. */
+#ifndef CC_COMPTIME
+#include <ccc/cc_runtime.h>
+#include <ccc/cc_type.h>
+#include <ccc/cc_ufcs.h>
+#include <ccc/std/vec.h>
+
+/* CCVec_char may already be declared by vec.cch in parser mode. */
+#ifndef CC_VEC_CHAR_DEFINED
+#define CC_VEC_CHAR_DEFINED 1
+CC_VEC_DECL_ARENA(char, CCVec_char)
+#endif
+#endif /* !CC_COMPTIME */
+
+typedef struct CCString {
+    union {
+        char *data;
+        char inline_buf[sizeof(void *)];
+        uintptr_t _inline_word;
+    };
+    uint32_t len;
+    uint32_t cap;
+} CCString;
+
+#ifndef CC_STRING_INLINE_CAP
+#define CC_STRING_INLINE_CAP (sizeof(void *))
+#endif
+
+#if UINTPTR_MAX == UINT64_MAX
+_Static_assert(sizeof(CCString) == 16, "CCString should stay compact on 64-bit targets");
+#endif
+
+typedef struct CCStringHeapHeader {
+    CCArena *arena;
+    uint64_t provenance;
+} CCStringHeapHeader;
+
+/* Sticky failure poison.
+ *
+ * CCString is an OWNER (CCSlice borrows; CCString owns its bytes, inline or
+ * via the arena recorded in its heap header). Growth/OOM failures poison the
+ * owner instead of leaving a silently truncated string behind: without this,
+ * a mid-template push that fails is skipped while later pushes succeed,
+ * yielding corrupted output with no signal — and an owner that failed to
+ * acquire must be distinguishable from an owner of the empty string.
+ * `len == CC_STRING_LEN_POISON` is unreachable for valid strings (reserve
+ * rejects need > UINT32_MAX, so len is always at most UINT32_MAX - 1), so
+ * the sentinel costs no struct space and keeps the 16-byte ABI.
+ *
+ * Poisoned semantics: every push* is a sticky no-op returning NULL,
+ * cc_string_len() reads 0, as_slice() is empty, cstr() is NULL. Check with
+ * cc_string_failed(); clear() empties in place (keeps backing); release()
+ * drops heap and zeroes the struct — use release before arena reset. */
+#define CC_STRING_LEN_POISON UINT32_MAX
+static inline bool cc_string_failed(const CCString *str) {
+    return str && str->len == CC_STRING_LEN_POISON;
+}
+static inline void cc__string_poison(CCString *str) {
+    if (str) str->len = CC_STRING_LEN_POISON;
+}
+
+/* Declared niche for @variant(packed) (spec/draft_variants.md §11).
+ *
+ * CCString's first word is SSO (inline bytes OR a pointer), so no sentinel
+ * over word 0 is sound.  The niche instead lives in the `cap` field: a valid
+ * CCString never has `cap == CC_STRING_CAP_NICHE`.  Inline cap is
+ * CC_STRING_INLINE_CAP (8); heap cap is a real allocation size grown by
+ * doubling from CC_STRING_INLINE_CAP (cc_string_reserve), so every non-zero
+ * cap is a power of two <= UINT32_MAX.  0xFFFFFFFF is not a power of two and
+ * is therefore unreachable — reserving it as a niche costs no struct space and
+ * is distinct from the `len == UINT32_MAX` poison sentinel (cc_string_failed
+ * stays a len test, orthogonal to the cap niche). */
+#define CC_STRING_CAP_NICHE UINT32_MAX
+#if UINTPTR_MAX == UINT64_MAX
+_Static_assert(offsetof(CCString, cap) == 12,
+               "CCString cap niche assumes cap at byte offset 12 on 64-bit targets");
+_Static_assert(sizeof(((CCString *)0)->cap) == 4, "CCString cap is 4 bytes wide");
+_Static_assert(CC_STRING_INLINE_CAP != CC_STRING_CAP_NICHE,
+               "the inline cap must never collide with the niche sentinel");
+#endif
+
+
+/* Register the cap-field niche so a @variant(packed) arm of type CCString
+ * donates it to carry the discriminant.  See spec §11. */
+
+
+// ------------------------- Parse error enums ------------------------------
+typedef enum {
+    CC_I64_PARSE_INVALID_CHAR = 1,
+    CC_I64_PARSE_OVERFLOW,
+    CC_I64_PARSE_UNDERFLOW,
+} CC_I64ParseError;
+
+typedef enum {
+    CC_U64_PARSE_INVALID_CHAR = 1,
+    CC_U64_PARSE_OVERFLOW,
+} CC_U64ParseError;
+
+typedef enum {
+    CC_F64_PARSE_INVALID_CHAR = 1,
+    CC_F64_PARSE_OVERFLOW,
+} CC_F64ParseError;
+
+typedef enum {
+    CC_BOOL_PARSE_INVALID_VALUE = 1,
+} CC_BoolParseError;
+
+#ifndef CC_COMPTIME
+CC_DECL_RESULT_SPEC(CCResult_int64_t_CC_I64ParseError, int64_t, CC_I64ParseError)
+CC_DECL_RESULT_SPEC(CCResult_uint64_t_CC_U64ParseError, uint64_t, CC_U64ParseError)
+CC_DECL_RESULT_SPEC(CCResult_double_CC_F64ParseError, double, CC_F64ParseError)
+CC_DECL_RESULT_SPEC(CCResult_bool_CC_BoolParseError, bool, CC_BoolParseError)
+
+/* Stdlib-predeclared CCError result specs (owned by std/slice.cch, which
+ * prelude includes first; duplicated here under the same guards so TUs
+ * that include string.cch alone still complete the types referenced by
+ * the per-TU `__cc_uw_*` result arms). */
+#ifndef CCResult_int64_t_CCError_DEFINED
+#define CCResult_int64_t_CCError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_int64_t_CCError, int64_t, CCError)
+#endif
+#ifndef CCResult_uint64_t_CCError_DEFINED
+#define CCResult_uint64_t_CCError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_uint64_t_CCError, uint64_t, CCError)
+#endif
+#ifndef CCResult_double_CCError_DEFINED
+#define CCResult_double_CCError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_double_CCError, double, CCError)
+#endif
+#endif /* !CC_COMPTIME */
+
+// ----------------------- Arena-backed slice helpers -------------------------
+
+static inline CCSlice cc_slice_clone(CCArena *arena, CCSlice s) {
+    if (!arena || s.len == 0) return s.len == 0 ? cc_slice_empty() : s;
+    CCSlice stable = cc_arena_alloc_slice_bytes(arena, s.len);
+    if (!stable.ptr) return cc_slice_empty();
+    if (s.ptr && s.len) memcpy(stable.ptr, s.ptr, s.len);
+    return stable;
+}
+
+static inline char *cc_slice_c_str(CCArena *arena, CCSlice s) {
+    if (!arena) return NULL;
+    char *buf = (char *)cc_arena_alloc(arena, s.len + 1, sizeof(char));
+    if (!buf) return NULL;
+    if (s.ptr && s.len) memcpy(buf, s.ptr, s.len);
+    buf[s.len] = '\0';
+    return buf;
+}
+
+static inline CCSliceArray cc_slice_split_all(CCArena *arena, CCSlice s, CCSlice delim) {
+    CCSliceArray arr = {0};
+    if (!arena) return arr;
+    if (delim.len == 0) {
+        arr.len = 1;
+        arr.items = (CCSlice *)cc_arena_alloc(arena, sizeof(CCSlice), sizeof(void*));
+        if (arr.items) arr.items[0] = s;
+        return arr;
+    }
+    size_t parts = 1 + cc_slice_count(s, delim);
+    arr.items = (CCSlice *)cc_arena_alloc(arena, parts * sizeof(CCSlice), sizeof(void*));
+    if (!arr.items) return arr;
+    size_t idx = 0; size_t out = 0;
+    while (idx <= s.len && out < parts) {
+        bool found = false;
+        size_t pos = cc_slice_index_of(cc_slice_sub(s, idx, s.len), delim, &found);
+        if (!found) {
+            arr.items[out++] = cc_slice_sub(s, idx, s.len);
+            break;
+        }
+        arr.items[out++] = cc_slice_sub(s, idx, idx + pos);
+        idx += pos + delim.len;
+    }
+    arr.len = out;
+    return arr;
+}
+
+/*
+ * Concat helpers.
+ *
+ * `cc_slice_concat_*` stays close to the slice model and is pure except for the
+ * arena-backed allocation wrapper. This keeps the low-level pieces suitable for
+ * future comptime evaluation while still giving runtime code an ergonomic
+ * `cc_concat(arena, ...)` surface.
+ */
+static inline size_t cc_slice_concat_lenv(const CCSlice *parts, size_t count) {
+    size_t total = 0;
+    if (!parts) return 0;
+    for (size_t i = 0; i < count; ++i) {
+        total += parts[i].len;
+    }
+    return total;
+}
+
+static inline CCSlice cc_slice_concat_into(void *dst, size_t cap, const CCSlice *parts, size_t count) {
+    size_t total = cc_slice_concat_lenv(parts, count);
+    uint8_t *out = (uint8_t *)dst;
+    size_t off = 0;
+    if (total == 0) return cc_slice_empty();
+    if (!out || cap < total) return cc_slice_empty();
+    for (size_t i = 0; i < count; ++i) {
+        if (!parts[i].ptr || parts[i].len == 0) continue;
+        memcpy(out + off, parts[i].ptr, parts[i].len);
+        off += parts[i].len;
+    }
+    return cc_slice_from_parts(dst, total, CC_SLICE_ID_UNTRACKED);
+}
+
+static inline CCSlice cc_slice_concat_many(CCArena *arena, const CCSlice *parts, size_t count) {
+    size_t total = cc_slice_concat_lenv(parts, count);
+    void *buf;
+    if (total == 0) return cc_slice_empty();
+    if (!arena) return cc_slice_empty();
+    buf = cc_arena_alloc(arena, total, sizeof(char));
+    if (!buf) return cc_slice_empty();
+    return cc_slice_concat_into(buf, total, parts, count);
+}
+
+// ------------------------- String builder ---------------------------------
+
+static inline CCString cc_string_new(void) {
+    CCString s = {0};
+    s.cap = CC_STRING_INLINE_CAP;
+    return s;
+}
+#ifdef CC_COMPTIME
+/* Comptime: forward-declare as static inline; bodies defined at end of file
+ * (after the cc_string_push/from macros they depend on). */
+static inline CCString cc_string_with_capacity(CCArena *arena, size_t cap);
+static inline CCString cc_string_from_slice(CCArena *arena, CCSlice slice);
+static inline CCString* cc_string_push_buffer(CCString *str, const char *buffer, uint32_t len, CCArena *arena);
+static inline CCString* cc_string_push_slice(CCString *str, CCSlice data, CCArena *arena);
+static inline CCString* cc_string_clear(CCString *str);
+static inline CCSlice cc_string_as_slice(const CCString *str);
+static inline const char *cc_string_cstr(CCString *str, CCArena *arena);
+static inline uint64_t cc_string_provenance(const CCString *str);
+#else
+CCString cc_string_with_capacity(CCArena *arena, size_t cap);
+CCString cc_string_from_slice(CCArena *arena, CCSlice slice);
+CCString* cc_string_push_buffer(CCString *str, const char *buffer, uint32_t len, CCArena *arena);
+CCString* cc_string_push_slice(CCString *str, CCSlice data, CCArena *arena);
+CCString* cc_string_clear(CCString *str);
+CCSlice cc_string_as_slice(const CCString *str);
+const char *cc_string_cstr(CCString *str, CCArena *arena);
+uint64_t cc_string_provenance(const CCString *str);
+#endif
+static inline CCSlice cc_string_persist_slice(CCArena *arena, const CCString *str);
+/* string-template(policy, `...`, a): tag is empty for ${expr}; $~name{expr} passes tag "name". */
+typedef CCSlice (*CCStringPolicy)(CCArena *arena, CCSlice tag, CCSlice value);
+#ifdef __cplusplus
+extern "C" {
+#endif
+/* Provided by cc/runtime/float_format_zmij.c (linked into the runtime object). */
+char *cc_zmij_f64_to_string(double v, char *buf);
+char *cc_zmij_f32_to_string(float v, char *buf);
+#ifdef __cplusplus
+}
+#endif
+static inline size_t cc_string_len(const CCString *str) {
+    if (!str || cc_string_failed(str)) return 0;
+    return str->len;
+}
+static inline size_t cc_string_cap(const CCString *str) {
+    return str ? str->cap : 0;
+}
+
+static inline bool cc_string_is_inline(const CCString *str) {
+    return str && str->cap > 0 && str->cap <= CC_STRING_INLINE_CAP;
+}
+
+static inline const char *cc_string_data_const(const CCString *str) {
+    if (!str) return NULL;
+    if (cc_string_is_inline(str)) return str->inline_buf;
+    return str->data;
+}
+
+static inline char *cc_string_data(CCString *str) {
+    return (char *)cc_string_data_const((const CCString *)str);
+}
+
+static inline const char *cc_string_heap_data_const(const CCString *str) {
+    if (!str) return NULL;
+    return cc_string_is_inline(str) ? NULL : str->data;
+}
+
+static inline char *cc_string_heap_data(CCString *str) {
+    return (char *)cc_string_heap_data_const((const CCString *)str);
+}
+
+static inline CCStringHeapHeader *cc__string_heap_header_from_data(const void *data) {
+    if (!data) return NULL;
+    return (CCStringHeapHeader *)((uint8_t *)data - sizeof(CCStringHeapHeader));
+}
+
+static inline CCStringHeapHeader *cc__string_heap_header(const CCString *str) {
+    if (!str || cc_string_is_inline(str) || !str->data) return NULL;
+    return cc__string_heap_header_from_data(str->data);
+}
+
+static inline CCArena *cc_string_arena(const CCString *str) {
+    CCStringHeapHeader *header = cc__string_heap_header(str);
+    return header ? header->arena : NULL;
+}
+
+/* Grow heap storage to at least `need` bytes. When the string already owns
+ * heap storage in a different arena, this is an arena swap: realloc moves
+ * the buffer to `arena` and updates the header owner/provenance. */
+static inline char *cc_string_reserve(CCString *str, size_t need, CCArena *arena) {
+    size_t new_cap;
+    char saved[CC_STRING_INLINE_CAP];
+    size_t saved_len;
+    CCStringHeapHeader *header;
+    CCArena *old_arena;
+    size_t old_total;
+    size_t new_total;
+    if (!str) return NULL;
+    if (cc_string_failed(str)) return NULL;
+    if (need > UINT32_MAX) { cc__string_poison(str); return NULL; }
+    if (cc_string_is_inline(str) && need <= CC_STRING_INLINE_CAP) return cc_string_data(str);
+    if (!cc_string_is_inline(str) && cc_string_heap_data(str) && need <= str->cap) return cc_string_data(str);
+    if (!arena) { cc__string_poison(str); return NULL; }
+    if (need <= CC_STRING_INLINE_CAP) {
+        if (str->cap == 0) {
+            str->cap = CC_STRING_INLINE_CAP;
+            memset(str->inline_buf, 0, sizeof(str->inline_buf));
+        }
+        return cc_string_data(str);
+    }
+    new_cap = str->cap ? str->cap : CC_STRING_INLINE_CAP;
+    if (new_cap < CC_STRING_INLINE_CAP) new_cap = CC_STRING_INLINE_CAP;
+    while (new_cap < need) {
+        size_t next = (new_cap * 8) / 5;
+        if (next <= new_cap) next = new_cap + 1;
+        new_cap = next;
+    }
+    if (new_cap > UINT32_MAX) { cc__string_poison(str); return NULL; }
+    if (cc_string_is_inline(str) || !cc_string_heap_data(str)) {
+        saved_len = str->len + 1;
+        if (saved_len > sizeof(saved)) saved_len = sizeof(saved);
+        memset(saved, 0, sizeof(saved));
+        if (saved_len > 0) memcpy(saved, str->inline_buf, saved_len);
+        new_total = sizeof(CCStringHeapHeader) + new_cap;
+        header = (CCStringHeapHeader *)cc_arena_alloc(arena, new_total, _Alignof(CCStringHeapHeader));
+        if (!header) { cc__string_poison(str); return NULL; }
+        header->arena = arena;
+        header->provenance = arena->provenance;
+        str->data = (char *)(header + 1);
+        str->cap = (uint32_t)new_cap;
+        if (saved_len > 0) memcpy(str->data, saved, saved_len);
+        return cc_string_heap_data(str);
+    }
+    header = cc__string_heap_header(str);
+    if (!header || !header->arena) { cc__string_poison(str); return NULL; }
+    old_arena = header->arena;
+    old_total = sizeof(CCStringHeapHeader) + str->cap;
+    new_total = sizeof(CCStringHeapHeader) + new_cap;
+    header = (CCStringHeapHeader *)cc_arena_realloc(old_arena, arena, header, old_total, new_total, _Alignof(CCStringHeapHeader));
+    if (!header) { cc__string_poison(str); return NULL; }
+    header->arena = arena;
+    header->provenance = arena->provenance;
+    str->data = (char *)(header + 1);
+    str->cap = (uint32_t)new_cap;
+    return str->data;
+}
+
+/* Frees out-of-line storage only; does not zero *str. Prefer release(). */
+static inline void cc_string_release_heap(CCString *str) {
+    CCStringHeapHeader *header;
+    if (!str) return;
+    if (cc_string_is_inline(str)) return;
+    if (!cc_string_heap_data(str)) return;
+    header = cc__string_heap_header(str);
+    if (header && header->arena) (void)cc_arena_release(header->arena, header);
+}
+
+/* End ownership of heap backing (via arena_release) and zero *str.
+ * clear() only sets len=0 and keeps ptr/cap — unsafe before arena->reset()
+ * when the string spilled into that arena. After release, push* may reuse
+ * the (empty) struct; a dedicated encode arena still needs reset to reclaim
+ * bump space. */
+static inline void cc_string_release(CCString *str, CCArena *arena) {
+    CCStringHeapHeader *header;
+    CCArena *owner;
+    if (!str) return;
+    if (!cc_string_is_inline(str) && cc_string_heap_data(str)) {
+        header = cc__string_heap_header(str);
+        owner = header && header->arena ? header->arena : arena;
+        if (owner && header) (void)cc_arena_release(owner, header);
+    }
+    *str = (CCString){0};
+}
+
+static inline CCSlice cc__string_persist_slice(CCArena *arena, const CCString *str) {
+    CCSlice slice = cc_string_as_slice(str);
+    if (!str || !slice.ptr || slice.len == 0) return slice;
+    if (cc_string_is_inline(str) && arena) return cc_slice_clone(arena, slice);
+    return slice;
+}
+
+static inline CCSlice cc_string_persist_slice(CCArena *arena, const CCString *str) {
+    return cc__string_persist_slice(arena, str);
+}
+
+#ifndef CC_COMPTIME
+/* Ensure `*s` is owned in `arena`. Inline/empty strings are already
+ * value-owned; heap strings already in `arena` (pointer or provenance)
+ * are left alone; otherwise copy into a fresh string in `arena`. */
+static inline CCResult_bool_CCError cc_string_materialize_in(CCString *s, CCArena *arena) {
+    if (!s || !arena) {
+        return cc_err_CCResult_bool_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "materialize_in without arena"));
+    }
+    if (cc_string_failed(s)) {
+        return cc_err_CCResult_bool_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "materialize_in poisoned string"));
+    }
+    if (cc_string_len(s) == 0 || cc_string_is_inline(s)) {
+        return cc_ok_CCResult_bool_CCError(true);
+    }
+    if (cc_string_arena(s) == arena ||
+        cc_string_provenance(s) == arena->provenance) {
+        return cc_ok_CCResult_bool_CCError(true);
+    }
+    {
+        CCString neu = cc_string_from_slice(arena, cc_string_as_slice(s));
+        if (cc_string_failed(&neu)) {
+            return cc_err_CCResult_bool_CCError(CC_ERROR(CC_ERR_OUT_OF_MEMORY, "materialize string"));
+        }
+        *s = neu;
+        return cc_ok_CCResult_bool_CCError(true);
+    }
+}
+static inline CCResult_bool_CCError CCString_materialize_in(CCString *s, CCArena *arena) {
+    return cc_string_materialize_in(s, arena);
+}
+#endif /* !CC_COMPTIME */
+
+static inline CCString* cc_string_push_char(CCString *str, char c, CCArena *arena) {
+    return cc_string_push_buffer(str, &c, 1, arena);
+}
+
+static inline CCString* cc__string_append_u64_impl(CCString *str, uint64_t v, CCArena *arena) {
+    char buf[32];
+    char *dst;
+    size_t pos = sizeof(buf);
+    size_t out_len;
+    if (!str || cc_string_failed(str)) return NULL;
+    do {
+        uint64_t q = v / 10;
+        buf[--pos] = (char)('0' + (v - q * 10));
+        v = q;
+    } while (v != 0);
+    out_len = sizeof(buf) - pos;
+    dst = cc_string_reserve(str, str->len + out_len + 1, arena);
+    if (!dst) return NULL;
+    memcpy(dst + str->len, buf + pos, out_len);
+    str->len += out_len;
+    dst[str->len] = '\0';
+    return str;
+}
+
+static inline CCString* cc_string_push_int(CCString *str, int64_t v, CCArena *arena) {
+    uint64_t mag;
+    if (!str) return NULL;
+    if (v >= 0) return cc__string_append_u64_impl(str, (uint64_t)v, arena);
+    mag = (uint64_t)(-(v + 1)) + 1;
+    if (!cc_string_push_char(str, '-', arena)) return NULL;
+    return cc__string_append_u64_impl(str, mag, arena);
+}
+
+static inline CCString* cc_string_push_uint(CCString *str, uint64_t v, CCArena *arena) {
+    return cc__string_append_u64_impl(str, v, arena);
+}
+
+static inline CCString* cc_string_push_f32(CCString *str, float v, CCArena *arena) {
+    char buf[64];
+    char *end = cc_zmij_f32_to_string(v, buf);
+    if (!end || end < buf || (size_t)(end - buf) > sizeof(buf)) return NULL;
+    return cc_string_push_buffer(str, buf, (uint32_t)(end - buf), arena);
+}
+
+static inline CCString* cc_string_push_f64(CCString *str, double v, CCArena *arena) {
+    char buf[64];
+    char *end = cc_zmij_f64_to_string(v, buf);
+    if (!end || end < buf || (size_t)(end - buf) > sizeof(buf)) return NULL;
+    return cc_string_push_buffer(str, buf, (uint32_t)(end - buf), arena);
+}
+
+static inline CCString* cc_string_push_float(CCString *str, double v, CCArena *arena) {
+    return cc_string_push_f64(str, v, arena);
+}
+
+static inline CCString* cc_string_push_cstr(CCString *str, const char *cstr, CCArena *arena) {
+    size_t len;
+    if (!cstr) return str;
+    len = strlen(cstr);
+    if (len > UINT32_MAX) return NULL;
+    return cc_string_push_buffer(str, cstr, (uint32_t)len, arena);
+}
+
+static inline CCSlice cc_string_apply_policy(CCStringPolicy policy, CCArena *arena, CCSlice tag, CCSlice value) {
+    CCSlice out = policy ? policy(arena, tag, value) : value;
+    if (!policy || !arena || !out.ptr || out.len == 0) return out;
+    if (out.id == CC_SLICE_ID_UNTRACKED) return cc_slice_clone(arena, out);
+    return out;
+}
+
+static inline CCString* cc_string_push_policy(CCString *str,
+                                              CCStringPolicy policy,
+                                              CCArena *arena,
+                                              CCSlice tag,
+                                              CCSlice value) {
+    return cc_string_push_slice(str, cc_string_apply_policy(policy, arena, tag, value), arena);
+}
+
+static inline CCString cc__string_from_signed_impl(CCArena *arena, long long v) {
+    CCString s = cc_string_new();
+    if (!arena) return s;
+    (void)cc_string_push_int(&s, (int64_t)v, arena);
+    return s;
+}
+
+static inline CCString cc__string_from_unsigned_impl(CCArena *arena, unsigned long long v) {
+    CCString s = cc_string_new();
+    if (!arena) return s;
+    (void)cc_string_push_uint(&s, (uint64_t)v, arena);
+    return s;
+}
+
+static inline CCString cc__string_from_float32_impl(CCArena *arena, float v) {
+    CCString s = cc_string_new();
+    if (!arena) return s;
+    (void)cc_string_push_f32(&s, v, arena);
+    return s;
+}
+
+static inline CCString cc__string_from_float64_impl(CCArena *arena, double v) {
+    CCString s = cc_string_new();
+    if (!arena) return s;
+    (void)cc_string_push_f64(&s, v, arena);
+    return s;
+}
+
+static inline CCString cc__string_from_bool_impl(CCArena *arena, bool v) {
+    return cc_string_from_slice(arena, v ? CC_SLICE_LIT("true") : CC_SLICE_LIT("false"));
+}
+
+static inline CCString cc__string_from_char_impl(CCArena *arena, char v) {
+    CCString s = cc_string_new();
+    (void)cc_string_push_char(&s, v, arena);
+    return s;
+}
+
+static inline CCString char_to_str(char v, CCArena *arena) { return cc__string_from_char_impl(arena, v); }
+static inline CCString signed_char_to_str(signed char v, CCArena *arena) { return cc__string_from_signed_impl(arena, v); }
+static inline CCString unsigned_char_to_str(unsigned char v, CCArena *arena) { return cc__string_from_unsigned_impl(arena, v); }
+static inline CCString short_to_str(short v, CCArena *arena) { return cc__string_from_signed_impl(arena, v); }
+static inline CCString unsigned_short_to_str(unsigned short v, CCArena *arena) { return cc__string_from_unsigned_impl(arena, v); }
+static inline CCString int_to_str(int v, CCArena *arena) { return cc__string_from_signed_impl(arena, v); }
+static inline CCString unsigned_to_str(unsigned v, CCArena *arena) { return cc__string_from_unsigned_impl(arena, v); }
+static inline CCString long_to_str(long v, CCArena *arena) { return cc__string_from_signed_impl(arena, v); }
+static inline CCString unsigned_long_to_str(unsigned long v, CCArena *arena) { return cc__string_from_unsigned_impl(arena, v); }
+static inline CCString long_long_to_str(long long v, CCArena *arena) { return cc__string_from_signed_impl(arena, v); }
+static inline CCString unsigned_long_long_to_str(unsigned long long v, CCArena *arena) { return cc__string_from_unsigned_impl(arena, v); }
+static inline CCString int8_t_to_str(int8_t v, CCArena *arena) { return cc__string_from_signed_impl(arena, v); }
+static inline CCString uint8_t_to_str(uint8_t v, CCArena *arena) { return cc__string_from_unsigned_impl(arena, v); }
+static inline CCString int16_t_to_str(int16_t v, CCArena *arena) { return cc__string_from_signed_impl(arena, v); }
+static inline CCString uint16_t_to_str(uint16_t v, CCArena *arena) { return cc__string_from_unsigned_impl(arena, v); }
+static inline CCString int32_t_to_str(int32_t v, CCArena *arena) { return cc__string_from_signed_impl(arena, v); }
+static inline CCString uint32_t_to_str(uint32_t v, CCArena *arena) { return cc__string_from_unsigned_impl(arena, v); }
+static inline CCString int64_t_to_str(int64_t v, CCArena *arena) { return cc__string_from_signed_impl(arena, v); }
+static inline CCString uint64_t_to_str(uint64_t v, CCArena *arena) { return cc__string_from_unsigned_impl(arena, v); }
+static inline CCString intptr_t_to_str(intptr_t v, CCArena *arena) { return cc__string_from_signed_impl(arena, v); }
+static inline CCString uintptr_t_to_str(uintptr_t v, CCArena *arena) { return cc__string_from_unsigned_impl(arena, v); }
+static inline CCString float_to_str(float v, CCArena *arena) { return cc__string_from_float32_impl(arena, v); }
+static inline CCString double_to_str(double v, CCArena *arena) { return cc__string_from_float64_impl(arena, v); }
+static inline CCString bool_to_str(bool v, CCArena *arena) { return cc__string_from_bool_impl(arena, v); }
+
+static inline CCString cc__string_value_from_cstr(const char *cstr, CCArena *arena) {
+    return cc_string_from_slice(arena, cc_slice_cstr(cstr));
+}
+
+static inline CCString cc__string_value_from_slice(CCSlice s, CCArena *arena) {
+    return cc_string_from_slice(arena, s);
+}
+
+static inline CCString cc__string_value_from_string(CCString s, CCArena *arena) {
+    (void)arena;
+    return s;
+}
+
+static inline CCString cc__string_value_from_string_ptr(const CCString *s, CCArena *arena) {
+    (void)arena;
+    return s ? *s : (CCString){0};
+}
+
+static inline CCSlice cc__string_slot_from_cstr(const char *cstr, CCArena *arena) {
+    (void)arena;
+    return cc_slice_cstr(cstr);
+}
+
+static inline CCSlice cc__string_slot_from_slice(CCSlice s, CCArena *arena) {
+    (void)arena;
+    return s;
+}
+
+static inline CCSlice cc__string_slot_from_string(CCString s, CCArena *arena) {
+    return cc__string_persist_slice(arena, &s);
+}
+
+static inline CCSlice cc__string_slot_from_string_ptr(const CCString *s, CCArena *arena) {
+    (void)arena;
+    return cc_string_as_slice(s);
+}
+
+static inline CCSlice cc__string_slot_from_char(char v, CCArena *arena) {
+    CCString s = char_to_str(v, arena);
+    return cc__string_persist_slice(arena, &s);
+}
+
+static inline CCSlice cc__string_slot_from_signed_char(signed char v, CCArena *arena) {
+    CCString s = signed_char_to_str(v, arena);
+    return cc__string_persist_slice(arena, &s);
+}
+
+static inline CCSlice cc__string_slot_from_unsigned_char(unsigned char v, CCArena *arena) {
+    CCString s = unsigned_char_to_str(v, arena);
+    return cc__string_persist_slice(arena, &s);
+}
+
+static inline CCSlice cc__string_slot_from_short(short v, CCArena *arena) {
+    CCString s = short_to_str(v, arena);
+    return cc__string_persist_slice(arena, &s);
+}
+
+static inline CCSlice cc__string_slot_from_unsigned_short(unsigned short v, CCArena *arena) {
+    CCString s = unsigned_short_to_str(v, arena);
+    return cc__string_persist_slice(arena, &s);
+}
+
+static inline CCSlice cc__string_slot_from_int(int v, CCArena *arena) {
+    CCString s = int_to_str(v, arena);
+    return cc__string_persist_slice(arena, &s);
+}
+
+static inline CCSlice cc__string_slot_from_unsigned(unsigned v, CCArena *arena) {
+    CCString s = unsigned_to_str(v, arena);
+    return cc__string_persist_slice(arena, &s);
+}
+
+static inline CCSlice cc__string_slot_from_long(long v, CCArena *arena) {
+    CCString s = long_to_str(v, arena);
+    return cc__string_persist_slice(arena, &s);
+}
+
+static inline CCSlice cc__string_slot_from_unsigned_long(unsigned long v, CCArena *arena) {
+    CCString s = unsigned_long_to_str(v, arena);
+    return cc__string_persist_slice(arena, &s);
+}
+
+static inline CCSlice cc__string_slot_from_long_long(long long v, CCArena *arena) {
+    CCString s = long_long_to_str(v, arena);
+    return cc__string_persist_slice(arena, &s);
+}
+
+static inline CCSlice cc__string_slot_from_unsigned_long_long(unsigned long long v, CCArena *arena) {
+    CCString s = unsigned_long_long_to_str(v, arena);
+    return cc__string_persist_slice(arena, &s);
+}
+
+static inline CCSlice cc__string_slot_from_int8_t(int8_t v, CCArena *arena) {
+    CCString s = int8_t_to_str(v, arena);
+    return cc__string_persist_slice(arena, &s);
+}
+
+static inline CCSlice cc__string_slot_from_uint8_t(uint8_t v, CCArena *arena) {
+    CCString s = uint8_t_to_str(v, arena);
+    return cc__string_persist_slice(arena, &s);
+}
+
+static inline CCSlice cc__string_slot_from_int16_t(int16_t v, CCArena *arena) {
+    CCString s = int16_t_to_str(v, arena);
+    return cc__string_persist_slice(arena, &s);
+}
+
+static inline CCSlice cc__string_slot_from_uint16_t(uint16_t v, CCArena *arena) {
+    CCString s = uint16_t_to_str(v, arena);
+    return cc__string_persist_slice(arena, &s);
+}
+
+static inline CCSlice cc__string_slot_from_int32_t(int32_t v, CCArena *arena) {
+    CCString s = int32_t_to_str(v, arena);
+    return cc__string_persist_slice(arena, &s);
+}
+
+static inline CCSlice cc__string_slot_from_uint32_t(uint32_t v, CCArena *arena) {
+    CCString s = uint32_t_to_str(v, arena);
+    return cc__string_persist_slice(arena, &s);
+}
+
+static inline CCSlice cc__string_slot_from_int64_t(int64_t v, CCArena *arena) {
+    CCString s = int64_t_to_str(v, arena);
+    return cc__string_persist_slice(arena, &s);
+}
+
+static inline CCSlice cc__string_slot_from_uint64_t(uint64_t v, CCArena *arena) {
+    CCString s = uint64_t_to_str(v, arena);
+    return cc__string_persist_slice(arena, &s);
+}
+
+static inline CCSlice cc__string_slot_from_intptr_t(intptr_t v, CCArena *arena) {
+    CCString s = intptr_t_to_str(v, arena);
+    return cc__string_persist_slice(arena, &s);
+}
+
+static inline CCSlice cc__string_slot_from_uintptr_t(uintptr_t v, CCArena *arena) {
+    CCString s = uintptr_t_to_str(v, arena);
+    return cc__string_persist_slice(arena, &s);
+}
+
+static inline CCSlice cc__string_slot_from_float(float v, CCArena *arena) {
+    CCString s = float_to_str(v, arena);
+    return cc__string_persist_slice(arena, &s);
+}
+
+static inline CCSlice cc__string_slot_from_double(double v, CCArena *arena) {
+    CCString s = double_to_str(v, arena);
+    return cc__string_persist_slice(arena, &s);
+}
+
+static inline CCSlice cc__string_slot_from_bool(bool v, CCArena *arena) {
+    CCString s = bool_to_str(v, arena);
+    return cc__string_persist_slice(arena, &s);
+}
+
+static inline CCString* cc__string_slot_push_from_string(CCString *str, CCString s, CCArena *arena) {
+    return cc_string_push_slice(str, cc_string_as_slice(&s), arena);
+}
+
+static inline CCString* cc__string_slot_push_from_string_ptr(CCString *str, const CCString *s, CCArena *arena) {
+    return cc_string_push_slice(str, cc_string_as_slice(s), arena);
+}
+
+static inline CCString* cc__string_slot_push_from_bool(CCString *str, bool v, CCArena *arena) {
+    return cc_string_push_cstr(str, v ? "true" : "false", arena);
+}
+
+static inline CCSlice cc__concat_from_cstr(const char *cstr, CCArena *arena) {
+    (void)arena;
+    return cc_slice_cstr(cstr);
+}
+
+static inline CCSlice cc__concat_from_slice(CCSlice s, CCArena *arena) {
+    (void)arena;
+    return s;
+}
+
+static inline CCSlice cc__concat_from_string_value(CCString str, CCArena *arena) {
+    return cc__string_persist_slice(arena, &str);
+}
+
+static inline CCSlice cc__concat_from_string_ptr(const CCString *str, CCArena *arena) {
+    (void)arena;
+    return cc_string_as_slice(str);
+}
+
+#define cc__concat_arg(x, arena) _Generic((x), \
+    CCSlice: cc__concat_from_slice, \
+    char *: cc__concat_from_cstr, \
+    const char *: cc__concat_from_cstr, \
+    CCString: cc__concat_from_string_value, \
+    CCString *: cc__concat_from_string_ptr, \
+    const CCString *: cc__concat_from_string_ptr \
+)((x), (arena))
+
+#define cc_string_push(str, data, arena) cc_string_push_slice((str), cc__concat_arg((data), (arena)), (arena))
+#define cc_string_append(str, data, arena) cc_string_push((str), (data), (arena))
+
+#define cc_string_from(data, arena) _Generic((data), \
+    CCSlice: cc__string_value_from_slice, \
+    char *: cc__string_value_from_cstr, \
+    const char *: cc__string_value_from_cstr, \
+    CCString: cc__string_value_from_string, \
+    CCString *: cc__string_value_from_string_ptr, \
+    const CCString *: cc__string_value_from_string_ptr, \
+    char: char_to_str, \
+    signed char: signed_char_to_str, \
+    unsigned char: unsigned_char_to_str, \
+    short: short_to_str, \
+    unsigned short: unsigned_short_to_str, \
+    int: int_to_str, \
+    unsigned: unsigned_to_str, \
+    long: long_to_str, \
+    unsigned long: unsigned_long_to_str, \
+    long long: long_long_to_str, \
+    unsigned long long: unsigned_long_long_to_str, \
+    float: float_to_str, \
+    double: double_to_str, \
+    bool: bool_to_str \
+)((data), (arena))
+
+#define cc__string_slot_arg(data, arena) _Generic((data), \
+    CCSlice: cc__string_slot_from_slice, \
+    char *: cc__string_slot_from_cstr, \
+    const char *: cc__string_slot_from_cstr, \
+    CCString: cc__string_slot_from_string, \
+    CCString *: cc__string_slot_from_string_ptr, \
+    const CCString *: cc__string_slot_from_string_ptr, \
+    char: cc__string_slot_from_char, \
+    signed char: cc__string_slot_from_signed_char, \
+    unsigned char: cc__string_slot_from_unsigned_char, \
+    short: cc__string_slot_from_short, \
+    unsigned short: cc__string_slot_from_unsigned_short, \
+    int: cc__string_slot_from_int, \
+    unsigned: cc__string_slot_from_unsigned, \
+    long: cc__string_slot_from_long, \
+    unsigned long: cc__string_slot_from_unsigned_long, \
+    long long: cc__string_slot_from_long_long, \
+    unsigned long long: cc__string_slot_from_unsigned_long_long, \
+    float: cc__string_slot_from_float, \
+    double: cc__string_slot_from_double, \
+    bool: cc__string_slot_from_bool \
+)((data), (arena))
+
+#define cc__string_slot_push(str, data, arena) _Generic((data), \
+    CCSlice: cc_string_push_slice, \
+    char *: cc_string_push_cstr, \
+    const char *: cc_string_push_cstr, \
+    CCString: cc__string_slot_push_from_string, \
+    CCString *: cc__string_slot_push_from_string_ptr, \
+    const CCString *: cc__string_slot_push_from_string_ptr, \
+    char: cc_string_push_char, \
+    signed char: cc_string_push_int, \
+    unsigned char: cc_string_push_uint, \
+    short: cc_string_push_int, \
+    unsigned short: cc_string_push_uint, \
+    int: cc_string_push_int, \
+    unsigned: cc_string_push_uint, \
+    long: cc_string_push_int, \
+    unsigned long: cc_string_push_uint, \
+    long long: cc_string_push_int, \
+    unsigned long long: cc_string_push_uint, \
+    float: cc_string_push_f32, \
+    double: cc_string_push_f64, \
+    bool: cc__string_slot_push_from_bool \
+)((str), (data), (arena))
+
+#define cc__concat_args_1(arena, a1) \
+    cc__concat_arg(a1, arena)
+#define cc__concat_args_2(arena, a1, a2) \
+    cc__concat_arg(a1, arena), cc__concat_arg(a2, arena)
+#define cc__concat_args_3(arena, a1, a2, a3) \
+    cc__concat_arg(a1, arena), cc__concat_arg(a2, arena), cc__concat_arg(a3, arena)
+#define cc__concat_args_4(arena, a1, a2, a3, a4) \
+    cc__concat_arg(a1, arena), cc__concat_arg(a2, arena), cc__concat_arg(a3, arena), cc__concat_arg(a4, arena)
+#define cc__concat_args_5(arena, a1, a2, a3, a4, a5) \
+    cc__concat_arg(a1, arena), cc__concat_arg(a2, arena), cc__concat_arg(a3, arena), cc__concat_arg(a4, arena), cc__concat_arg(a5, arena)
+#define cc__concat_args_6(arena, a1, a2, a3, a4, a5, a6) \
+    cc__concat_arg(a1, arena), cc__concat_arg(a2, arena), cc__concat_arg(a3, arena), cc__concat_arg(a4, arena), cc__concat_arg(a5, arena), cc__concat_arg(a6, arena)
+#define cc__concat_args_7(arena, a1, a2, a3, a4, a5, a6, a7) \
+    cc__concat_arg(a1, arena), cc__concat_arg(a2, arena), cc__concat_arg(a3, arena), cc__concat_arg(a4, arena), cc__concat_arg(a5, arena), cc__concat_arg(a6, arena), cc__concat_arg(a7, arena)
+#define cc__concat_args_8(arena, a1, a2, a3, a4, a5, a6, a7, a8) \
+    cc__concat_arg(a1, arena), cc__concat_arg(a2, arena), cc__concat_arg(a3, arena), cc__concat_arg(a4, arena), cc__concat_arg(a5, arena), cc__concat_arg(a6, arena), cc__concat_arg(a7, arena), cc__concat_arg(a8, arena)
+
+#define cc__concat_pick(_1, _2, _3, _4, _5, _6, _7, _8, NAME, ...) NAME
+#define cc__concat_args(...) \
+    cc__concat_pick(__VA_ARGS__, \
+        cc__concat_args_8, \
+        cc__concat_args_7, \
+        cc__concat_args_6, \
+        cc__concat_args_5, \
+        cc__concat_args_4, \
+        cc__concat_args_3, \
+        cc__concat_args_2, \
+        cc__concat_args_1)
+
+#define cc__concat_count_pick(_1, _2, _3, _4, _5, _6, _7, _8, N, ...) N
+#define cc__concat_count(...) \
+    cc__concat_count_pick(__VA_ARGS__, 8, 7, 6, 5, 4, 3, 2, 1)
+
+#define cc_concat(arena, ...) \
+    cc_slice_concat_many((arena), \
+        (CCSlice[]){ cc__concat_args(__VA_ARGS__)((arena), __VA_ARGS__) }, \
+        cc__concat_count(__VA_ARGS__))
+
+// ----------- Comptime: inline bodies for the otherwise runtime-backed --------
+// cc_string_* functions (mirror of cc/runtime/string.c). Defined here, after the
+// cc_string_push/from macros above, because cc_string_from_slice uses them.
+#ifdef CC_COMPTIME
+static inline CCString cc_string_with_capacity(CCArena *arena, size_t cap) {
+    CCString s = cc_string_new();
+    if (cap > CC_STRING_INLINE_CAP) {
+        (void)cc_string_reserve(&s, cap, arena); /* failure poisons s */
+    }
+    return s;
+}
+static inline CCString cc_string_from_slice(CCArena *arena, CCSlice slice) {
+    CCString s = cc_string_new();
+    (void)cc_string_push(&s, slice, arena); /* failure poisons s */
+    return s;
+}
+static inline CCString* cc_string_push_buffer(CCString *str, const char *buffer, uint32_t len, CCArena *arena) {
+    char *dst;
+    size_t new_len;
+    if (!str || cc_string_failed(str)) return NULL;
+    new_len = (size_t)str->len + (size_t)len;
+    if (new_len > UINT32_MAX) { cc__string_poison(str); return NULL; }
+    dst = cc_string_reserve(str, new_len + 1, arena);
+    if (!dst) return NULL;
+    if (buffer && len) memcpy(dst + str->len, buffer, (size_t)len);
+    str->len = (uint32_t)new_len;
+    dst[str->len] = '\0';
+    return str;
+}
+static inline CCString* cc_string_push_slice(CCString *str, CCSlice data, CCArena *arena) {
+    if (data.len > UINT32_MAX) return NULL;
+    return cc_string_push_buffer(str, (const char *)data.ptr, (uint32_t)data.len, arena);
+}
+/* Empty in place: len=0, keep capacity and any arena heap pointer.
+ * Not a detach — do not arena->reset() while a cleared string still
+ * references that arena; use release() instead. */
+static inline CCString* cc_string_clear(CCString *str) {
+    char *dst;
+    if (!str) return NULL;
+    str->len = 0;
+    dst = cc_string_data(str);
+    if (dst) dst[0] = '\0';
+    return str;
+}
+static inline uint64_t cc_string_provenance(const CCString *str) {
+    CCStringHeapHeader *header;
+    if (!str) return 0;
+    if (cc_string_is_inline(str)) return CC_SLICE_ID_UNTRACKED;
+    header = cc__string_heap_header(str);
+    return header ? header->provenance : 0;
+}
+static inline CCSlice cc_string_as_slice(const CCString *str) {
+    const char *data;
+    if (!str || cc_string_failed(str)) return cc_slice_empty();
+    data = cc_string_data_const(str);
+    if (!data) return cc_slice_empty();
+    return cc_slice_from_parts((void *)data, str->len,
+                               cc_slice_make_id(cc_string_provenance(str), false, false, false));
+}
+static inline const char *cc_string_cstr(CCString *str, CCArena *arena) {
+    char *data;
+    if (!str || cc_string_failed(str)) return NULL;
+    if (str->len + 1 > str->cap) {
+        data = cc_string_reserve(str, str->len + 1, arena);
+        if (!data) return NULL;
+    } else {
+        data = cc_string_data(str);
+    }
+    if (!data) return NULL;
+    data[str->len] = '\0';
+    return data;
+}
+#endif /* CC_COMPTIME */
+
+// ------------- Arena-less string-template: bounded stack form -------------
+/* Lowering target for arena-less backtick string-templates (no arena arg;
+ * spec/draft_variants.md §9.2).  The compiler emits a block-scoped
+ * `(char[K]){0}` compound literal sized exactly from the template's static
+ * bound (literal bytes + per-slot max width from `cc__string_stack_bound`),
+ * chains the pushes below, and yields a `char[:]` BORROW of that buffer
+ * (block lifetime, stack provenance).
+ *
+ * The two `_Generic` macros deliberately have NO default arm: an
+ * interpolation whose type is not statically width-boundable (slices,
+ * strings, floats, pointers, ...) fails _Generic selection, which the
+ * driver reports as "arena-less string-template: interpolation has no
+ * statically bounded width; ... pass an arena".
+ *
+ * The bound is exact per C type (worst-case decimal width incl. sign);
+ * overflow of the computed bound is impossible by construction, so the
+ * push helpers treat it as a fatal compiler bug and abort LOUDLY.
+ *
+ * Note: do not write the characters at-string-paren in comments or string
+ * literals here — include-expanded comptime hook TUs can re-scan this
+ * header after comments are stripped, and that token would be rewritten. */
+typedef struct CCStringStackBuf {
+    char *buf;
+    uint32_t cap;
+    uint32_t len;
+} CCStringStackBuf;
+
+static inline void cc__string_stack_overflow_abort(size_t need, size_t cap) {
+    fprintf(stderr,
+            "cc fatal: arena-less string-template overflowed its computed bound "
+            "(need %zu, cap %zu) - compiler bug\n",
+            need, cap);
+    abort();
+}
+
+static inline CCStringStackBuf cc__string_stack_new(char *buf, size_t cap) {
+    CCStringStackBuf b;
+    b.buf = buf;
+    b.cap = (uint32_t)cap;
+    b.len = 0;
+    return b;
+}
+
+static inline CCStringStackBuf cc__string_stack_lit(CCStringStackBuf b, const char *s, size_t n) {
+    if ((size_t)b.len + n > b.cap) cc__string_stack_overflow_abort((size_t)b.len + n, b.cap);
+    if (n) memcpy(b.buf + b.len, s, n);
+    b.len += (uint32_t)n;
+    return b;
+}
+
+static inline CCStringStackBuf cc__string_stack_u64(CCStringStackBuf b, uint64_t v) {
+    char tmp[20];
+    size_t pos = sizeof(tmp);
+    do {
+        uint64_t q = v / 10;
+        tmp[--pos] = (char)('0' + (v - q * 10));
+        v = q;
+    } while (v != 0);
+    return cc__string_stack_lit(b, tmp + pos, sizeof(tmp) - pos);
+}
+
+static inline CCStringStackBuf cc__string_stack_i64(CCStringStackBuf b, int64_t v) {
+    if (v < 0) {
+        b = cc__string_stack_lit(b, "-", 1);
+        return cc__string_stack_u64(b, (uint64_t)(-(v + 1)) + 1);
+    }
+    return cc__string_stack_u64(b, (uint64_t)v);
+}
+
+static inline CCStringStackBuf cc__string_stack_bool(CCStringStackBuf b, bool v) {
+    return v ? cc__string_stack_lit(b, "true", 4) : cc__string_stack_lit(b, "false", 5);
+}
+
+static inline CCStringStackBuf cc__string_stack_char(CCStringStackBuf b, char v) {
+    return cc__string_stack_lit(b, &v, 1);
+}
+
+static inline CCSlice cc__string_stack_slice(CCStringStackBuf b) {
+    return cc_slice_from_parts(b.buf, b.len, CC_SLICE_ID_UNTRACKED);
+}
+
+/* Max formatted width per slot type: worst-case decimal digits + sign
+ * ("false" for bool).  NO default arm — see the header comment above. */
+#define cc__string_stack_bound(x) _Generic((x), \
+    char: 1, \
+    bool: 5, \
+    signed char: 4, \
+    unsigned char: 3, \
+    short: 6, \
+    unsigned short: 5, \
+    int: 11, \
+    unsigned int: 10, \
+    long: 20, \
+    unsigned long: 20, \
+    long long: 20, \
+    unsigned long long: 20)
+
+#define cc__string_stack_push(b, x) _Generic((x), \
+    char: cc__string_stack_char, \
+    bool: cc__string_stack_bool, \
+    signed char: cc__string_stack_i64, \
+    unsigned char: cc__string_stack_u64, \
+    short: cc__string_stack_i64, \
+    unsigned short: cc__string_stack_u64, \
+    int: cc__string_stack_i64, \
+    unsigned int: cc__string_stack_u64, \
+    long: cc__string_stack_i64, \
+    unsigned long: cc__string_stack_u64, \
+    long long: cc__string_stack_i64, \
+    unsigned long long: cc__string_stack_u64 \
+)((b), (x))
+
+// ------------------------- Parse helpers ----------------------------------
+#ifndef CC_COMPTIME
+
+/* strtoll/strtod need a NUL-terminated buffer, but slice length is caller
+ * (potentially wire) controlled — an unbounded alloca here is a stack
+ * overflow waiting for a long token. Small slices copy to a fixed stack
+ * buffer; larger ones (rare: only pathological-but-legal inputs like
+ * thousand-digit floats or huge leading whitespace) take a malloc/free
+ * round-trip. */
+#ifndef CC_SLICE_PARSE_STACK_MAX
+#define CC_SLICE_PARSE_STACK_MAX 256
+#endif
+
+static inline char *cc__slice_parse_buf(CCSlice s, char *stack_buf, size_t stack_cap) {
+    char *buf = (s.len + 1 <= stack_cap) ? stack_buf : (char *)malloc(s.len + 1);
+    if (!buf) return NULL;
+    memcpy(buf, s.ptr, s.len);
+    buf[s.len] = '\0';
+    return buf;
+}
+
+static inline CCResult_int64_t_CC_I64ParseError cc_slice_parse_i64(CCSlice s, int base) {
+    if (!s.ptr || s.len == 0) return cc_err_CCResult_int64_t_CC_I64ParseError(CC_I64_PARSE_INVALID_CHAR);
+    char stack_buf[CC_SLICE_PARSE_STACK_MAX];
+    char *buf = cc__slice_parse_buf(s, stack_buf, sizeof(stack_buf));
+    if (!buf) return cc_err_CCResult_int64_t_CC_I64ParseError(CC_I64_PARSE_INVALID_CHAR);
+    char *end = NULL;
+    errno = 0;
+    long long v = strtoll(buf, &end, base);
+    bool no_parse = (end == buf);
+    bool range = ((v == LLONG_MAX || v == LLONG_MIN) && errno == ERANGE);
+    if (buf != stack_buf) free(buf);
+    if (no_parse) return cc_err_CCResult_int64_t_CC_I64ParseError(CC_I64_PARSE_INVALID_CHAR);
+    if (range) {
+        return cc_err_CCResult_int64_t_CC_I64ParseError(v == LLONG_MAX ? CC_I64_PARSE_OVERFLOW : CC_I64_PARSE_UNDERFLOW);
+    }
+    return cc_ok_CCResult_int64_t_CC_I64ParseError((int64_t)v);
+}
+
+static inline CCResult_uint64_t_CC_U64ParseError cc_slice_parse_u64(CCSlice s, int base) {
+    if (!s.ptr || s.len == 0) return cc_err_CCResult_uint64_t_CC_U64ParseError(CC_U64_PARSE_INVALID_CHAR);
+    char stack_buf[CC_SLICE_PARSE_STACK_MAX];
+    char *buf = cc__slice_parse_buf(s, stack_buf, sizeof(stack_buf));
+    if (!buf) return cc_err_CCResult_uint64_t_CC_U64ParseError(CC_U64_PARSE_INVALID_CHAR);
+    char *end = NULL;
+    errno = 0;
+    unsigned long long v = strtoull(buf, &end, base);
+    bool no_parse = (end == buf);
+    bool range = (v == ULLONG_MAX && errno == ERANGE);
+    if (buf != stack_buf) free(buf);
+    if (no_parse) return cc_err_CCResult_uint64_t_CC_U64ParseError(CC_U64_PARSE_INVALID_CHAR);
+    if (range) {
+        return cc_err_CCResult_uint64_t_CC_U64ParseError(CC_U64_PARSE_OVERFLOW);
+    }
+    return cc_ok_CCResult_uint64_t_CC_U64ParseError((uint64_t)v);
+}
+
+static inline CCResult_double_CC_F64ParseError cc_slice_parse_f64(CCSlice s) {
+    if (!s.ptr || s.len == 0) return cc_err_CCResult_double_CC_F64ParseError(CC_F64_PARSE_INVALID_CHAR);
+    char stack_buf[CC_SLICE_PARSE_STACK_MAX];
+    char *buf = cc__slice_parse_buf(s, stack_buf, sizeof(stack_buf));
+    if (!buf) return cc_err_CCResult_double_CC_F64ParseError(CC_F64_PARSE_INVALID_CHAR);
+    char *end = NULL;
+    errno = 0;
+    double v = strtod(buf, &end);
+    bool no_parse = (end == buf);
+    bool range = ((v == HUGE_VAL || v == -HUGE_VAL) && errno == ERANGE);
+    if (buf != stack_buf) free(buf);
+    if (no_parse) return cc_err_CCResult_double_CC_F64ParseError(CC_F64_PARSE_INVALID_CHAR);
+    if (range) {
+        return cc_err_CCResult_double_CC_F64ParseError(CC_F64_PARSE_OVERFLOW);
+    }
+    return cc_ok_CCResult_double_CC_F64ParseError(v);
+}
+
+static inline CCResult_bool_CC_BoolParseError cc_slice_parse_bool(CCSlice s) {
+    static const char *true_lit = "true";
+    static const char *false_lit = "false";
+    if (s.len == 4 && memcmp(s.ptr, true_lit, 4) == 0) {
+        return cc_ok_CCResult_bool_CC_BoolParseError(true);
+    }
+    if (s.len == 5 && memcmp(s.ptr, false_lit, 5) == 0) {
+        return cc_ok_CCResult_bool_CC_BoolParseError(false);
+    }
+    return cc_err_CCResult_bool_CC_BoolParseError(CC_BOOL_PARSE_INVALID_VALUE);
+}
+#endif /* !CC_COMPTIME (parse helpers need result specs) */
+
+/* CCString UFCS dispatch is covered by the global `*` registration
+   in cc_arena.cch; no per-type opt-in needed here. */
+
+#endif // CC_STD_STRING_H
