@@ -33,17 +33,17 @@
 #include <ccc/std/string.h>
 
 typedef struct CCStdio {
-    CCArena *arena;
+    CCArena arena;
 } CCStdio;
 
-static inline CCStdio cc_stdio_create(CCArena *arena) {
+static inline CCStdio cc_stdio_create(CCArena arena) {
     CCStdio io;
     io.arena = arena;
     return io;
 }
 
 static inline void cc_stdio_destroy(CCStdio *io) {
-    if (io) io->arena = NULL;
+    if (io) io->arena = cc_arena_handle(NULL);
 }
 
 /* Read stdin to EOF into the bound arena (works for pipes and files). */
@@ -53,10 +53,10 @@ static inline void cc_stdio_destroy(CCStdio *io) {
 CC_DECL_RESULT_SPEC(CCResult_CCSlice_CCError, CCSlice, CCError)
 #endif
 static inline CCResult_CCSlice_CCError cc_stdio_read_all(CCStdio *io) {
-    if (!io || !io->arena) {
+    if (!io || !cc_arena_is_live(io->arena)) {
         return cc_err_CCResult_CCSlice_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "CCStdio.read_all: no arena"));
     }
-    CCArena *arena = io->arena;
+    CCArena arena = io->arena;
     size_t total_cap = 4096;
     size_t total_len = 0;
     char *total = (char *)cc_arena_alloc(arena, total_cap, 1);
@@ -182,7 +182,7 @@ static inline CCResult_size_t_CCError cc__stdio_write_all_cstr(CCStdio *io,
  * current-iteration only). Ok(false) is EOF. Err is IO / OOM.
  */
 static inline CCResult_bool_CCError cc_stdio_read_line(CCStdio *io, CCSlice *out) {
-    if (!io || !io->arena || !out) {
+    if (!io || !cc_arena_is_live(io->arena) || !out) {
         return cc_err_CCResult_bool_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "CCStdio.read_line: bad args"));
     }
     CCString line = cc_string_new();
@@ -552,5 +552,7 @@ static inline CCResult_size_t_CCError cc__fprintln_string_ptr(int fd, const CCSt
 
 
 
+
+#define cc_stdio_create(a) (cc_stdio_create)(CC__ARENA_HANDLE(a))
 
 #endif /* CC_SCRIPT_STDIO_H */

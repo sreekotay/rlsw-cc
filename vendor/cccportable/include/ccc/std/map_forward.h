@@ -24,7 +24,8 @@
 #undef __CC_MAP_INIT
 #endif
 #define __CC_MAP(K, V) Map_##K##_##V
-#define __CC_MAP_INIT(K, V, arena) Map_##K##_##V##_init((arena))
+#define __CC_MAP_INIT(K, V, arena) \
+    Map_##K##_##V##_init(CC__ARENA_HANDLE(arena))
 
 #ifndef __CC_MAP_GENERIC_DEFINED
 #define __CC_MAP_GENERIC_DEFINED
@@ -261,9 +262,10 @@ size_t ccj_map_bucket_index_from_itr();
      
       
                                                          
-                                                        
+                                                           
                                 
  
+                                                                   
 
                                           
                                                 

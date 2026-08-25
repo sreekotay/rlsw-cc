@@ -5,8 +5,8 @@
  * with the runtime. C twins (`wait_release` / `signal` / `broadcast`) stay
  * there. CCS:
  *
- *   CCExclusiveGuard g = excl->acquire_when(name, pred, env) !> @destroy;
- *   excl->acquire_when_into(name, pred, env, &slot, &arena, builder) !>;
+ *   CCExclusiveGuard g = excl.acquire_when(name, pred, env) !> @destroy;
+ *   excl.acquire_when_into(name, pred, env, &slot, arena, builder) !>;
  *   m.acquire_when(pred, env) !>;
  *
  * Success: name is held and pred was true under that hold. Error: not
@@ -33,7 +33,7 @@ CC_DECL_RESULT_SPEC(CCResult_CCExclusiveGuard_CCError, CCExclusiveGuard, CCError
 #endif
 
 static inline CCResult_CCExclusiveGuard_CCError
-cc_exclusive_acquire_when(CCExclusive* excl, uint64_t name,
+cc_exclusive_acquire_when(CCExclusiveHost* excl, uint64_t name,
                           CCExclusivePred pred, void* env) {
     CCExclusiveGuard g;
     if (!excl || !pred)
@@ -63,9 +63,9 @@ cc_exclusive_mutex_acquire_when(CCExclusiveMutex* m,
 }
 
 static inline CCResult_void_CCError
-cc_exclusive_acquire_when_into(CCExclusive* excl, uint64_t name,
+cc_exclusive_acquire_when_into(CCExclusiveHost* excl, uint64_t name,
                                CCExclusivePred pred, void* env,
-                               void* slot, CCArena* arena,
+                               void* slot, CCArena arena,
                                CCClosure2 builder) {
     CCResult_CCExclusiveGuard_CCError r;
     if (!excl || !pred) {
@@ -77,7 +77,7 @@ cc_exclusive_acquire_when_into(CCExclusive* excl, uint64_t name,
         cc_closure2_drop(builder);
         return cc_err_CCResult_void_CCError(r.u.error);
     }
-    cc_closure2_call(builder, (intptr_t)slot, (intptr_t)arena);
+    cc_closure2_call(builder, (intptr_t)slot, (intptr_t)&arena);
     cc_exclusive_guard_release(&r.u.value);
     return cc_ok_CCResult_void_CCError();
 }
@@ -85,7 +85,7 @@ cc_exclusive_acquire_when_into(CCExclusive* excl, uint64_t name,
 static inline CCResult_void_CCError
 cc_exclusive_mutex_acquire_when_into(CCExclusiveMutex* m,
                                      CCExclusivePred pred, void* env,
-                                     void* slot, CCArena* arena,
+                                     void* slot, CCArena arena,
                                      CCClosure2 builder) {
     if (!m || !m->excl) {
         cc_closure2_drop(builder);
@@ -94,5 +94,12 @@ cc_exclusive_mutex_acquire_when_into(CCExclusiveMutex* m,
     return cc_exclusive_acquire_when_into(m->excl, m->name, pred, env,
                                           slot, arena, builder);
 }
+
+#define cc_exclusive_acquire_when_into(excl, name, pred, env, slot, a, b) \
+    (cc_exclusive_acquire_when_into)((excl), (name), (pred), (env), (slot), \
+                                     CC__ARENA_HANDLE_OR_NULL(a), (b))
+#define cc_exclusive_mutex_acquire_when_into(m, pred, env, slot, a, b) \
+    (cc_exclusive_mutex_acquire_when_into)((m), (pred), (env), (slot), \
+                                           CC__ARENA_HANDLE_OR_NULL(a), (b))
 
 #endif /* CC_EXCLUSIVE_RESULT_H */

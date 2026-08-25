@@ -82,7 +82,7 @@ CC_MODULE_EXPORT(cc_py_export,
 
 typedef struct CCPy {
     int ready;
-    CCArena *arena; /* error text + default extract backing */
+    CCArena arena; /* error text + default extract backing */
     /* Transport: INPROC (libpython in this process) or PROC (python
      * child on the broker.py wire).  Never aliased — `cc_py_new(true)`
      * is always PROC. */
@@ -510,7 +510,7 @@ static CC_THREAD_LOCAL char cc__py_errbuf[512];
 /* Scratch arena for the next `cc__py_err` copy. Set at each public entry
  * from `CCPy.arena` / `CCPyObj.home->arena`. NULL keeps the TLS errbuf
  * (bootstrap / load failures before a handle exists). Calling thread only. */
-static CCArena *cc__py_err_arena;
+static CCArena cc__py_err_arena;
 
 /* Runtime selection (cc_py_use / VIRTUAL_ENV / ./.venv): resolved before
  * the first load, consumed by cc__py_load and the pre-init program-name
@@ -654,15 +654,15 @@ static inline void cc_py_thread_detach(CCPy *py) {
     }
 }
 
-static inline void cc__py_bind_err_arena(CCArena *arena) {
+static inline void cc__py_bind_err_arena(CCArena arena) {
     cc__py_err_arena = arena;
 }
 static inline void cc__py_bind_err_py(CCPy *py) {
-    cc__py_err_arena = py ? py->arena : NULL;
+    cc__py_err_arena = py ? py->arena : cc_arena_handle(NULL);
     cc__py_attach(py);
 }
 static inline void cc__py_bind_err_obj(CCPyObj *obj) {
-    cc__py_err_arena = (obj && obj->home) ? obj->home->arena : NULL;
+    cc__py_err_arena = (obj && obj->home) ? obj->home->arena : cc_arena_handle(NULL);
     if (obj) cc__py_attach(obj->home);
 }
 
@@ -1116,7 +1116,7 @@ static CCSlice cc__py_text_into_err_arena(void *s) {
     const char *p;
     intptr_t n = 0;
     char *dst;
-    if (!s || !cc__py_err_arena) return cc_slice_empty();
+    if (!s || !cc_arena_is_live(cc__py_err_arena)) return cc_slice_empty();
     p = cc__py.AsUTF8AndSize(s, &n);
     if (!p || n < 0) return cc_slice_empty();
     dst = (char *)cc_arena_alloc(cc__py_err_arena, (size_t)n + 1, 1);
@@ -1141,7 +1141,7 @@ static CCSlice cc__py_attr_text(void *obj, const char *attr) {
 static CCSlice cc__py_format_traceback(void *t, void *v, void *tb) {
     void *mod, *lines, *sep, *joined;
     CCSlice out = cc_slice_empty();
-    if (!cc__py_err_arena || !cc__py.ImportModule || !cc__py.CallMethod)
+    if (!cc_arena_is_live(cc__py_err_arena) || !cc__py.ImportModule || !cc__py.CallMethod)
         return out;
     mod = cc__py.ImportModule("traceback");
     if (!mod) { if (cc__py.ErrClear) cc__py.ErrClear(); return out; }
@@ -1226,7 +1226,7 @@ static CCPyError cc__py_err(const char *ctx) {
         CCErrorKind kind =
             (e.type_name.ptr && e.type_name.len > 0) ? CC_ERR_USER
                                                     : CC_ERR_INTERNAL;
-        if (cc__py_err_arena) {
+        if (cc_arena_is_live(cc__py_err_arena)) {
             size_t n = strlen(msg_src);
             char *dst = (char *)cc_arena_alloc(cc__py_err_arena, n + 1, 1);
             if (dst) {
@@ -1279,7 +1279,7 @@ static size_t cc__py_elem_align(CCPyElemKind k) {
 
 /* Convert one element into `dst`. Returns 0 on success. */
 static int cc__py_elem_store(void *item, CCPyElemKind kind, void *dst,
-                             CCArena *arena) {
+                             CCArena arena) {
     switch (kind) {
     case CC__PY_EL_F64: {
         double d = cc__py.FloatAsDouble(item);
@@ -1370,7 +1370,7 @@ static inline int cc__py_buf_format_ok(const char *fmt, CCPyElemKind kind) {
  * array of the WRONG dtype should convert per element rather than be
  * reinterpreted — raw bytes only move when both sides agree on what they
  * mean. */
-static inline int cc__py_obj_buffer_fill(CCPyObj *obj, CCArena *arena,
+static inline int cc__py_obj_buffer_fill(CCPyObj *obj, CCArena arena,
                                          CCPyElemKind kind, CCSlice *out) {
     CC__PyBuffer view;
     size_t esz = cc__py_elem_size(kind);
@@ -1402,13 +1402,13 @@ static inline int cc__py_obj_buffer_fill(CCPyObj *obj, CCArena *arena,
 }
 
 static inline CCResult_CCSlice_CCPyError cc__py_obj_as_list_raw(CCPyObj *obj,
-                                                               CCArena *arena,
+                                                               CCArena arena,
                                                                CCPyElemKind kind) {
     intptr_t n, i;
     size_t esz = cc__py_elem_size(kind);
     CCSlice out;
     cc__py_bind_err_obj(obj);
-    if (!obj || !obj->o || !arena)
+    if (!obj || !obj->o || !cc_arena_is_live(arena))
         return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("as_list"));
     /* Contiguous exporter of the right element type: one memcpy. */
     {
@@ -1452,7 +1452,7 @@ static inline CCResult_CCSlice_CCPyError cc__py_obj_as_list_raw(CCPyObj *obj,
 
 /* `obj.as_list::[T](&arena)` — the `::[T]` type argument selects the arm. */
 #define cc_py_obj_as_list(T, obj, arena) \
-    cc__py_obj_as_list_raw((obj), (arena), cc__py_elem_kind_of_##T)
+    cc__py_obj_as_list_raw((obj), CC__ARENA_HANDLE(arena), cc__py_elem_kind_of_##T)
 
 #define cc__py_elem_kind_of_double   CC__PY_EL_F64
 #define cc__py_elem_kind_of_float    CC__PY_EL_F64
@@ -1463,14 +1463,14 @@ static inline CCResult_CCSlice_CCPyError cc__py_obj_as_list_raw(CCPyObj *obj,
 /* `obj.as_map::[K, V](&arena, m)` — fills `m` from a Python mapping and
  * yields the pair count. K/V select the element arms. */
 static inline CCResult_size_t_CCPyError cc__py_obj_as_map_raw(
-        CCPyObj *obj, CCArena *arena, void *map,
+        CCPyObj *obj, CCArena arena, void *map,
         int (*insert)(void *map, void *k, void *v),
         CCPyElemKind kk, CCPyElemKind vk) {
     void *items;
     intptr_t n, i;
     size_t inserted = 0;
     cc__py_bind_err_obj(obj);
-    if (!obj || !obj->o || !arena || !map || !insert)
+    if (!obj || !obj->o || !cc_arena_is_live(arena) || !map || !insert)
         return cc_err_CCResult_size_t_CCPyError(cc__py_err("as_map"));
     if (!cc__py.MappingItems || !cc__py.SequenceSize || !cc__py.SequenceGetItem) {
         snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
@@ -1511,7 +1511,7 @@ static inline CCResult_size_t_CCPyError cc__py_obj_as_map_raw(
 }
 
 #define cc_py_obj_as_map(K, V, obj, arena, m) \
-    cc__py_obj_as_map_raw((obj), (arena), (m), \
+    cc__py_obj_as_map_raw((obj), CC__ARENA_HANDLE(arena), (m), \
                           cc__py_map_insert_##K##_##V, \
                           cc__py_elem_kind_of_##K, cc__py_elem_kind_of_##V)
 
@@ -1931,14 +1931,14 @@ CC_DECL_RESULT_SPEC(CCResult_CCSlice_uint32_t_CCError, CCSlice_uint32_t, CCError
 
 /* UFCS: `s.codepoints(arena)` — object first, arena last. */
 static CCResult_CCSlice_uint32_t_CCError
-cc_py_str_codepoints(CCPyStr *s, CCArena *arena) {
+cc_py_str_codepoints(CCPyStr *s, CCArena arena) {
     CCSlice_uint32_t out;
     intptr_t n;
     uint32_t *buf;
     CCSlice base;
     void *o = s ? s->o : NULL;
     memset(&out, 0, sizeof(out));
-    if (!arena) {
+    if (!cc_arena_is_live(arena)) {
         return cc_err_CCResult_CCSlice_uint32_t_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "codepoints without arena"));
     }
     if (!o || !cc__py.UnicodeGetLength || !cc__py.UnicodeAsUCS4) {
@@ -1965,7 +1965,7 @@ cc_py_str_codepoints(CCPyStr *s, CCArena *arena) {
 }
 
 static CCResult_CCSlice_uint32_t_CCError
-CCPyStr_codepoints(CCPyStr *s, CCArena *arena) {
+CCPyStr_codepoints(CCPyStr *s, CCArena arena) {
     return cc_py_str_codepoints(s, arena);
 }
 
@@ -2625,7 +2625,7 @@ static void *cc__py_none(void) {
  * is loaded without a CC host.  A module that cannot work without one fails
  * its init, which Python reports as an ordinary ImportError. */
 typedef struct CCHostState {
-    CCArena *arena;   /* the host's arena, or NULL with no CC host */
+    CCArena arena;   /* the host's arena; dead handle with no CC host */
     long long counter;
 } CCHostState;
 
@@ -2762,7 +2762,7 @@ static void *cc__py_tramp_add(void *mod__, void *const *args__, intptr_t nargs__
     CCHostState *self = (CCHostState *)cc__py_callable_state(mod__);
     long long a, b;
     if (!self) return cc__py_raise("cc.host: module state unavailable");
-    if (!self->arena) return cc__py_raise("cc.host: requires a CC host");
+    if (!cc_arena_is_live(self->arena)) return cc__py_raise("cc.host: requires a CC host");
     if (cc__py_bind_fast(args__, nargs__, kwnames__, 2, names__, NULL, bound__,
                          "add") != 0)
         return NULL;
@@ -2781,7 +2781,7 @@ static void *cc__py_tramp_bump(void *mod__, void *const *args__, intptr_t nargs_
     CCHostState *self = (CCHostState *)cc__py_callable_state(mod__);
     long long by;
     if (!self) return cc__py_raise("cc.host: module state unavailable");
-    if (!self->arena) return cc__py_raise("cc.host: requires a CC host");
+    if (!cc_arena_is_live(self->arena)) return cc__py_raise("cc.host: requires a CC host");
     if (cc__py_bind_fast(args__, nargs__, kwnames__, 1, names__, NULL, bound__,
                          "bump") != 0)
         return NULL;
@@ -2797,7 +2797,7 @@ static void *cc__py_tramp_reset(void *mod__, void *const *args__, intptr_t nargs
     CCHostState *self = (CCHostState *)cc__py_callable_state(mod__);
     (void)args__;
     if (!self) return cc__py_raise("cc.host: module state unavailable");
-    if (!self->arena) return cc__py_raise("cc.host: requires a CC host");
+    if (!cc_arena_is_live(self->arena)) return cc__py_raise("cc.host: requires a CC host");
     if (cc__py_bind_fast(args__, nargs__, kwnames__, 0, NULL, NULL, NULL,
                          "reset") != 0)
         return NULL;
@@ -3023,7 +3023,7 @@ done:
 }
 
 /* Install the built-in `cc.host` module in THIS interpreter. */
-static int cc__py_install_namespace(CCArena *host_arena) {
+static int cc__py_install_namespace(CCArena host_arena) {
     CCHostState seed;
     memset(&seed, 0, sizeof(seed));
     seed.arena = host_arena;
@@ -3591,11 +3591,11 @@ static const char *cc__py_iso_scan_val(const char *p, const char *end) {
     return p;
 }
 
-static CCSlice cc__py_iso_copy(CCArena *a, const char *p, size_t n) {
+static CCSlice cc__py_iso_copy(CCArena a, const char *p, size_t n) {
     CCSlice s;
     char *dst;
     memset(&s, 0, sizeof(s));
-    if (!a) return s;
+    if (!cc_arena_is_live(a)) return s;
     dst = (char *)cc_arena_alloc(a, n + 1, 1);
     if (!dst) return s;
     if (n) memcpy(dst, p, n);
@@ -3605,7 +3605,7 @@ static CCSlice cc__py_iso_copy(CCArena *a, const char *p, size_t n) {
     return s;
 }
 
-static int cc__py_iso_unescape(CCArena *a, const char *p, const char *end,
+static int cc__py_iso_unescape(CCArena a, const char *p, const char *end,
                                CCSlice *out) {
     const char *s, *e;
     size_t n, i, o;
@@ -3647,7 +3647,7 @@ static int cc__py_iso_unescape(CCArena *a, const char *p, const char *end,
     return 0;
 }
 
-static int cc__py_iso_classify(CCArena *a, const char *p, const char *end,
+static int cc__py_iso_classify(CCArena a, const char *p, const char *end,
                               CC__PyIsoResp *r) {
     p = cc__py_iso_ws(p, end);
     if (p >= end) return -1;
@@ -3710,7 +3710,7 @@ static int cc__py_iso_classify(CCArena *a, const char *p, const char *end,
     }
 }
 
-static int cc__py_iso_parse(CCArena *a, const char *line, size_t len,
+static int cc__py_iso_parse(CCArena a, const char *line, size_t len,
                             CC__PyIsoResp *r) {
     const char *p = line, *end = line + len;
     memset(r, 0, sizeof(*r));
@@ -3940,7 +3940,7 @@ static int cc__py_iso_send_cbr(CCPy *d, const CCPyObj *v, const char *err) {
 }
 
 /* Decode one JSON value from [start,end) into a CCPyObj (scalars / $h). */
-static int cc__py_iso_decode_cb_arg(CCPy *d, CCArena *a, const char *p,
+static int cc__py_iso_decode_cb_arg(CCPy *d, CCArena a, const char *p,
                                     const char *end, CCPyObj *out) {
     CC__PyIsoResp tmp;
     memset(out, 0, sizeof(*out));
@@ -4210,7 +4210,7 @@ static inline bool cc_py_proc_available(void) {
 }
 
 static inline CCResult_CCPy_CCPyError
-cc__py_proc_new_exe(CCArena *arena, const char *python_exe) {
+cc__py_proc_new_exe(CCArena arena, const char *python_exe) {
     char broker[448];
     int sv[2] = {-1, -1};
     long long pid;
@@ -4218,7 +4218,7 @@ cc__py_proc_new_exe(CCArena *arena, const char *python_exe) {
     const char *exe = cc__py_iso_exe(python_exe);
     cc__py_errbuf[0] = 0;
     cc__py_bind_err_arena(arena);
-    if (!arena) {
+    if (!cc_arena_is_live(arena)) {
         snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
                  "python: cc_py_new requires arena");
         return cc_err_CCResult_CCPy_CCPyError(cc__py_err("cc_py_new"));
@@ -4320,7 +4320,7 @@ static void cc__py_iso_close(CCPy *py) {
     cc__py_iso_drop(py);
     cc__py_iso_reap(py);
     py->ready = 0;
-    py->arena = NULL;
+    py->arena = cc_arena_handle(NULL);
     py->crashed = 0;
 }
 
@@ -4553,13 +4553,13 @@ static int cc__py_main_taken;
  * `true` (process-isolated): a python child per handle on the
  * broker.py wire (remote handles, never PyObject*).  Never a silent
  * alias of `false`. */
-static inline CCResult_CCPy_CCPyError cc_py_new(_Bool isolated, CCArena *arena) {
+static inline CCResult_CCPy_CCPyError cc_py_new(_Bool isolated, CCArena arena) {
     CCPy py;
     memset(&py, 0, sizeof(py));
     cc__py_errbuf[0] = '\0';
     cc__py_bind_err_arena(arena);
     if (isolated) return cc__py_proc_new_exe(arena, NULL);
-    if (!arena) {
+    if (!cc_arena_is_live(arena)) {
         snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
                  "python: cc_py_new requires arena");
         return cc_err_CCResult_CCPy_CCPyError(cc__py_err("cc_py_new"));
@@ -4734,7 +4734,7 @@ static inline void cc_py_close(CCPy *py) {
     py->sys_getrefcount = NULL;
     cc__py_fn_kill_boxes(py);
     py->ready = 0;
-    py->arena = NULL;
+    py->arena = cc_arena_handle(NULL);
     py->tstate = NULL;
     py->interp = NULL;
     py->owns_interp = 0;
@@ -4788,7 +4788,7 @@ static inline CCResult_CCPyObj_CCPyError cc__py_obj_or_err(CCPy *home,
  * C strings; a slice need not be terminated). */
 static const char *cc__py_cstr(CCPy *py, CCSlice s) {
     char *buf;
-    if (!py || !py->arena) return NULL;
+    if (!py || !cc_arena_is_live(py->arena)) return NULL;
     buf = (char *)cc_arena_alloc(py->arena, s.len + 1, 1);
     if (!buf) return NULL;
     if (s.len && s.ptr) memcpy(buf, s.ptr, s.len);
@@ -5005,7 +5005,7 @@ static inline CCResult_CCPyObj_CCPyError cc_py_obj_clone_into(CCPyObj *obj,
     CC__PyBuffer view;
     char *buf = NULL;
     size_t n = 0;
-    CCArena *scratch = NULL;
+    CCArena scratch = cc_arena_handle(NULL);
     char empty;
 
     cc__py_bind_err_obj(obj);
@@ -5064,9 +5064,9 @@ static inline CCResult_CCPyObj_CCPyError cc_py_obj_clone_into(CCPyObj *obj,
         return cc_err_CCResult_CCPyObj_CCPyError(cc__py_err("clone_into"));
     }
     n = (size_t)view.len;
-    scratch = target->arena ? target->arena : obj->home->arena;
+    scratch = cc_arena_is_live(target->arena) ? target->arena : obj->home->arena;
     if (n > 0) {
-        if (scratch)
+        if (cc_arena_is_live(scratch))
             buf = (char *)cc_arena_alloc(scratch, n, 1);
         if (!buf) {
             cc__py.ReleaseBuffer(&view);
@@ -5472,7 +5472,7 @@ static int cc__py_fn_from_pyobj(CCPy *home, void *o, CCPyObj *out) {
     if (s && (!cc__py.ErrOccurred || !cc__py.ErrOccurred())) {
         char *copy = NULL;
         out->kind = CC__PY_K_STR;
-        if (home && home->arena && slen >= 0) {
+        if (home && cc_arena_is_live(home->arena) && slen >= 0) {
             copy = (char *)cc_arena_alloc(home->arena, (size_t)slen + 1, 1);
             if (copy) {
                 memcpy(copy, s, (size_t)slen);
@@ -5762,7 +5762,7 @@ static inline void *cc__py_box_elem(const CCPyArg *col, size_t row) {
  * the call.  Python stores by kind: floats widen to double, integers land
  * as int64 or int. */
 static inline CCResult_CCSlice_CCPyError cc__py_obj_map_raw(
-        CCPyObj *fobj, CCArena *arena, int out_esz, int out_isf,
+        CCPyObj *fobj, CCArena arena, int out_esz, int out_isf,
         int argc, const CCPyArg *argv) {
     CCPyElemKind outkind;
     size_t nrows, r, esz;
@@ -5781,7 +5781,7 @@ static inline CCResult_CCSlice_CCPyError cc__py_obj_map_raw(
         return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("map"));
     }
     esz = cc__py_elem_size(outkind);
-    if (!fobj || !fobj->o || !arena || argc < 1 || argc > 8) {
+    if (!fobj || !fobj->o || !cc_arena_is_live(arena) || argc < 1 || argc > 8) {
         snprintf(cc__py_errbuf, sizeof(cc__py_errbuf),
                  "python: map: needs a callable, an arena, and 1..8 columns");
         return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("map"));
@@ -5900,7 +5900,7 @@ CC_DECL_RESULT_SPEC(CCResult_CCSlice_int_CCPyError, CCSlice_int, CCPyError)
 #endif
 
 static inline CCResult_CCSlice_double_CCPyError cc__py_obj_map_CCSlice_double(
-        CCPyObj *fobj, CCArena *arena, int esz, int isf, int argc,
+        CCPyObj *fobj, CCArena arena, int esz, int isf, int argc,
         const CCPyArg *argv) {
     CCResult_CCSlice_CCPyError r =
         cc__py_obj_map_raw(fobj, arena, esz, isf, argc, argv);
@@ -5912,7 +5912,7 @@ static inline CCResult_CCSlice_double_CCPyError cc__py_obj_map_CCSlice_double(
 }
 
 static inline CCResult_CCSlice_float_CCPyError cc__py_obj_map_CCSlice_float(
-        CCPyObj *fobj, CCArena *arena, int esz, int isf, int argc,
+        CCPyObj *fobj, CCArena arena, int esz, int isf, int argc,
         const CCPyArg *argv) {
     CCResult_CCSlice_CCPyError r =
         cc__py_obj_map_raw(fobj, arena, esz, isf, argc, argv);
@@ -5924,7 +5924,7 @@ static inline CCResult_CCSlice_float_CCPyError cc__py_obj_map_CCSlice_float(
 }
 
 static inline CCResult_CCSlice_int64_t_CCPyError cc__py_obj_map_CCSlice_int64_t(
-        CCPyObj *fobj, CCArena *arena, int esz, int isf, int argc,
+        CCPyObj *fobj, CCArena arena, int esz, int isf, int argc,
         const CCPyArg *argv) {
     CCResult_CCSlice_CCPyError r =
         cc__py_obj_map_raw(fobj, arena, esz, isf, argc, argv);
@@ -5936,7 +5936,7 @@ static inline CCResult_CCSlice_int64_t_CCPyError cc__py_obj_map_CCSlice_int64_t(
 }
 
 static inline CCResult_CCSlice_long_long_CCPyError cc__py_obj_map_CCSlice_long_long(
-        CCPyObj *fobj, CCArena *arena, int esz, int isf, int argc,
+        CCPyObj *fobj, CCArena arena, int esz, int isf, int argc,
         const CCPyArg *argv) {
     CCResult_CCSlice_CCPyError r =
         cc__py_obj_map_raw(fobj, arena, esz, isf, argc, argv);
@@ -5948,7 +5948,7 @@ static inline CCResult_CCSlice_long_long_CCPyError cc__py_obj_map_CCSlice_long_l
 }
 
 static inline CCResult_CCSlice_int_CCPyError cc__py_obj_map_CCSlice_int(
-        CCPyObj *fobj, CCArena *arena, int esz, int isf, int argc,
+        CCPyObj *fobj, CCArena arena, int esz, int isf, int argc,
         const CCPyArg *argv) {
     CCResult_CCSlice_CCPyError r =
         cc__py_obj_map_raw(fobj, arena, esz, isf, argc, argv);
@@ -5995,7 +5995,7 @@ static inline CCResult_CCSlice_int_CCPyError cc__py_obj_map_CCSlice_int(
  * the macro below intercepts every call — so nothing references it at
  * link time. */
 CCResult_CCSlice_CCPyError cc_py_obj_map(void *never_defined, ...);
-#define cc_py_obj_map(T, obj, arena, ...)     cc__py_obj_map_raw((obj), (arena), (int)sizeof(T),         _Generic((T)0, float: 1, double: 1, default: 0),         CC__PY_NARG(__VA_ARGS__),         (const CCPyArg[]){             CC__PY_MAPCAT(CC__PY_MAPA, CC__PY_NARG(__VA_ARGS__))(__VA_ARGS__) })
+#define cc_py_obj_map(T, obj, arena, ...)     cc__py_obj_map_raw((obj), CC__ARENA_HANDLE(arena), (int)sizeof(T),         _Generic((T)0, float: 1, double: 1, default: 0),         CC__PY_NARG(__VA_ARGS__),         (const CCPyArg[]){             CC__PY_MAPCAT(CC__PY_MAPA, CC__PY_NARG(__VA_ARGS__))(__VA_ARGS__) })
 
 
 /* `obj.method(args…)` sink core: builds an argument tuple and calls the
@@ -6868,13 +6868,13 @@ static inline CCResult_int_CCPyError cc_py_callm_int(
 /* str(obj) copied into `arena`; NUL-terminated (char[:0] compatible).
  * Slice provenance matches the arena epoch. */
 static inline CCResult_CCSlice_CCPyError cc_py_obj_as_slice_into(CCPyObj *obj,
-                                                                 CCArena *arena) {
+                                                                 CCArena arena) {
     void *s;
     const char *msg;
     intptr_t n = 0;
     CCSlice out;
     cc__py_bind_err_obj(obj);
-    if (!obj || !arena)
+    if (!obj || !cc_arena_is_live(arena))
         return cc_err_CCResult_CCSlice_CCPyError(cc__py_err("as_slice"));
     if (obj->home && obj->home->tier == CC__PY_TIER_PROC) {
         CCSlice src;
@@ -6976,7 +6976,7 @@ static inline CCResult_CCSlice_CCPyError cc_py_obj_as_slice_into(CCPyObj *obj,
 
 /* Default extract: copy into the home handle's scratch arena. */
 static inline CCResult_CCSlice_CCPyError cc_py_obj_as_slice(CCPyObj *obj) {
-    CCArena *arena = (obj && obj->home) ? obj->home->arena : NULL;
+    CCArena arena = (obj && obj->home) ? obj->home->arena : cc_arena_handle(NULL);
     return cc_py_obj_as_slice_into(obj, arena);
 }
 
@@ -7286,5 +7286,25 @@ static inline CCResult_CCSlice_CCPyError cc_py_obj_as_slice(CCPyObj *obj) {
 
 
 
+
+#define cc_py_new(isolated, a) (cc_py_new)((isolated), CC__ARENA_HANDLE(a))
+#define cc__py_obj_map_raw(f, a, ...) \
+    (cc__py_obj_map_raw)((f), CC__ARENA_HANDLE(a), __VA_ARGS__)
+#define cc__py_obj_map_CCSlice_double(f, a, ...) \
+    (cc__py_obj_map_CCSlice_double)((f), CC__ARENA_HANDLE(a), __VA_ARGS__)
+#define cc__py_obj_map_CCSlice_float(f, a, ...) \
+    (cc__py_obj_map_CCSlice_float)((f), CC__ARENA_HANDLE(a), __VA_ARGS__)
+#define cc__py_obj_map_CCSlice_int64_t(f, a, ...) \
+    (cc__py_obj_map_CCSlice_int64_t)((f), CC__ARENA_HANDLE(a), __VA_ARGS__)
+#define cc__py_obj_map_CCSlice_long_long(f, a, ...) \
+    (cc__py_obj_map_CCSlice_long_long)((f), CC__ARENA_HANDLE(a), __VA_ARGS__)
+#define cc__py_obj_map_CCSlice_int(f, a, ...) \
+    (cc__py_obj_map_CCSlice_int)((f), CC__ARENA_HANDLE(a), __VA_ARGS__)
+#define cc_py_str_codepoints(s, a) \
+    (cc_py_str_codepoints)((s), CC__ARENA_HANDLE(a))
+#define CCPyStr_codepoints(s, a) \
+    (CCPyStr_codepoints)((s), CC__ARENA_HANDLE(a))
+#define cc_py_obj_as_slice_into(o, a) \
+    (cc_py_obj_as_slice_into)((o), CC__ARENA_HANDLE(a))
 
 #endif /* CC_SCRIPT_PY_H */

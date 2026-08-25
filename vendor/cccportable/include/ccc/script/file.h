@@ -21,10 +21,10 @@
 #define CCResult_CCSlice_CCError_DEFINED 1
 CC_DECL_RESULT_SPEC(CCResult_CCSlice_CCError, CCSlice, CCError)
 #endif
-static inline CCResult_CCSlice_CCError cc_file_read_path(CCSlice path, CCArena *arena) {
+static inline CCResult_CCSlice_CCError cc_file_read_path(CCSlice path, CCArena arena) {
     CCFile file;
     CCResult_CCSlice_CCIoError r;
-    if (!path.ptr || !arena) {
+    if (!path.ptr || !cc_arena_is_live(arena)) {
         return cc_err_CCResult_CCSlice_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "cc_file_read_path: bad args"));
     }
     if (cc_file_open(&file, path, "rb") != 0) {
@@ -55,10 +55,10 @@ static inline CCResult_size_t_CCError cc_file_write_path(CCSlice path, CCSlice d
     return cc_ok_CCResult_size_t_CCError(cc_value(r));
 }
 
-static inline CCResult_bool_CCError cc_file_copy(CCSlice src, CCSlice dst, CCArena *arena) {
+static inline CCResult_bool_CCError cc_file_copy(CCSlice src, CCSlice dst, CCArena arena) {
     CCResult_CCSlice_CCError rr;
     CCResult_size_t_CCError wr;
-    if (!arena || !src.ptr || !dst.ptr) {
+    if (!cc_arena_is_live(arena) || !src.ptr || !dst.ptr) {
         return cc_err_CCResult_bool_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "cc_file_copy: bad args"));
     }
     rr = cc_file_read_path(src, arena);
@@ -72,10 +72,10 @@ static inline CCResult_bool_CCError cc_file_copy(CCSlice src, CCSlice dst, CCAre
     return cc_ok_CCResult_bool_CCError(true);
 }
 
-static inline CCResult_size_t_CCError cc_script_print_file(CCSlice path, CCArena *arena) {
+static inline CCResult_size_t_CCError cc_script_print_file(CCSlice path, CCArena arena) {
     CCResult_CCSlice_CCError rr;
     CCResult_size_t_CCIoError wr;
-    if (!arena || !path.ptr) {
+    if (!cc_arena_is_live(arena) || !path.ptr) {
         return cc_err_CCResult_size_t_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "cc_script_print_file: bad args"));
     }
     rr = cc_file_read_path(path, arena);
@@ -86,5 +86,12 @@ static inline CCResult_size_t_CCError cc_script_print_file(CCSlice path, CCArena
     }
     return cc_ok_CCResult_size_t_CCError(cc_value(wr));
 }
+
+#define cc_file_read_path(path, a) \
+    (cc_file_read_path)((path), CC__ARENA_HANDLE(a))
+#define cc_file_copy(src, dst, a) \
+    (cc_file_copy)((src), (dst), CC__ARENA_HANDLE(a))
+#define cc_script_print_file(path, a) \
+    (cc_script_print_file)((path), CC__ARENA_HANDLE(a))
 
 #endif /* CC_SCRIPT_FILE_H */

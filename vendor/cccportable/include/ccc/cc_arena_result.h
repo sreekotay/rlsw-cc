@@ -22,41 +22,57 @@ CC_DECL_RESULT_SPEC(CCResult_CCArenaCheckpoint_CCError, CCArenaCheckpoint, CCErr
 CC_DECL_RESULT_SPEC(CCResult_CCArenaCheckpoint_CCError, CCArenaCheckpoint, CCError)
 #endif
 
-static inline CCResult_CCArenaCheckpoint_CCError cc_arena_try_checkpoint(CCArena *arena) {
-    CCArenaCheckpoint cp = cc_arena_checkpoint(arena);
+/* Last-good UFCS still emits fn(&handle). Accept handle or handle*. */
+static inline CCArena cc__arena_val_from_h(CCArena a) { return a; }
+static inline CCArena cc__arena_val_from_p(CCArena *p) {
+    CCArena z;
+    if (!p) {
+        z.a = NULL;
+        return z;
+    }
+    return *p;
+}
+#define CC__ARENA_VAL(x) _Generic((x), \
+    struct CCArena: cc__arena_val_from_h, \
+    struct CCArena *: cc__arena_val_from_p \
+)(x)
+
+static inline CCArenaCheckpoint cc__cp_val_from_h(CCArenaCheckpoint c) { return c; }
+static inline CCArenaCheckpoint cc__cp_val_from_p(CCArenaCheckpoint *p) {
+    CCArenaCheckpoint z = {0};
+    return p ? *p : z;
+}
+#define CC__CHECKPOINT_VAL(x) _Generic((x), \
+    CCArenaCheckpoint: cc__cp_val_from_h, \
+    CCArenaCheckpoint *: cc__cp_val_from_p \
+)(x)
+
+static inline CCResult_CCArenaCheckpoint_CCError cc__arena_try_checkpoint_h(CCArena arena) {
+    CCArenaCheckpoint cp = cc_arena_checkpoint(cc_arena_host(arena));
     if (!cp.arena) {
         return cc_err_CCResult_CCArenaCheckpoint_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "cc_arena_checkpoint: refused"));
     }
     return cc_ok_CCResult_CCArenaCheckpoint_CCError(cp);
 }
 
-static inline CCResult_void_CCError cc_arena_try_restore(CCArenaCheckpoint checkpoint) {
+static inline CCResult_void_CCError cc__arena_try_restore_h(CCArenaCheckpoint checkpoint) {
     if (!cc_arena_restore(checkpoint)) {
         return cc_err_CCResult_void_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "cc_arena_restore: refused"));
     }
     return cc_ok_CCResult_void_CCError();
 }
 
-#ifndef CCResult_CCArenaPtr_CCError_DEFINED
-#define CCResult_CCArenaPtr_CCError_DEFINED 1
-typedef CCArena* CCArenaPtr;
-/* --- CC auto-generated type declaration --- */
-#ifndef CCResult_CCArenaPtr_CCError_DEFINED
-#define CCResult_CCArenaPtr_CCError_DEFINED 1
-CC_DECL_RESULT_SPEC(CCResult_CCArenaPtr_CCError, CCArenaPtr, CCError)
-#endif
-CC_DECL_RESULT_SPEC(CCResult_CCArenaPtr_CCError, CCArenaPtr, CCError)
-#endif
+#define cc_arena_try_checkpoint(x) cc__arena_try_checkpoint_h(CC__ARENA_VAL(x))
+#define cc_arena_try_restore(x) cc__arena_try_restore_h(CC__CHECKPOINT_VAL(x))
 
-/* Result face over cc_arena_adopt (which reports the specific refusal and
- * returns NULL; the plain form already composes with `!>` as a nullable
- * pointer). CCS: `parent->try_adopt(&a) !>`. */
-static inline CCResult_CCArenaPtr_CCError cc_arena_try_adopt(CCArena* parent, CCArena* src) {
-    CCArena* h = cc_arena_adopt(parent, src);
-    if (!h) {
-        return cc_err_CCResult_CCArenaPtr_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "cc_arena_adopt: refused"));
-    }
-    return cc_ok_CCResult_CCArenaPtr_CCError(h);
+/* CCS: `parent.try_adopt(&child) !>`. `cc_arena_adopt` is already Result. */
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCArena_CCError_DEFINED
+#define CCResult_CCArena_CCError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCArena_CCError, CCArena, CCError)
+#endif
+static inline CCResult_CCArena_CCError cc_arena_try_adopt(CCArena *parent, CCArena *src) {
+    return cc_arena_adopt(parent, src);
 }
 
 static inline CCResult_void_CCError cc_arena_checkpoint_try_restore(CCArenaCheckpoint *cp) {

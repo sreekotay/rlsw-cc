@@ -57,14 +57,14 @@ static inline void cc_temp_file_destroy(CCTempFile *tmp) {
     cc_file_close(&tmp->file);
 }
 
-static inline CCResult_CCTempFile_CCError cc_temp_file(CCArena *arena) {
+static inline CCResult_CCTempFile_CCError cc_temp_file(CCArena arena) {
     char tmpl[] = "/tmp/cc_script.XXXXXX";
     int fd;
     size_t n;
     CCSlice path;
     CCTempFile tmp;
     FILE *fp;
-    if (!arena) {
+    if (!cc_arena_is_live(arena)) {
         return cc_err_CCResult_CCTempFile_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "cc_temp_file: no arena"));
     }
     fd = mkstemp(tmpl);
@@ -92,5 +92,7 @@ static inline CCResult_CCTempFile_CCError cc_temp_file(CCArena *arena) {
     tmp.owns = 1;
     return cc_ok_CCResult_CCTempFile_CCError(tmp);
 }
+
+#define cc_temp_file(a) (cc_temp_file)(CC__ARENA_HANDLE(a))
 
 #endif /* CC_SCRIPT_TEMP_H */

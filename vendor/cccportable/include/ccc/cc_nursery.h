@@ -49,7 +49,9 @@ CCResult_CCNursery_CCError cc_nursery_create_child(CCNursery parent);
 /* Lifetime-parent birth. Handle lives in `a`; `a` must be live (null/dead
  * abort). Walk of `a` joins. `abandon` is refused. UFCS: `a.create_nursery()`
  * via the generic `cc_arena_` prefix — writing this function installs it. */
-CCResult_CCNursery_CCError cc_arena_create_nursery(CCArena* a);
+CCResult_CCNursery_CCError cc_nursery_create_on(CCArena a);
+/* UFCS `a.create_nursery()` emits this name with `&a`; peel. */
+#define cc_arena_create_nursery(a) cc_nursery_create_on(CC__ARENA_HANDLE(a))
 
 /* The nursery's lifetime-parent arena (Region face). Host C cannot see
  * the field on the host; UFCS peels through this accessor. */
@@ -208,7 +210,7 @@ static inline CCSlice cc_nursery_lower_c(CCSlice recv_type,
                                          CCSlice mode,
                                          CCSliceArray argv,
                                          CCSliceArray arg_types,
-                                         CCArena* arena) {
+                                         CCArena *arena) {
     (void)recv_type;
     (void)mode;
     (void)argv;

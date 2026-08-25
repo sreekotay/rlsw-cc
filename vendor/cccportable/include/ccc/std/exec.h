@@ -15,7 +15,7 @@
 #include <ccc/std/vec.h>
 
 typedef struct CCCommand {
-    CCArena *arena;
+    CCArena arena;
     CCString storage;
     CCVec_size_t offsets;
     const char** env;
@@ -57,9 +57,9 @@ CC_DECL_RESULT_SPEC(CCResult_int_CCIoError, int, CCIoError)
 CC_DECL_RESULT_SPEC(CCResult_int_CCIoError, int, CCIoError)
 #endif
 
-CCCommand cc_command_new(CCArena *arena, CCSlice program);
+CCCommand cc_command_new(CCArena arena, CCSlice program);
 
-static inline CCCommand cc_command(CCArena *arena, CCSlice program) {
+static inline CCCommand cc_command(CCArena arena, CCSlice program) {
     return cc_command_new(arena, program);
 }
 
@@ -99,16 +99,16 @@ static inline CCCommand *cc_command_arg_i32_if(CCCommand *cmd, bool cond, int va
 const char **cc_command_argv(CCCommand *cmd);
 CCProcessConfig cc_command_process_config(CCCommand *cmd);
 CCResult_CCProcess_CCIoError cc_command_spawn(CCCommand *cmd);
-CCResult_CCProcessOutput_CCIoError cc_command_run(CCCommand *cmd, CCArena *arena);
-CCResult_CCProcessOutput_CCIoError cc_command_output(CCCommand *cmd, CCArena *arena);
-CCResult_CCProcessOutput_CCIoError cc_command_output_with_input(CCCommand *cmd, CCArena *arena, CCSlice input);
+CCResult_CCProcessOutput_CCIoError cc_command_run(CCCommand *cmd, CCArena arena);
+CCResult_CCProcessOutput_CCIoError cc_command_output(CCCommand *cmd, CCArena arena);
+CCResult_CCProcessOutput_CCIoError cc_command_output_with_input(CCCommand *cmd, CCArena arena, CCSlice input);
 CCResult_int_CCIoError cc_command_status(CCCommand *cmd);
 
 /* Script/oracle default: merge stderr into stdout, then capture.
  * Prefer this over stderr_to_stdout() + output() for inspect-the-text runs.
  * Exit status stays on the returned CCProcessOutput (not folded into Err). */
 static inline CCResult_CCProcessOutput_CCIoError
-cc_command_capture(CCCommand *cmd, CCArena *arena) {
+cc_command_capture(CCCommand *cmd, CCArena arena) {
     (void)cc_command_stderr_to_stdout(cmd);
     return cc_command_output(cmd, arena);
 }
@@ -118,5 +118,13 @@ cc_command_capture(CCCommand *cmd, CCArena *arena) {
 
 /* CCCommand UFCS dispatch is covered by the global `*` registration
    in cc_arena.cch; no per-type opt-in needed here. */
+
+#define cc_command_new(a, p) (cc_command_new)(CC__ARENA_HANDLE(a), (p))
+#define cc_command(a, p) (cc_command)(CC__ARENA_HANDLE(a), (p))
+#define cc_command_run(cmd, a) (cc_command_run)((cmd), CC__ARENA_HANDLE(a))
+#define cc_command_output(cmd, a) (cc_command_output)((cmd), CC__ARENA_HANDLE(a))
+#define cc_command_output_with_input(cmd, a, in) \
+    (cc_command_output_with_input)((cmd), CC__ARENA_HANDLE(a), (in))
+#define cc_command_capture(cmd, a) (cc_command_capture)((cmd), CC__ARENA_HANDLE(a))
 
 #endif /* CC_STD_EXEC_H */

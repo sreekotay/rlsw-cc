@@ -40,7 +40,7 @@ static inline int cc__script_is_repo_root(CCSlice dir) {
     return cc_path_exists(cc_slice_cstr(marker)) ? 1 : 0;
 }
 
-static inline CCSlice cc__script_dup_cstr(CCArena *arena, const char *s) {
+static inline CCSlice cc__script_dup_cstr(CCArena arena, const char *s) {
     size_t n = s ? strlen(s) : 0;
     CCSlice out = cc_arena_alloc_slice_bytes(arena, n + 1);
     if (!out.ptr) return cc_slice_empty();
@@ -60,10 +60,10 @@ static inline CCSlice cc__script_dup_cstr(CCArena *arena, const char *s) {
 CC_DECL_RESULT_SPEC(CCResult_CCSlice_CCError, CCSlice, CCError)
 #endif
 static inline CCResult_CCSlice_CCError cc_script_repo_root(CCSlice argv0,
-                                                          CCArena *arena) {
+                                                          CCArena arena) {
     char start[PATH_MAX];
     char cur[PATH_MAX];
-    if (!arena) {
+    if (!cc_arena_is_live(arena)) {
         return cc_err_CCResult_CCSlice_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "cc_script_repo_root: no arena"));
     }
     start[0] = '\0';
@@ -101,7 +101,7 @@ static inline CCResult_CCSlice_CCError cc_script_repo_root(CCSlice argv0,
 }
 
 /* Join path segments; arena last. Result is NUL-terminated CCSlice. */
-static inline CCSlice cc_script_path_join(CCSlice a, CCSlice b, CCArena *arena) {
+static inline CCSlice cc_script_path_join(CCSlice a, CCSlice b, CCArena arena) {
     return cc_path_join(arena, a, b);
 }
 
@@ -109,5 +109,10 @@ static inline bool cc_script_path_exists(CCSlice path) {
     if (!path.ptr || path.len == 0) return false;
     return cc_path_exists(path);
 }
+
+#define cc_script_repo_root(argv0, a) \
+    (cc_script_repo_root)((argv0), CC__ARENA_HANDLE(a))
+#define cc_script_path_join(a, b, ar) \
+    (cc_script_path_join)((a), (b), CC__ARENA_HANDLE(ar))
 
 #endif /* CC_SCRIPT_PATHX_H */

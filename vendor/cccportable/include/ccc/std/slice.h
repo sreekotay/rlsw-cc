@@ -50,8 +50,8 @@ CC_DECL_RESULT_SPEC(CCResult_uint64_t_CCError, uint64_t, CCError)
 CC_DECL_RESULT_SPEC(CCResult_double_CCError, double, CCError)
 #endif
 
-static inline CCResult_CCSlice_CCError cc_slice_clone_into(CCSlice* src, CCArena* arena) {
-    if (!src || !arena) {
+static inline CCResult_CCSlice_CCError cc_slice_clone_into(CCSlice* src, CCArena arena) {
+    if (!src || !cc_arena_is_live(arena)) {
         return cc_err_CCResult_CCSlice_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "clone_into without arena"));
     }
     if (src->len == 0) {
@@ -72,8 +72,8 @@ static inline CCResult_CCSlice_CCError cc_slice_clone_into(CCSlice* src, CCArena
  * No-op when empty, canonical/static, or already minted by this arena's
  * provenance epoch; otherwise clone bytes into `arena` and replace `*s`.
  * Does not free or destroy the prior view. */
-static inline CCResult_bool_CCError cc_slice_materialize_in(CCSlice* s, CCArena* arena) {
-    if (!s || !arena) {
+static inline CCResult_bool_CCError cc_slice_materialize_in(CCSlice* s, CCArena arena) {
+    if (!s || !cc_arena_is_live(arena)) {
         return cc_err_CCResult_bool_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "materialize_in without arena"));
     }
     if (s->len == 0 || cc_slice_is_canonical(*s) ||
@@ -87,12 +87,12 @@ static inline CCResult_bool_CCError cc_slice_materialize_in(CCSlice* s, CCArena*
     *s = cc_value(cloned);
     return cc_ok_CCResult_bool_CCError(true);
 }
-static inline CCResult_bool_CCError CCSlice_materialize_in(CCSlice* s, CCArena* arena) {
+static inline CCResult_bool_CCError CCSlice_materialize_in(CCSlice* s, CCArena arena) {
     return cc_slice_materialize_in(s, arena);
 }
 
-static inline CCResult_CCSliceHdr_CCError cc_slice_hdr_clone_into(CCSliceHdr* src, CCArena* arena) {
-    if (!src || !arena) {
+static inline CCResult_CCSliceHdr_CCError cc_slice_hdr_clone_into(CCSliceHdr* src, CCArena arena) {
+    if (!src || !cc_arena_is_live(arena)) {
         return cc_err_CCResult_CCSliceHdr_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "clone_into without arena"));
     }
     if (src->len == 0) {
@@ -107,6 +107,10 @@ static inline CCResult_CCSliceHdr_CCError cc_slice_hdr_clone_into(CCSliceHdr* sr
 
     memcpy(stable.ptr, src->ptr, src->len);
     return cc_ok_CCResult_CCSliceHdr_CCError((CCSliceHdr){ .ptr = stable.ptr, .len = stable.len });
+}
+
+static inline CCResult_CCSliceHdr_CCError CCSliceHdr_clone_into(CCSliceHdr* src, CCArena arena) {
+    return cc_slice_hdr_clone_into(src, arena);
 }
 
 /*
@@ -318,14 +322,14 @@ CC_DECL_RESULT_SPEC(CCResult_CCSlice_uint32_t_CCError, CCSlice_uint32_t, CCError
 CC_DECL_RESULT_SPEC(CCResult_CCSlice_uint32_t_CCError, CCSlice_uint32_t, CCError)
 #endif
 
-static inline CCResult_CCSlice_uint32_t_CCError cc_slice_utf8_codepoints(const CCSlice *s_ptr, CCArena *arena) {
+static inline CCResult_CCSlice_uint32_t_CCError cc_slice_utf8_codepoints(const CCSlice *s_ptr, CCArena arena) {
     CCSlice s = s_ptr ? *s_ptr : cc_slice_empty();
     const unsigned char *p = (const unsigned char *)s.ptr;
     size_t i = 0, n = 0;
     uint32_t *cp;
     CCSlice base;
     CCSlice_uint32_t out;
-    if (!arena) {
+    if (!cc_arena_is_live(arena)) {
         return cc_err_CCResult_CCSlice_uint32_t_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "utf8_codepoints without arena"));
     }
     if (s.len == 0) {
@@ -409,7 +413,7 @@ static inline CCResult_CCSlice_uint32_t_CCError cc_slice_utf8_codepoints(const C
     return cc_ok_CCResult_CCSlice_uint32_t_CCError(out);
 }
 
-static inline CCResult_CCSlice_uint32_t_CCError CCSlice_utf8_codepoints(const CCSlice *s, CCArena *arena) {
+static inline CCResult_CCSlice_uint32_t_CCError CCSlice_utf8_codepoints(const CCSlice *s, CCArena arena) {
     return cc_slice_utf8_codepoints(s, arena);
 }
 
@@ -465,5 +469,20 @@ static inline CCResult_int64_t_CCError cc_mul_i64_checked(int64_t a, int64_t b) 
 #endif
     return cc_ok_CCResult_int64_t_CCError(r);
 }
+
+#define cc_slice_utf8_codepoints(s, a) \
+    (cc_slice_utf8_codepoints)((s), CC__ARENA_HANDLE(a))
+#define CCSlice_utf8_codepoints(s, a) \
+    (CCSlice_utf8_codepoints)((s), CC__ARENA_HANDLE(a))
+#define cc_slice_clone_into(s, a) \
+    (cc_slice_clone_into)((s), CC__ARENA_HANDLE(a))
+#define cc_slice_hdr_clone_into(s, a) \
+    (cc_slice_hdr_clone_into)((s), CC__ARENA_HANDLE(a))
+#define CCSliceHdr_clone_into(s, a) \
+    (CCSliceHdr_clone_into)((s), CC__ARENA_HANDLE(a))
+#define cc_slice_materialize_in(s, a) \
+    (cc_slice_materialize_in)((s), CC__ARENA_HANDLE(a))
+#define CCSlice_materialize_in(s, a) \
+    (CCSlice_materialize_in)((s), CC__ARENA_HANDLE(a))
 
 #endif /* CC_STD_SLICE_H */
