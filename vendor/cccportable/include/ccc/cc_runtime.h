@@ -3,7 +3,6 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <string.h>
 
 #include <ccc/cc_atomic.h>
 #include <ccc/cc_slice.h>
@@ -17,14 +16,14 @@
 
 /* Surface channel helpers (ergonomic layer over CCChanTx/CCChanRx).
    Canonical lowered/manual-C surface uses the `cc_channel_*` family.
-   Legacy `channel_pair` / `chan_*` spellings remain as compatibility aliases. */
+   `channel_pair` / `chan_*` spellings are compatibility aliases. */
 
 /* Surface constructor marker. This is lowered by the CC frontend; the runtime does not implement it.
    Declared here to avoid implicit-declaration warnings if the lowering misses a call site. */
 CCChan* channel_pair(CCChanTx* tx, CCChanRx* rx);
 CCChan* cc_channel_pair(CCChanTx* tx, CCChanRx* rx);
 
-/* Legacy compatibility aliases over the canonical channel family. */
+/* Compatibility aliases over the canonical channel family. */
 #define chan_send(tx, value) cc_channel_send((tx), (value))
 #define chan_recv(rx, out_ptr) cc_channel_recv((rx), (out_ptr))
 #define chan_try_send(tx, value) cc_channel_try_send((tx), (value))
@@ -33,10 +32,10 @@ CCChan* cc_channel_pair(CCChanTx* tx, CCChanRx* rx);
 #define chan_free(h) cc_channel_free((h))
 #define chan_send_take(tx, value) cc_channel_send_take((tx), (value))
 #define chan_send_task(tx, value) cc_channel_send_task((tx), (value))
-/* Generated closure bodies can still emit these transitional nursery-aware names. */
+/* Generated closure bodies may emit these nursery-aware channel names. */
 #define cc_nursery_send(tx_ptr, value) cc_channel_send(*(tx_ptr), (value))
 #define cc_nursery_recv(rx_ptr, out_ptr) cc_channel_recv(*(rx_ptr), (out_ptr))
-#define cc_nursery_close(h_ptr) cc_channel_close(*(h_ptr))
+#define cc_nursery_chan_close(h_ptr) cc_channel_close(*(h_ptr))
 
 /* Language-level cancellation helpers.
    The runtime already provides cc_cancel(CCDeadline*) / cc_is_cancelled(const CCDeadline*).
@@ -62,18 +61,26 @@ int cc_external_wait_active(void);
 
 // Forward declarations for runtime handles.
 typedef struct CCChan CCChan;
-/* CCTask is now defined in <ccc/std/task.h> as a value type */
+/* CCTask is defined in <ccc/std/task.h> as a value type */
 
-/* Explicit move primitive.
-   Best-effort: uses GNU statement-expr supported by Clang/GCC.
-   For now we "poison" the moved-from value by zeroing it.
-   The compiler will enforce use-after-move for certain move-only values (e.g. unique slices) over time. */
+/* cc_move is transfer: copy, then leave the source empty so generated
+   drop / variant transition / @destroy do not still own. User use after
+   the move is shadow (compile error), not a runtime check on the empty
+   bytes. Dead-state is an inline byte loop — not a cc_mem.c symbol. */
 #if defined(CC_PARSER_MODE)
 /* During TCC parse-to-stub-AST, macros expand before recording. We emit a real call the recorder can see. */
 static inline void cc__move_marker_impl(void* p) { (void)p; }
 #define cc_move(x) (cc__move_marker_impl(&(x)), (x))
 #else
-#define cc_move(x) ({ __typeof__(x) __cc_tmp = (x); memset(&(x), 0, sizeof(x)); __cc_tmp; })
+static inline void cc__move_dead(void *p, size_t n) {
+    unsigned char *b = (unsigned char *)p;
+    while (n--) *b++ = 0;
+}
+#define cc_move(x) ({ \
+    __typeof__(x) __cc_tmp = (x); \
+    cc__move_dead(&(x), sizeof(x)); \
+    __cc_tmp; \
+})
 #endif
 
 #endif // CC_RUNTIME_H

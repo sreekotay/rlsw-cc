@@ -23,6 +23,8 @@
 #include "fiber_sched_boundary.h"
 #include "sched_v2.h"
 
+static CCResult_void_CCError cc__nursery_errno(int err, const char* msg);
+
 /* ============================================================================
  * Nursery spawn timing instrumentation
  * ============================================================================ */
@@ -183,35 +185,35 @@ struct CCNurseryHost {
     fiber_v2* _Atomic alive_waiter;
     wake_primitive alive_wake;
 
-    /* LIVE → JOINING (wait) or ABANDONED (abandon). After abandon the
-     * handle is consumed; last-exit frees the object. */
+    /* LIVE → JOINING (wait) or LEFT (leave). After leave the
+     * handle is consumed; EMPTY frees the object. */
     _Atomic int end_state;
     _Atomic int finishing;
-    void (*on_last_fn)(void*);
-    void* on_last_ctx;
+    void (*leftover_fn)(void*);
+    void* leftover_ctx;
 };
 
 enum {
     CC_NURSERY_LIVE = 0,
     CC_NURSERY_JOINING = 1,
-    CC_NURSERY_ABANDONED = 2
+    CC_NURSERY_LEFT = 2
 };
 
-/* Abandon-mode last-exit arbitration lives in ONE atomic word: the high bit
- * of alive_count is the abandoned flag, the low bits are the live-child
- * count. Both exit-qualifying operations (abandon's fetch_or, notify's
+/* LEFT-path EMPTY arbitration lives in ONE atomic word: the high bit
+ * of alive_count is the LEFT flag, the low bits are the live-child
+ * count. Both exit-qualifying operations (leave's fetch_or, notify's
  * fetch_sub) are RMWs on this word, so they are totally ordered and exactly
- * one of them observes "abandoned and count zero" at its own linearization
+ * one of them observes "LEFT and count zero" at its own linearization
  * point. The non-closer must not touch the nursery after its RMW — the
  * closer frees it. (The previous two-variable protocol — end_state stores
  * paired with alive_count loads under seq-cst fences — guaranteed no LOST
  * exit but let both sides qualify; the loser then consulted `finishing`
  * inside an object the winner had already freed. Freed-memory scribble could
- * fake finishing==0 and run a second teardown: the nursery_abandon_smoke
+ * fake finishing==0 and run a second teardown: the nursery_leave_smoke
  * malloc abort.) end_state remains the user-facing lifecycle state (spawn /
- * on_last / wait refusals, loud-die diagnostics); it no longer arbitrates. */
-#define CC_NURSERY_ALIVE_ABANDONED_BIT ((size_t)1 << (sizeof(size_t) * 8 - 1))
-#define CC_NURSERY_ALIVE_COUNT_MASK    (~CC_NURSERY_ALIVE_ABANDONED_BIT)
+ * leftover / wait refusals, loud-die diagnostics); it no longer arbitrates. */
+#define CC_NURSERY_ALIVE_LEFT_BIT ((size_t)1 << (sizeof(size_t) * 8 - 1))
+#define CC_NURSERY_ALIVE_COUNT_MASK    (~CC_NURSERY_ALIVE_LEFT_BIT)
 
 static void cc_nursery_die(const char* msg) {
     fprintf(stderr, "cc_nursery: %s\n", msg);
@@ -242,13 +244,9 @@ void cc__chan_set_autoclose_owner(CCChan* ch, CCNurseryHost* owner);
  * makes closing_count nonzero — installs it; the teardown loops only consult
  * it when closing_count > 0, so the pointer is always set before it is
  * needed (both writes publish under the same nursery mutex). Cost tracks
- * source behavior: no close_on in the program, no channel code in the
+ * source behavior: no n.close in the program, no channel code in the
  * binary. */
 static void (*g_cc__nursery_chan_close)(CCChan*) = NULL;
-
-int cc_nursery_add_closing_tx(CCNurseryHost* n, CCChanTx tx) {
-    return cc_nursery_add_closing_chan(n, tx.raw);
-}
 
 static CCNurseryHost* cc__nursery_alloc(void) {
     CCNurseryHost* n = (CCNurseryHost*)malloc(sizeof(CCNurseryHost));
@@ -288,7 +286,7 @@ static CCNurseryHost* cc__nursery_alloc(void) {
 static CCResult_CCNursery_CCError cc__nursery_wrap_ok(CCNurseryHost* h) {
     CCResult_CCNursery_CCError r;
     CCNursery w;
-    w.n = h;
+    w.p = h;
     r.ok = 1;
     r.u.value = w;
     return r;
@@ -309,7 +307,7 @@ CCResult_CCNursery_CCError cc_nursery_create(void) {
 }
 
 CCResult_CCNursery_CCError cc_nursery_create_child(CCNursery parent) {
-    CCNurseryHost* p = parent.n;
+    CCNurseryHost* p = parent.p;
     CCNurseryHost* n;
     if (!p)
         cc_nursery_die("cc_nursery_create_child: parent nursery is null");
@@ -317,19 +315,19 @@ CCResult_CCNursery_CCError cc_nursery_create_child(CCNursery parent) {
     if (!n)
         return cc__nursery_wrap_oom("cc_nursery_create_child: out of memory");
     /* Snapshot parent cancellation/deadline at birth. No live parent pointer. */
-    if (cc_nursery_is_cancelled(p)) {
+    if (cc_nursery_is_cancelled_host(p)) {
         atomic_store_explicit(&n->cancelled, 1, memory_order_release);
     }
     {
         struct timespec inherited_deadline;
-        if (cc_nursery_deadline(p, &inherited_deadline)) {
+        if (cc_nursery_deadline_host(p, &inherited_deadline)) {
             n->deadline = inherited_deadline;
         }
     }
     return cc__nursery_wrap_ok(n);
 }
 
-void* cc_nursery_closure_env_alloc(CCNurseryHost* n, size_t size, size_t align) {
+void* cc_nursery_closure_env_alloc_host(CCNurseryHost* n, size_t size, size_t align) {
     if (!n || size == 0) return NULL;
     /* TODO: The arena-backed path gives closures under a nursery a clean,
        deterministic lifetime model, but the spawn benchmark breakdown showed
@@ -339,7 +337,7 @@ void* cc_nursery_closure_env_alloc(CCNurseryHost* n, size_t size, size_t align) 
     return cc_arena_alloc(n->arena.a, size, align);
 }
 
-void cc_nursery_cancel(CCNurseryHost* n) {
+void cc_nursery_cancel_host(CCNurseryHost* n) {
     if (!n) return;
     pthread_mutex_lock(&n->mu);
     atomic_store_explicit(&n->cancelled, 1, memory_order_release);
@@ -380,7 +378,7 @@ typedef struct {
 static void* cc__nursery_cancel_only(void* env, intptr_t arg0) {
     (void)env;
     CCNurseryHost* n = (CCNurseryHost*)(uintptr_t)arg0;
-    if (n) cc_nursery_cancel(n);
+    if (n) cc_nursery_cancel_host(n);
     return NULL;
 }
 
@@ -437,39 +435,33 @@ static CCResult_void_CCError cc__nursery_install_signals(CCNurseryHost* n,
     return cc_ok_CCResult_void_CCError();
 }
 
-CCResult_void_CCError cc_nursery_on_signals_n(CCNurseryHost* n, const int* signos,
+CCResult_void_CCError cc_nursery_on_signals_n_host(CCNurseryHost* n, const int* signos,
                                               size_t count, CCClosure1 handler) {
     return cc__nursery_install_signals(n, signos, count, handler);
 }
 
-CCResult_void_CCError cc_nursery_on_shutdown(CCNurseryHost* n, CCClosure1 handler) {
-    static const int sigs[] = { SIGINT, SIGTERM };
-    return cc_nursery_on_signals_n(n, sigs, sizeof(sigs) / sizeof(sigs[0]),
-                                   handler);
-}
-
-CCResult_void_CCError cc_nursery_cancel_on_signals_n(CCNurseryHost* n,
+CCResult_void_CCError cc_nursery_cancel_on_signals_n_host(CCNurseryHost* n,
                                                      const int* signos,
                                                      size_t count) {
     CCClosure1 cancel_only =
         cc_closure1_make(cc__nursery_cancel_only, NULL, NULL);
-    return cc_nursery_on_signals_n(n, signos, count, cancel_only);
+    return cc_nursery_on_signals_n_host(n, signos, count, cancel_only);
 }
 
-void cc_nursery_set_deadline(CCNurseryHost* n, struct timespec abs_deadline) {
+void cc_nursery_set_deadline_host(CCNurseryHost* n, struct timespec abs_deadline) {
     if (!n) return;
     pthread_mutex_lock(&n->mu);
     n->deadline = abs_deadline;
     pthread_mutex_unlock(&n->mu);
 }
 
-const struct timespec* cc_nursery_deadline(const CCNurseryHost* n, struct timespec* out) {
+const struct timespec* cc_nursery_deadline_host(const CCNurseryHost* n, struct timespec* out) {
     if (!n || n->deadline.tv_sec == 0) return NULL;
     if (out) *out = n->deadline;
     return out;
 }
 
-CCDeadline cc_nursery_as_deadline(const CCNurseryHost* n) {
+CCDeadline cc_nursery_as_deadline_host(const CCNurseryHost* n) {
     CCDeadline d = cc_deadline_none();
     if (!n) { d.cancelled = 1; return d; }
     d.cancelled = atomic_load_explicit(&n->cancelled, memory_order_acquire);
@@ -477,8 +469,8 @@ CCDeadline cc_nursery_as_deadline(const CCNurseryHost* n) {
     return d;
 }
 
-bool cc_nursery_is_cancelled(const CCNurseryHost* n) {
-    if (!n) return true;
+bool cc_nursery_is_cancelled_host(const CCNurseryHost* n) {
+    if (!n) return false;
     if (atomic_load_explicit(&n->cancelled, memory_order_acquire)) return true;
     if (n->deadline.tv_sec == 0) return false;
     struct timespec now;
@@ -490,12 +482,12 @@ bool cc_nursery_is_cancelled(const CCNurseryHost* n) {
 
 /* Check if current fiber's nursery is cancelled (convenience for user code). */
 bool cc_cancelled(void) {
-    return cc_nursery_is_cancelled(cc__runtime_current_nursery());
+    return cc_nursery_is_cancelled_host(cc__runtime_current_nursery());
 }
 
 /* Get the cancel wake generation for the current nursery (0 if none).
  * Used by channel waits to detect cancellation. */
-uint32_t cc_nursery_cancel_gen(const CCNurseryHost* n) {
+uint32_t cc_nursery_cancel_gen_host(const CCNurseryHost* n) {
     if (!n) return 0;
     /* Cast away const: TCC treats atomic_load through a const object as
      * assignment to a read-only location. */
@@ -505,7 +497,7 @@ uint32_t cc_nursery_cancel_gen(const CCNurseryHost* n) {
 
 /* Wait on the nursery's cancel primitive with timeout (ms).
  * Returns immediately if cancel_gen changed (i.e., cancelled). */
-void cc_nursery_cancel_wait(CCNurseryHost* n, uint32_t expected_gen, uint32_t timeout_ms) {
+void cc_nursery_cancel_wait_host(CCNurseryHost* n, uint32_t expected_gen, uint32_t timeout_ms) {
     if (!n) return;
     wake_primitive_wait_timeout(&n->cancel_wake, expected_gen, timeout_ms);
 }
@@ -616,7 +608,7 @@ void cc_nursery_notify_child_done(CCNurseryHost* n);
 
 /* V2 is the default scheduler. spawn() routes through sched_v2; spawnhybrid()
  * is kept as an alias for source compatibility during the V1 retirement. */
-int cc_nursery_spawn(CCNurseryHost* n, void* (*fn)(void*), void* arg) {
+static int cc__nursery_spawn_errno(CCNurseryHost* n, void* (*fn)(void*), void* arg) {
     if (!n || !fn) return EINVAL;
 
     int timing = nursery_timing_enabled();
@@ -627,13 +619,13 @@ int cc_nursery_spawn(CCNurseryHost* n, void* (*fn)(void*), void* arg) {
     /* Worker-frees mode: publish the pending child on alive_count BEFORE
      * enqueuing so a worker that races us to MCO_DEAD always observes a
      * matching increment when it calls cc_nursery_notify_child_done.  In
-     * the classic mode this counter is never consulted. The abandoned
-     * check and the increment share mu so abandon cannot last-exit
+     * the classic mode this counter is never consulted. The LEFT
+     * check and the increment share mu so leave cannot reach EMPTY
      * between them. */
     int worker_frees = cc_nursery_worker_frees_mode();
     pthread_mutex_lock(&n->mu);
     if (atomic_load_explicit(&n->end_state, memory_order_acquire) ==
-            CC_NURSERY_ABANDONED) {
+            CC_NURSERY_LEFT) {
         pthread_mutex_unlock(&n->mu);
         return EINVAL;
     }
@@ -646,7 +638,7 @@ int cc_nursery_spawn(CCNurseryHost* n, void* (*fn)(void*), void* arg) {
     if (!t) {
         if (worker_frees) {
             /* May last-exit if this increment was the last live child
-             * after abandon. Do not touch n afterward. */
+             * after leave. Do not touch n afterward. */
             cc_nursery_notify_child_done(n);
         }
         return ENOMEM;
@@ -676,46 +668,40 @@ int cc_nursery_spawn(CCNurseryHost* n, void* (*fn)(void*), void* arg) {
     return 0;
 }
 
-int cc_nursery_spawnhybrid(CCNurseryHost* n, void* (*fn)(void*), void* arg) {
-    return cc_nursery_spawn(n, fn, arg);
+CCResult_void_CCError cc_nursery_spawn_host(CCNurseryHost* n, void* (*fn)(void*), void* arg) {
+    return cc__nursery_errno(cc__nursery_spawn_errno(n, fn, arg),
+                             "cc_nursery_spawn");
 }
 
-int cc_nursery_spawn_async_named(CCNurseryHost* n, CCTask task,
+CCResult_void_CCError cc_nursery_spawn_async_named_host(CCNurseryHost* n, CCTask task,
                                   const char* diag_user_name,
                                   const char* diag_file,
                                   int diag_line) {
     cc_nursery_async_spawn* a;
-    int err;
+    CCResult_void_CCError r;
     if (!n || task.kind == CC_TASK_KIND_INVALID) {
         cc_task_free(&task);
-        return EINVAL;
+        return cc__nursery_errno(EINVAL, "cc_nursery_spawn_async_named");
     }
     a = (cc_nursery_async_spawn*)malloc(sizeof(*a));
     if (!a) {
         cc_task_free(&task);
-        return ENOMEM;
+        return cc__nursery_errno(ENOMEM, "cc_nursery_spawn_async_named");
     }
     a->task = task;
     a->diag_user_name = diag_user_name;
     a->diag_file = diag_file;
     a->diag_line = diag_line;
-    err = cc_nursery_spawn(n, cc__nursery_async_runner, a);
-    if (err != 0) {
+    r = cc_nursery_spawn_host(n, cc__nursery_async_runner, a);
+    if (!r.ok) {
         cc_task_free(&a->task);
         free(a);
     }
-    return err;
+    return r;
 }
 
-int cc_nursery_spawn_async(CCNurseryHost* n, CCTask task) {
-    /* Anonymous-spawn entry point: kept for callers (and tests) that
-     * predate the spawn-site lowering's switch to the `_named` variant.
-     * The runner sees NULL metadata and skips the fiber-name stamp. */
-    return cc_nursery_spawn_async_named(n, task, NULL, NULL, 0);
-}
-
-int cc_nursery_spawnhybrid_async(CCNurseryHost* n, CCTask task) {
-    return cc_nursery_spawn_async(n, task);
+CCResult_void_CCError cc_nursery_spawnhybrid_async(CCNurseryHost* n, CCTask task) {
+    return cc_nursery_spawn_async_named_host(n, task, NULL, NULL, 0);
 }
 
 /* Worker-frees mode: v2 worker calls this on MCO_DEAD for every
@@ -774,15 +760,26 @@ static void cc_nursery_release(CCNurseryHost* n) {
     free(n);
 }
 
-CCArena* cc_nursery_arena(CCNurseryHost* n) {
-    return n ? &n->arena : NULL;
+CCArena cc_nursery_arena_host(CCNurseryHost* n) {
+    return n ? n->arena : cc_arena_handle(NULL);
+}
+
+static CCResult_void_CCError cc__nursery_errno(int err, const char* msg) {
+    if (err == 0) return cc_ok_CCResult_void_CCError();
+    if (err == ENOMEM)
+        return cc_err_CCResult_void_CCError(CC_ERROR(CC_ERR_OUT_OF_MEMORY, msg));
+    if (err == EINVAL)
+        return cc_err_CCResult_void_CCError(CC_ERROR(CC_ERR_INVALID_ARG, msg));
+    return cc_err_CCResult_void_CCError(CC_ERROR(CC_ERR_INTERNAL, msg));
 }
 
 static void cc__nursery_owner_destroy(void* p) {
     CCNurseryHost* n = (CCNurseryHost*)p;
+    CCResult_void_CCError w;
     if (!n || !n->arena.a) return;
-    (void)cc_nursery_wait(n);
-    cc_nursery_free(n);
+    w = cc_nursery_wait_host(n);
+    cc_nursery_free_host(n);
+    if (!w.ok) cc_error_exit(w.u.error);
 }
 
 static int cc__nursery_init_body(CCNurseryHost* n) {
@@ -832,25 +829,25 @@ CCResult_CCNursery_CCError cc_nursery_create_on(CCArena a) {
     return cc__nursery_wrap_ok(n);
 }
 
-/* Last child is already dead (fiber returned to the pool). Close
- * registered channels, run on_last, free. The single-word protocol
+/* Last child is already dead (fiber returned to the pool). Reach EMPTY:
+ * close registered channels, run leftover, free. The single-word protocol
  * guarantees a unique caller; `finishing` is a tripwire, not an arbiter —
  * a second entry means the protocol was broken upstream, and deduping it
  * quietly would hide a use-after-free (no silent degradation).
- * The on_last callback must not touch the nursery: it runs before release,
+ * The leftover callback must not touch the nursery: it runs before release,
  * and whoever it wakes races the teardown. */
-static void cc_nursery_last_exit(CCNurseryHost* n) {
+static void cc_nursery_at_empty(CCNurseryHost* n) {
     int expected = 0;
     void (*fn)(void*);
     void* ctx;
     if (!atomic_compare_exchange_strong_explicit(&n->finishing, &expected, 1,
             memory_order_acq_rel, memory_order_relaxed))
-        cc_nursery_die("last-exit entered twice (abandon protocol violation)");
+        cc_nursery_die("EMPTY entered twice (leave protocol violation)");
     cc_nursery_close_registered(n);
-    fn = n->on_last_fn;
-    ctx = n->on_last_ctx;
-    n->on_last_fn = NULL;
-    n->on_last_ctx = NULL;
+    fn = n->leftover_fn;
+    ctx = n->leftover_ctx;
+    n->leftover_fn = NULL;
+    n->leftover_ctx = NULL;
     if (fn)
         fn(ctx);
     cc_nursery_release(n);
@@ -859,15 +856,15 @@ static void cc_nursery_last_exit(CCNurseryHost* n) {
 void cc_nursery_notify_child_done(CCNurseryHost* n) {
     if (!n) return;
     size_t prev = atomic_fetch_sub_explicit(&n->alive_count, 1, memory_order_acq_rel);
-    if (prev == (CC_NURSERY_ALIVE_ABANDONED_BIT | 1)) {
-        /* Abandoned, and this decrement took the count to zero: unique
+    if (prev == (CC_NURSERY_ALIVE_LEFT_BIT | 1)) {
+        /* LEFT path, and this decrement took the count to zero: unique
          * closer (see the protocol comment on the bit). No waiter can
-         * exist — wait-after-abandon dies — so go straight to teardown. */
-        cc_nursery_last_exit(n);
+         * exist — wait-after-leave dies — so go straight to teardown. */
+        cc_nursery_at_empty(n);
         return;
     }
     if (prev == 1) {
-        /* Wait-mode boundary. The nursery is pinned here: the abandoned
+        /* Wait-mode boundary. The nursery is pinned here: the LEFT
          * bit was clear in `prev`, so teardown can only come from
          * cc_nursery_wait / cc_nursery_free on the owner's side, and the
          * owner is either parked below or hasn't reached them.
@@ -894,14 +891,14 @@ void cc_nursery_notify_child_done(CCNurseryHost* n) {
      * another child may take the count to zero and free it any time. */
 }
 
-int cc_nursery_wait(CCNurseryHost* n) {
-    if (!n) return EINVAL;
+CCResult_void_CCError cc_nursery_wait_host(CCNurseryHost* n) {
+    if (!n) return cc__nursery_errno(EINVAL, "cc_nursery_wait");
     {
         int expected = CC_NURSERY_LIVE;
         if (!atomic_compare_exchange_strong_explicit(&n->end_state, &expected,
                 CC_NURSERY_JOINING, memory_order_acq_rel, memory_order_acquire)) {
-            if (expected == CC_NURSERY_ABANDONED)
-                cc_nursery_die("wait after abandon");
+            if (expected == CC_NURSERY_LEFT)
+                cc_nursery_die("wait after leave");
         }
     }
     int first_err = 0;
@@ -928,7 +925,7 @@ int cc_nursery_wait(CCNurseryHost* n) {
              * notifier, leaving us parked with no signal coming.
              * Stress: `tests/stress/nursery_worker_frees_race_stress_smoke.ccs`. */
             atomic_thread_fence(memory_order_seq_cst);
-            /* Mask is hygiene: JOINING excludes ABANDONED, the bit cannot
+            /* Mask is hygiene: JOINING excludes LEFT, the bit cannot
              * be set here. */
             while ((atomic_load_explicit(&n->alive_count, memory_order_acquire) &
                     CC_NURSERY_ALIVE_COUNT_MASK) != 0) {
@@ -999,16 +996,16 @@ int cc_nursery_wait(CCNurseryHost* n) {
         atomic_fetch_add_explicit(&g_nursery_timing.wait_tasks_joined, joined, memory_order_relaxed);
         atomic_fetch_add_explicit(&g_nursery_timing.wait_channels_closed, closed, memory_order_relaxed);
     }
-    return first_err;
+    return cc__nursery_errno(first_err, "cc_nursery_wait");
 }
 
-void cc_nursery_free(CCNurseryHost* n) {
+void cc_nursery_free_host(CCNurseryHost* n) {
     if (!n) return;
     /* Owner walk and a local @destroy may both fire. Second call is a no-op. */
     if (n->owner_placed && !n->arena.a) return;
     if (atomic_load_explicit(&n->end_state, memory_order_acquire) ==
-            CC_NURSERY_ABANDONED)
-        cc_nursery_die("free after abandon");
+            CC_NURSERY_LEFT)
+        cc_nursery_die("free after leave");
     if (!cc_nursery_worker_frees_mode()) {
         /* Classic: tasks[] still owns fiber_v2 references until free. */
         for (size_t i = 0; i < n->count; ++i) {
@@ -1023,70 +1020,68 @@ void cc_nursery_free(CCNurseryHost* n) {
     cc_nursery_release(n);
 }
 
-int cc_nursery_on_last(CCNurseryHost* n, void* ctx, void (*finish)(void*)) {
-    if (!n || !finish) return EINVAL;
+CCResult_void_CCError cc_nursery_register_leftover_host(CCNurseryHost* n, void* ctx, void (*finish)(void*)) {
+    if (!n || !finish)
+        return cc__nursery_errno(EINVAL, "cc_nursery_register_leftover");
     pthread_mutex_lock(&n->mu);
     if (atomic_load_explicit(&n->end_state, memory_order_acquire) !=
             CC_NURSERY_LIVE) {
         pthread_mutex_unlock(&n->mu);
-        return EINVAL;
+        return cc__nursery_errno(EINVAL, "cc_nursery_register_leftover");
     }
-    if (n->on_last_fn) {
+    if (n->leftover_fn) {
         pthread_mutex_unlock(&n->mu);
-        return EINVAL;
+        return cc__nursery_errno(EINVAL, "cc_nursery_register_leftover");
     }
-    n->on_last_fn = finish;
-    n->on_last_ctx = ctx;
+    n->leftover_fn = finish;
+    n->leftover_ctx = ctx;
     pthread_mutex_unlock(&n->mu);
-    return 0;
+    return cc_ok_CCResult_void_CCError();
 }
 
-/* Hand the nursery to its children and walk away. From the caller's side
- * the handle is CONSUMED: the last child to exit (or this call, if none are
- * live) frees the object at an unpredictable time on a worker thread.
- * Calling anything on `n` after abandon is a use-after-free unless the
- * caller owns independent proof that a child is still live (e.g. it holds
- * the channel a spawned child is provably blocked on); such calls get
- * EINVAL, they are not part of the supported lifecycle. This is also why an
- * abandon-capable nursery must never have a lifetime parent: an owner's
- * destroy record would eventually fire on freed storage. */
-void cc_nursery_abandon(CCNurseryHost* n) {
+/* OPEN → LEFT. From the caller's side the handle is CONSUMED: the last child
+ * to exit (or this call, if none are live) reaches EMPTY then DEAD on a
+ * worker at an unpredictable time. Calling anything on `n` after leave is a
+ * use-after-free unless the caller owns independent proof that a child is
+ * still live. A leave-capable nursery must never have a lifetime parent. */
+void cc_nursery_leave_host(CCNurseryHost* n) {
     int expected;
     size_t prev;
     if (!n) return;
     if (n->owner_placed)
-        cc_nursery_die("abandon on an owner-attached nursery "
+        cc_nursery_die("leave on an owner-attached nursery "
                        "(cc_arena_create_nursery); use cc_nursery_create()");
     if (!cc_nursery_worker_frees_mode())
-        cc_nursery_die("abandon requires worker-frees mode");
+        cc_nursery_die("leave requires worker-frees mode");
     pthread_mutex_lock(&n->mu);
     expected = CC_NURSERY_LIVE;
     if (!atomic_compare_exchange_strong_explicit(&n->end_state, &expected,
-            CC_NURSERY_ABANDONED, memory_order_acq_rel, memory_order_acquire)) {
+            CC_NURSERY_LEFT, memory_order_acq_rel, memory_order_acquire)) {
         pthread_mutex_unlock(&n->mu);
         if (expected == CC_NURSERY_JOINING)
-            cc_nursery_die("abandon while wait in progress");
-        cc_nursery_die("double abandon");
+            cc_nursery_die("leave while wait in progress");
+        cc_nursery_die("double leave");
     }
     /* Single-word arbitration (see the protocol comment on the bit).
-     * Under mu so no spawn increment can interleave: spawn's not-abandoned
+     * Under mu so no spawn increment can interleave: spawn's not-LEFT
      * check and its increment share this mutex, so a zero count observed by
      * this RMW is final — no child exists and none can appear. */
     prev = atomic_fetch_or_explicit(&n->alive_count,
-                                    CC_NURSERY_ALIVE_ABANDONED_BIT,
+                                    CC_NURSERY_ALIVE_LEFT_BIT,
                                     memory_order_acq_rel);
     pthread_mutex_unlock(&n->mu);
     if ((prev & CC_NURSERY_ALIVE_COUNT_MASK) == 0)
-        cc_nursery_last_exit(n);
+        cc_nursery_at_empty(n);
 }
 
-int cc_nursery_add_closing_chan(CCNurseryHost* n, CCChan* ch) {
-    if (!n || !ch) return EINVAL;
+CCResult_void_CCError cc_nursery_add_closing_chan_host(CCNurseryHost* n, CCChan* ch) {
+    if (!n || !ch)
+        return cc__nursery_errno(EINVAL, "cc_nursery_add_closing_chan");
     pthread_mutex_lock(&n->mu);
     if (atomic_load_explicit(&n->end_state, memory_order_acquire) ==
-            CC_NURSERY_ABANDONED) {
+            CC_NURSERY_LEFT) {
         pthread_mutex_unlock(&n->mu);
-        return EINVAL;
+        return cc__nursery_errno(EINVAL, "cc_nursery_add_closing_chan");
     }
     if (n->closing_count == n->closing_cap) {
         /* Arena-backed like tasks[]: alloc-and-copy, old array is arena
@@ -1094,7 +1089,10 @@ int cc_nursery_add_closing_chan(CCNurseryHost* n, CCChan* ch) {
         size_t new_cap = n->closing_cap ? n->closing_cap * 2 : 4;
         CCChan** nc = (CCChan**)cc_arena_alloc(
             n->arena.a, new_cap * sizeof(CCChan*), _Alignof(CCChan*));
-        if (!nc) { pthread_mutex_unlock(&n->mu); return ENOMEM; }
+        if (!nc) {
+            pthread_mutex_unlock(&n->mu);
+            return cc__nursery_errno(ENOMEM, "cc_nursery_add_closing_chan");
+        }
         if (n->closing_count)
             memcpy(nc, n->closing, n->closing_count * sizeof(CCChan*));
         n->closing = nc;
@@ -1106,5 +1104,5 @@ int cc_nursery_add_closing_chan(CCNurseryHost* n, CCChan* ch) {
     pthread_mutex_unlock(&n->mu);
     /* Mark channel with its autoclose owner for optional runtime guard. */
     cc__chan_set_autoclose_owner(ch, n);
-    return 0;
+    return cc_ok_CCResult_void_CCError();
 }

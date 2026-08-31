@@ -1,0 +1,235 @@
+/*
+ * Named pointer. Copy shares the host. Dead is p == NULL (never-born or
+ * consumed). Use fails; root birth is a handle, not Result.
+ *
+ * Bare CCBox is the erased core ({ void *p }). CCBox::[H] is the typed
+ * instance. CCExclusive / CCNursery are the factory aliases.
+ * CCArena is that ABI (`.p`); it still aliases `.base`.
+ *
+ * Dest-init `CCBox::[H] b = &x` consults `.cast` (`cc_box_cast_lower_c`) and
+ * rewrites to from_host. A teaching alias (`CC_DECL_BOX_ALIAS` /
+ * `typedef CCBox::[H] Name`) does not mint. `as: p` hops UFCS to Host*.
+ */
+#ifndef CC_BOX_H
+#define CC_BOX_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include <ccc/cc_arena.h>
+
+typedef struct CCBox {
+    void *p;
+} CCBox;
+
+static inline CCBox cc_box_empty(void) {
+    CCBox b;
+    b.p = NULL;
+    return b;
+}
+
+static inline CCBox cc_box_from_host(void *h) {
+    CCBox b;
+    b.p = h;
+    return b;
+}
+
+static inline int cc_box_is_live(CCBox b) {
+    return b.p != NULL;
+}
+
+static inline void *cc_box_host(CCBox b) {
+    return b.p;
+}
+
+#define CC_DECL_BOX_SPEC(NAME, H)                                              \
+    typedef struct NAME {                                                      \
+        H *p;                                                                  \
+    } NAME;                                                                    \
+    static inline NAME NAME##_empty(void) {                                    \
+        NAME b;                                                                \
+        b.p = NULL;                                                            \
+        return b;                                                              \
+    }                                                                          \
+    static inline NAME NAME##_from_host(H *h) {                                \
+        NAME b;                                                                \
+        b.p = h;                                                               \
+        return b;                                                              \
+    }                                                                          \
+    static inline int NAME##_is_live(NAME *b) {                                \
+        return b && b->p != NULL;                                              \
+    }                                                                          \
+    static inline H *NAME##_host(NAME *b) {                                    \
+        return b ? b->p : NULL;                                                \
+    }
+
+/* Teaching name of a named pointer. Host `.h` cannot spell `typedef CCBox::[H]`.
+ * CCS: `CCBox::[Host]` and Alias are the same type. */
+#define CC_DECL_BOX_ALIAS(Alias, Host)                                         \
+    CC_DECL_BOX_SPEC(CCBox_##Host, Host)                                       \
+    typedef CCBox_##Host Alias
+
+/* Harvested from this `.cch` (blanked from the lowered `.h`). */
+                              
+                  
+                           
+                                               
+                                  
+      
+                          
+                          
+                           
+                 
+             
+                                                 
+                 
+               
+             
+ 
+                                                             
+                 
+            
+             
+ 
+                                                     
+                             
+ 
+                                                         
+                           
+ 
+      
+          
+ 
+
+static inline int cc__box_bytes_eq(const char *a, const char *b, size_t n) {
+    if (!n) return 1;
+    if (!a || !b) return 0;
+    while (n--) {
+        if (*a++ != *b++) return 0;
+    }
+    return 1;
+}
+
+static inline size_t cc__box_cstr_len(const char *s) {
+    size_t n = 0;
+    if (s) while (s[n]) n++;
+    return n;
+}
+
+static inline void cc__box_cast_trim(const char **p, size_t *n) {
+    while (*n && (**p == ' ' || **p == '\t')) {
+        (*p)++;
+        (*n)--;
+    }
+    while (*n && ((*p)[*n - 1] == ' ' || (*p)[*n - 1] == '\t'))
+        (*n)--;
+}
+
+static inline int cc__box_cast_is_box(CCSlice ty, const char **host, size_t *host_n,
+                                     int *erased) {
+    const char *p = (const char *)ty.ptr;
+    size_t n = ty.len;
+    if (host) *host = NULL;
+    if (host_n) *host_n = 0;
+    if (erased) *erased = 0;
+    if (!p) return 0;
+    cc__box_cast_trim(&p, &n);
+    if (n == 5 && cc__box_bytes_eq(p, "CCBox", 5)) {
+        if (erased) *erased = 1;
+        return 1;
+    }
+    if (n > 6 && cc__box_bytes_eq(p, "CCBox_", 6)) {
+        if (host) *host = p + 6;
+        if (host_n) *host_n = n - 6;
+        return 1;
+    }
+    return 0;
+}
+
+static inline int cc__box_cast_is_ptr(CCSlice ty, const char **base, size_t *base_n) {
+    const char *p = (const char *)ty.ptr;
+    size_t n = ty.len;
+    if (base) *base = NULL;
+    if (base_n) *base_n = 0;
+    if (!p) return 0;
+    cc__box_cast_trim(&p, &n);
+    if (!n || p[n - 1] != '*') return 0;
+    n--;
+    cc__box_cast_trim(&p, &n);
+    if (!n) return 0;
+    if (base) *base = p;
+    if (base_n) *base_n = n;
+    return 1;
+}
+
+static inline CCSlice cc__box_cast_pass(void) {
+    static const char pass_tag[] = "__cc_ufcs_pass__";
+    return cc_slice_from_static((void *)pass_tag, sizeof(pass_tag) - 1);
+}
+
+static inline CCSlice cc__box_cast_concat(const char *p, size_t n, const char *suf,
+                                         CCArena arena) {
+    CCSlice left;
+    CCSlice right;
+    left.ptr = (char *)(void *)p;
+    left.len = n;
+    left.id = 0;
+    right = cc_slice_from_static((void *)suf, cc__box_cstr_len(suf));
+    return cc_slice_concat2(left, right, arena);
+}
+
+/* `.cast` on CCBox / CCBox_*: dest may insert H* → box; dest must not peel. */
+static inline CCSlice cc_box_cast_lower_c(CCSlice src, CCSlice dest, CCSlice kind,
+                                         CCArena arena) {
+    const char *dhost = NULL;
+    size_t dhost_n = 0;
+    int derased = 0;
+    const char *sbase = NULL;
+    size_t sbase_n = 0;
+    const char *dp = (const char *)dest.ptr;
+    size_t dn = dest.len;
+    int implicit;
+    implicit = (kind.ptr && kind.len == 8 &&
+                cc__box_bytes_eq((const char *)kind.ptr, "implicit", 8));
+    if (!cc__box_cast_is_box(dest, &dhost, &dhost_n, &derased))
+        return cc__box_cast_pass();
+    cc__box_cast_trim(&dp, &dn);
+    if (cc__box_cast_is_ptr(src, &sbase, &sbase_n)) {
+        if (derased)
+            return cc_slice_from_static((void *)"cc_box_from_host", 16);
+        if (dhost && sbase && dhost_n == sbase_n &&
+            cc__box_bytes_eq(dhost, sbase, dhost_n))
+            return cc__box_cast_concat(dp, dn, "_from_host", arena);
+    }
+    {
+        const char *shost = NULL;
+        size_t shost_n = 0;
+        int serased = 0;
+        const char *dbase = NULL;
+        size_t dbase_n = 0;
+        const char *sp = (const char *)src.ptr;
+        size_t sn = src.len;
+        if (cc__box_cast_is_box(src, &shost, &shost_n, &serased) &&
+            cc__box_cast_is_ptr(dest, &dbase, &dbase_n)) {
+            if (implicit) return cc__box_cast_pass();
+            cc__box_cast_trim(&sp, &sn);
+            if (serased)
+                return cc_slice_from_static((void *)"cc_box_host", 11);
+            if (shost && dbase && shost_n == dbase_n &&
+                cc__box_bytes_eq(shost, dbase, shost_n))
+                return cc__box_cast_concat(sp, sn, "_host", arena);
+        }
+    }
+    return cc__box_cast_pass();
+}
+
+#include <ccc/cc_type.h>
+
+
+
+/* Ordinary sites: methods, not `.p`. `^p` is implicit `*` minus the host
+ * field — user UFCS on CCBox::[H] stays open. Factory aliases (CCArena, …)
+ * are other subjects — they do not match CCBox_*. */
+
+
+#endif

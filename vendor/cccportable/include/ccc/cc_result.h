@@ -87,31 +87,52 @@ static inline const char* cc_error_str(CCError e) {
     return cc_error_kind_str(e.kind);
 }
 
-#include <stdio.h>
-#include <stdlib.h>
+#if defined(CC_COMPTIME) || defined(__TINYC__) || defined(CC_RESULT_IMPL)
+#include <ccc/cc_mem.h>
+#if defined(CC_RESULT_IMPL)
+#define CC__RESULT_SYS
+#else
+#define CC__RESULT_SYS static inline
+#endif
+#endif
+
+#ifdef CC__RESULT_SYS
+CC__RESULT_SYS void cc_result_panic(const char *msg, const char *file, int line) {
+    if (cc_eprintf("CC: %s at %s:%d\n", msg ? msg : "result",
+                   file ? file : "?", line) < 0)
+        cc_abort();
+    cc_abort();
+}
 
 /* Report a CCError to stderr. Building block for soft handlers:
  *   @errhandler(CCError e) { cc_error_log(e); return 1; }
  * Does not diverge — pair with return/cancel at the binding site. */
-static inline void cc_error_log(CCError e) {
-    if (fprintf(stderr, "fatal: %s\n", cc_error_str(e)) < 0) abort();
+CC__RESULT_SYS void cc_error_log(CCError e) {
+    if (cc_eprintf( "fatal: %s\n", cc_error_str(e)) < 0) cc_abort();
 }
 
 /* Log then return 1 — soft terminate for int-returning frames:
  *   @errhandler(CCError e) { return cc_err_log(e); }
  */
-static inline int cc_err_log(CCError e) {
+CC__RESULT_SYS int cc_err_log(CCError e) {
     cc_error_log(e);
     return 1;
 }
 
 /* Log then exit(1). The standard named `@errhandler` terminate policy:
  *   @errhandler(CCError e) cc_error_exit(e);
- * Recognized as diverging for expression-position `!>;`. */
-static inline void cc_error_exit(CCError e) {
+ * Recognized as diverging for expression-position `!>;`. `_Noreturn`
+ * closes the hoisted-handler trailer for the host C compiler. */
+CC__RESULT_SYS CC_NORETURN void cc_error_exit(CCError e) {
     cc_error_log(e);
-    exit(1);
+    cc_exit(1);
 }
+#else
+void cc_result_panic(const char *msg, const char *file, int line);
+void cc_error_log(CCError e);
+int cc_err_log(CCError e);
+CC_NORETURN void cc_error_exit(CCError e);
+#endif
 
 /*
  * Result type layout:
@@ -148,13 +169,11 @@ static inline void cc_error_exit(CCError e) {
     /* UFCS method: r.value() -> name##_value(r) */                                 \
     static inline OkType name##_value(name r) {                                     \
         if (!r.ok) {                                                                \
-            fprintf(stderr, "CC: value failed on %s at %s:%d\n",                    \
-                    #name, __FILE__, __LINE__);                                     \
-            abort();                                                                \
+            cc_result_panic("value failed on " #name, __FILE__, __LINE__);                                     \
         }                                                                           \
         return r.u.value;                                                           \
     }                                                                               \
-    /* Internal compatibility helper for legacy lowered code. */                    \
+    /* Alias: name##_unwrap — same as name##_value. */                    \
     static inline OkType name##_unwrap(name r) {                                    \
         return name##_value(r);                                                     \
     }                                                                               \
@@ -169,13 +188,11 @@ static inline void cc_error_exit(CCError e) {
     /* UFCS method: r.error() -> name##_error(r) */                                 \
     static inline ErrType name##_error(name r) {                                    \
         if (r.ok) {                                                                 \
-            fprintf(stderr, "CC: error failed on %s at %s:%d\n",                    \
-                    #name, __FILE__, __LINE__);                                     \
-            abort();                                                                \
+            cc_result_panic("error failed on " #name, __FILE__, __LINE__);                                     \
         }                                                                           \
         return r.u.error;                                                           \
     }                                                                               \
-    /* Internal compatibility helper for legacy lowered code. */                    \
+    /* Alias: name##_unwrap_err — same as name##_error. */                    \
     static inline ErrType name##_unwrap_err(name r) {                               \
         return name##_error(r);                                                     \
     }
@@ -243,9 +260,7 @@ CC_DECL_RESULT_SPEC(CCResult_charptr_CCError, char*, CCError)
     /* UFCS method: r.value() -> name##_value(r); yields nothing, aborts on err. */ \
     static inline void name##_value(name r) {                                       \
         if (!r.ok) {                                                                \
-            fprintf(stderr, "CC: value failed on %s at %s:%d\n",                    \
-                    #name, __FILE__, __LINE__);                                     \
-            abort();                                                                \
+            cc_result_panic("value failed on " #name, __FILE__, __LINE__);                                     \
         }                                                                           \
     }                                                                               \
     static inline void name##_unwrap(name r) { name##_value(r); }                   \
@@ -253,9 +268,7 @@ CC_DECL_RESULT_SPEC(CCResult_charptr_CCError, char*, CCError)
     static inline bool name##_is_err(name r) { return !r.ok; }                      \
     static inline ErrType name##_error(name r) {                                    \
         if (r.ok) {                                                                 \
-            fprintf(stderr, "CC: error failed on %s at %s:%d\n",                    \
-                    #name, __FILE__, __LINE__);                                     \
-            abort();                                                                \
+            cc_result_panic("error failed on " #name, __FILE__, __LINE__);                                     \
         }                                                                           \
         return r.u.error;                                                           \
     }                                                                               \
@@ -306,51 +319,17 @@ typedef struct __CCResultGeneric {
 } __CCResultGeneric;
 #endif
 
-/* In parser mode, result type declarations emit real distinct typed structs.
+/* Parser mode emits the same typed CC_DECL_RESULT_SPEC structs as real
+ * compilation (OkType / ErrType in u.value / u.error). preprocess.c splices
+ * each spec at insert_pos once both payload and error types are in scope.
  *
- * Historically this redefined `CC_DECL_RESULT_SPEC` to alias every Result
- * type to `__CCResultGeneric` (whose `u.value` is `intptr_t`).  That gave
- * TCC a single universal shape so `T!>(E)` types declared before `T` /
- * `E` were in scope still parsed, but the collapse cost us:
+ * __CCResultGeneric remains a fallback placeholder when a forward reference
+ * leaves a type undeclared during the pre-parse reparse phase.
  *
- *   - `r.u.value` is `long`, so a struct payload `T` gets reinterpreted
- *     as an integer by `__cc_uw_value(r)` — the `?>(e) handle(e)` ternary
- *     in code like `RedisReply reply = execute(req) ?>(e) err_reply(e);`
- *     tripped "type mismatch in conditional expression (have 'long' and
- *     'struct RedisReply')".
- *   - Every pass that touches `.u.error` has to pointer-cast through
- *     `void*` to recover `E` (see `pass_result_unwrap.c`,
- *     `pass_err_syntax.c`).
- *   - The enumerated `_Generic` arms `visit_codegen.c` emits per TU had
- *     to sit inside `#ifndef CC_PARSER_MODE` and were therefore dead in
- *     the lowered output (which always `#define`s `CC_PARSER_MODE`).
- *
- * The typed emission below mirrors the non-parser path exactly — same
- * struct layout, same inline helpers — so `_Generic` dispatch, UFCS
- * method calls, and direct field access all see `OkType` / `ErrType`
- * rather than `intptr_t` / `__CCGenericError`.  The preprocessor
- * (see `preprocess.c`) arranges for `CC_DECL_RESULT_SPEC(T, E)` to be
- * invoked at a program point where `OkType` and `ErrType` are already
- * in scope, using the `insert_pos` post-typedef anchor.
- *
- * `__CCResultGeneric` is kept around as a last-resort placeholder for
- * the internal pre-parse reparse phase when a forward reference leaves
- * a payload or error type genuinely undeclared — but it is no longer
- * the default shape.
- *
- * Irreducible core (2026-05-29): the old generic ctors
- * (`__cc_result_generic_ok/err`) and the nine generic UFCS accessor
- * methods (`__CCResultGeneric_value/unwrap/is_ok/is_err/...`) were
- * verified dead and removed (465/465 both modes).  What remains is
- * load-bearing and pinned to two things that cannot go until C3:
- *   1. the `__CCGenericError` / `__CCResultGeneric` tags — TCC-ext's
- *      UFCS stub emits `__CCResultGeneric` as a return type during the
- *      stub-AST parse (see preprocess.c's `__CC_RESULT_GENERIC_FWD_DECLARED`
- *      output), so the tag must be a complete type here; and
- *   2. the `cc_ok` / `cc_err` stubs below, which keep an un-rewritten
- *      `cc_ok(...)` / `cc_err(...)` parseable so the intended diagnostic
- *      surfaces rather than "undeclared function".
- */
+ * The cc_ok / cc_err stubs below parse calls outside a result-returning
+ * function so the compiler can emit a type-mismatch diagnostic instead of
+ * "undeclared function". __CCResultGeneric is also the UFCS stub return type
+ * during stub-AST parse. */
 
 /*
  * Simplified result constructors for parser mode.
@@ -360,14 +339,8 @@ typedef struct __CCResultGeneric {
  */
 #ifndef __CC_RESULT_CTORS_DEFINED
 #define __CC_RESULT_CTORS_DEFINED
-/* These generic stubs are the *declaration* that lets a `cc_ok(...)` /
- * `cc_err(...)` call parse even when it is NOT inside a result-returning
- * function (where preprocess.c rewrites it to a typed `cc_ok_CCResult_T_E`).
- * Without them, e.g. `cc_err(e)` in a plain `int` function would be an
- * "undeclared function" error; with them it parses and then surfaces the
- * intended "cannot convert" type-mismatch diagnostic (see
- * tests/try_outside_result_fn_fail).  They are the last text-matching
- * fallback; removing them is coupled to retiring `__CCResultGeneric`. */
+/* Parse-time stubs for cc_ok/cc_err outside a result-returning function.
+ * preprocess.c rewrites them to typed cc_ok_CCResult_T_E inside one. */
 static inline __CCResultGeneric cc_ok(long __v) {
     __CCResultGeneric __r; __r.ok = 1; __r.u.value = __v; return __r;
 }
@@ -428,7 +401,7 @@ int  cc_rt_diag_unwrap_site(int i, const char** out_file, const char** out_line_
  * of its own (a Python exception, an errno).  "" before any unwrap:
  *
  *     @errhandler(CCError e) {
- *         fprintf(stderr, "fatal: %s (at %s)\n", e.message, cc_error_site());
+ *         cc_eprintf( "fatal: %s (at %s)\n", e.message, cc_error_site());
  *         return 1;
  *     }
  */
@@ -444,20 +417,14 @@ const char* cc_error_site(void);
  *   - Result-struct shape:  `(x).u.value` / `(x).u.error` / `!(x).ok`
  *   - Raw-pointer shape:    `(x)` / synthesized CC_ERR_NULL / `(x) == NULL`
  *
- * So the lowering pass no longer has to scan the source text of the LHS
- * to guess whether it's pointer-typed — the generated C code asks the
- * compiler, which always knows for sure.
+ * The lowering pass emits these macros instead of guessing pointer vs result
+ * shape from source text — the compiler dispatches via _Generic.
  *
- * Baseline definitions here are the raw-pointer fallback.  When a TU
- * uses any `T!>(E)` result type, `visit_codegen.c` `#undef`s these and
- * re-emits enumerated `_Generic` macros with one arm per concrete
- * `CCResult_T_E` struct in that TU, plus the pointer default arm.
- *
- * Same shape in both parser mode and real compilation: result structs
- * are now real distinct typed structs in both modes (see the parser-mode
- * rework of `CC_DECL_RESULT_SPEC` above), so the enumerated arms
- * `visit_codegen.c` emits work unchanged in either mode.  The previous
- * parser-mode-only `__CCResultGeneric` arm has been retired.
+ * Baseline definitions here are the raw-pointer fallback. When a TU uses any
+ * T!>(E) result type, visit_codegen.c #undef's these and re-emits enumerated
+ * _Generic macros with one arm per concrete CCResult_T_E struct in that TU,
+ * plus the pointer default arm. Parser mode and real compilation share the
+ * same typed struct layout, so the per-TU arms work in both modes.
  * ============================================================================ */
 #define __cc_uw_is_err(__x__) _Generic((__x__), \
     default: (*(void* const*)(void*)&(__x__) == (void*)0))
@@ -520,32 +487,28 @@ const char* cc_error_site(void);
 #define cc_unwrap(res) ({ \
     __typeof__(res) __r = (res); \
     if (!__r.ok) { \
-        fprintf(stderr, "cc_unwrap called on error result\n"); \
-        abort(); \
+        cc_result_panic("cc_unwrap called on error result", __FILE__, __LINE__); \
     } \
     __r.u.value; \
 })
 #define cc_unwrap_as(res, T) ({ \
     __typeof__(res) __r = (res); \
     if (!__r.ok) { \
-        fprintf(stderr, "cc_unwrap_as called on error result\n"); \
-        abort(); \
+        cc_result_panic("cc_unwrap_as called on error result", __FILE__, __LINE__); \
     } \
     *(T*)(void*)&__r.u.value; \
 })
 #define cc_unwrap_err(res) ({ \
     __typeof__(res) __r = (res); \
     if (__r.ok) { \
-        fprintf(stderr, "cc_unwrap_err called on ok result\n"); \
-        abort(); \
+        cc_result_panic("cc_unwrap_err called on ok result", __FILE__, __LINE__); \
     } \
     __r.u.error; \
 })
 #define cc_unwrap_err_as(res, T) ({ \
     __typeof__(res) __r = (res); \
     if (__r.ok) { \
-        fprintf(stderr, "cc_unwrap_err_as called on ok result\n"); \
-        abort(); \
+        cc_result_panic("cc_unwrap_err_as called on ok result", __FILE__, __LINE__); \
     } \
     *(T*)(void*)&__r.u.error; \
 })
@@ -562,10 +525,6 @@ const char* cc_error_site(void);
  *   CCRes_err(T, E, e)   -> cc_err_CCResult_T_E(e)
  *   CCResPtr_ok(T, E, v) -> cc_ok_CCResult_Tptr_E(v)
  *   CCResPtr_err(T, E, e)-> cc_err_CCResult_Tptr_E(e)
- *
- * (retired) The companion Optional macros (CCOpt(T), CCOpt_some, CCOpt_none,
- * CCOptRes, CCResOpt) used to live in cc_optional.cch and are now gone; see
- * cc/include/ccc/DEPRECATIONS.md for the migration matrix.
  * ============================================================================ */
 #define CCRes(T, E) CCResult_##T##_##E
 #define CCResPtr(T, E) CCResult_##T##ptr_##E

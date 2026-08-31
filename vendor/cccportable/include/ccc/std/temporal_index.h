@@ -1,0 +1,377 @@
+/*
+ * CCTemporalIndex — intrusive death wheel.
+ *
+ * The caller owns the value and embeds a CCTemporalNode on it. This is only
+ * bucket heads + rotate/reclaim. No key map, no second allocation. Expire
+ * is a list unlink of the caller's node — same layout as a value-in-the-wheel
+ * store. Relink on TTL change (no new node).
+ *
+ *   e.ttl.user = e;   // or any cookie
+ *   sh->set(now, &e.ttl, dies_at);   // 0 / past → drop
+ *   sh->drop(&e.ttl);
+ *   e.ttl.dies_at                    // 0 if not on the wheel
+ *
+ * gone(env, node) runs before unlink. node is valid only during the callback.
+ * Hold-capped sweep: retire once, scan in chunks, refresh.
+ *
+ * on_empty(env, level, slot) runs when a due bucket rotates empty. The index
+ * does not own value storage; a caller with per-slot gen arenas resets there.
+ * A value must live in the arena of its current slot — relink across slots
+ * without realloc leaves a live node in a generation that is about to reset.
+ *
+ * Do not put no-TTL keys on the wheel.
+ */
+#ifndef CC_STD_TEMPORAL_INDEX_H
+#define CC_STD_TEMPORAL_INDEX_H
+
+#include <stddef.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <ccc/cc_arena.h>
+#include <ccc/cc_result.h>
+
+#ifndef CC_TEMPORAL_MAX_SHARDS
+#define CC_TEMPORAL_MAX_SHARDS 64
+#endif
+
+#define CC_TEMPORAL_LEVELS 3
+#define CC_TEMPORAL_MAX_SLOTS 64
+
+static const int64_t cc_temporal_unit_ms[CC_TEMPORAL_LEVELS] = { 100, 1000, 60000 };
+static const int cc_temporal_slots[CC_TEMPORAL_LEVELS] = { 64, 64, 60 };
+
+typedef struct CCTemporalNode CCTemporalNode;
+typedef void (*CCTemporalGone)(void* env, CCTemporalNode* node);
+typedef void (*CCTemporalReclaim)(void* env, int level, int slot);
+
+struct CCTemporalNode {
+    void* user;
+    int64_t dies_at;
+    int8_t level;
+    uint8_t slot;
+    uint8_t dead;
+    CCTemporalNode* live_next;
+    CCTemporalNode* live_prev;
+};
+
+typedef struct CCTemporalBucket {
+    CCTemporalNode* live_head;
+    CCTemporalNode* live_tail;
+    size_t live_n;
+    CCTemporalNode* scan_e;
+    int scanning;
+    int64_t end;
+} CCTemporalBucket;
+
+typedef struct CCTemporalShard {
+    CCTemporalBucket wheel[CC_TEMPORAL_LEVELS][CC_TEMPORAL_MAX_SLOTS];
+    int64_t next_end;
+    int ends_dirty;
+    size_t live_n;
+    CCTemporalReclaim on_empty;
+    void* on_empty_env;
+} CCTemporalShard;
+
+typedef struct CCTemporalIndex {
+    CCArena root;
+    CCTemporalShard* shards;
+    size_t nshards;
+} CCTemporalIndex;
+
+static inline void cc_temporal_link(CCTemporalBucket* b, CCTemporalNode* e) {
+    e->live_next = NULL;
+    e->live_prev = b->live_tail;
+    if (b->live_tail) b->live_tail->live_next = e;
+    else b->live_head = e;
+    b->live_tail = e;
+    b->live_n++;
+}
+
+static inline void cc_temporal_unlink(CCTemporalBucket* b, CCTemporalNode* e) {
+    if (e->live_prev) e->live_prev->live_next = e->live_next;
+    else if (b->live_head == e) b->live_head = e->live_next;
+    if (e->live_next) e->live_next->live_prev = e->live_prev;
+    else if (b->live_tail == e) b->live_tail = e->live_prev;
+    e->live_next = NULL;
+    e->live_prev = NULL;
+    if (b->live_n) b->live_n--;
+}
+
+static inline CCTemporalBucket* cc_temporal_bucket_of(CCTemporalShard* s,
+                                                     const CCTemporalNode* e) {
+    if (!s || !e || e->dead || e->level < 0 || e->level >= CC_TEMPORAL_LEVELS)
+        return NULL;
+    if (e->slot >= (uint8_t)cc_temporal_slots[e->level]) return NULL;
+    return &s->wheel[e->level][e->slot];
+}
+
+static inline void cc_temporal_refresh_next(CCTemporalShard* s) {
+    int64_t m = INT64_MAX;
+    int l, i;
+    for (l = 0; l < CC_TEMPORAL_LEVELS; l++)
+        for (i = 0; i < cc_temporal_slots[l]; i++)
+            if (s->wheel[l][i].end < m) m = s->wheel[l][i].end;
+    s->next_end = m;
+    s->ends_dirty = 0;
+}
+
+static inline void cc_temporal_rotate(CCTemporalShard* s, int l, int i) {
+    CCTemporalBucket* b = &s->wheel[l][i];
+    int64_t old = b->end;
+    b->end += cc_temporal_unit_ms[l] * (int64_t)cc_temporal_slots[l];
+    b->scan_e = NULL;
+    b->scanning = 0;
+    if (old == s->next_end) s->ends_dirty = 1;
+    if (s->on_empty) s->on_empty(s->on_empty_env, l, i);
+}
+
+static inline void cc_temporal_mark_dead(CCTemporalShard* s, CCTemporalNode* e) {
+    CCTemporalBucket* b;
+    if (!s || !e || e->dead) return;
+    e->dead = 1;
+    if (e->level >= 0 && e->level < CC_TEMPORAL_LEVELS &&
+        e->slot < (uint8_t)cc_temporal_slots[e->level]) {
+        b = &s->wheel[e->level][e->slot];
+        if (b->scan_e == e) b->scan_e = e->live_next;
+        cc_temporal_unlink(b, e);
+        if (s->live_n) s->live_n--;
+    }
+    e->dies_at = 0;
+    e->level = -1;
+}
+
+static inline bool cc_temporal_slot_for(CCTemporalShard* s, int64_t now, int64_t dies_at,
+                                       int8_t* level, uint8_t* slot) {
+    int l;
+    if (!s || dies_at <= now) return false;
+    for (l = 0; l < CC_TEMPORAL_LEVELS; l++) {
+        int64_t unit = cc_temporal_unit_ms[l];
+        int64_t span = unit * (int64_t)cc_temporal_slots[l];
+        int idx;
+        CCTemporalBucket* b;
+        if (dies_at - now > span) continue;
+        idx = (int)((dies_at / unit) % (int64_t)cc_temporal_slots[l]);
+        b = &s->wheel[l][idx];
+        if (dies_at >= b->end - unit && dies_at < b->end) {
+            *level = (int8_t)l;
+            *slot = (uint8_t)idx;
+            return true;
+        }
+    }
+    l = CC_TEMPORAL_LEVELS - 1;
+    *level = (int8_t)l;
+    *slot = (uint8_t)((dies_at / cc_temporal_unit_ms[l]) %
+                      (int64_t)cc_temporal_slots[l]);
+    return true;
+}
+
+static inline void cc_temporal_shard_drop(CCTemporalShard* s, CCTemporalNode* node) {
+    cc_temporal_mark_dead(s, node);
+}
+
+static inline bool cc_temporal_shard_set(CCTemporalShard* s, int64_t now,
+                                        CCTemporalNode* node, int64_t dies_at) {
+    CCTemporalBucket* b;
+    int8_t level;
+    uint8_t slot;
+    if (!s || !node) return false;
+    if (dies_at <= now) {
+        cc_temporal_shard_drop(s, node);
+        return true;
+    }
+    if (!cc_temporal_slot_for(s, now, dies_at, &level, &slot)) return false;
+    b = &s->wheel[level][slot];
+    if (!node->dead && node->level == level && node->slot == slot) {
+        node->dies_at = dies_at;
+        return true;
+    }
+    if (!node->dead) cc_temporal_mark_dead(s, node);
+    node->dead = 0;
+    node->dies_at = dies_at;
+    node->level = level;
+    node->slot = slot;
+    node->live_next = NULL;
+    node->live_prev = NULL;
+    cc_temporal_link(b, node);
+    s->live_n++;
+    return true;
+}
+
+static inline size_t cc_temporal_shard_len(const CCTemporalShard* s) {
+    return s ? s->live_n : 0;
+}
+
+static inline int64_t cc_temporal_shard_next_due(const CCTemporalShard* s) {
+    return s ? s->next_end : INT64_MAX;
+}
+
+static inline void cc_temporal_retire(CCTemporalShard* s, int64_t now) {
+    int l, i;
+    for (l = 0; l < CC_TEMPORAL_LEVELS; l++)
+        for (i = 0; i < cc_temporal_slots[l]; i++) {
+            CCTemporalBucket* b = &s->wheel[l][i];
+            if (b->end > now || b->scanning) continue;
+            if (b->live_n == 0) {
+                cc_temporal_rotate(s, l, i);
+                continue;
+            }
+            b->scanning = 1;
+            b->scan_e = b->live_head;
+        }
+}
+
+static inline size_t cc_temporal_scan(CCTemporalShard* s, int64_t now, size_t budget,
+                                     CCTemporalGone gone, void* env) {
+    size_t n = 0;
+    int l, i;
+    for (l = 0; l < CC_TEMPORAL_LEVELS && n < budget; l++)
+        for (i = 0; i < cc_temporal_slots[l] && n < budget; i++) {
+            CCTemporalBucket* b = &s->wheel[l][i];
+            CCTemporalNode* e;
+            if (!b->scanning) continue;
+            e = b->scan_e ? b->scan_e : b->live_head;
+            while (e && n < budget) {
+                CCTemporalNode* nxt = e->live_next;
+                n++;
+                b->scan_e = nxt;
+                if (e->dies_at <= now || b->end <= now) {
+                    if (gone) gone(env, e);
+                    cc_temporal_mark_dead(s, e);
+                }
+                e = nxt;
+            }
+            if (!e) {
+                b->scan_e = NULL;
+                b->scanning = 0;
+                if (b->live_n == 0) cc_temporal_rotate(s, l, i);
+            }
+        }
+    return n;
+}
+
+static inline void cc_temporal_shard_retire(CCTemporalShard* s, int64_t now) {
+    if (!s) return;
+    if (now >= s->next_end) cc_temporal_retire(s, now);
+}
+
+static inline size_t cc_temporal_shard_scan(CCTemporalShard* s, int64_t now,
+                                           size_t budget, CCTemporalGone gone,
+                                           void* env) {
+    if (!s || !budget) return 0;
+    return cc_temporal_scan(s, now, budget, gone, env);
+}
+
+static inline void cc_temporal_shard_refresh(CCTemporalShard* s) {
+    if (s && s->ends_dirty) cc_temporal_refresh_next(s);
+}
+
+static inline size_t cc_temporal_shard_sweep(CCTemporalShard* s, int64_t now,
+                                            size_t budget, CCTemporalGone gone,
+                                            void* env) {
+    size_t n = 0;
+    if (!s) return 0;
+    if (now >= s->next_end) cc_temporal_retire(s, now);
+    if (budget) n = cc_temporal_scan(s, now, budget, gone, env);
+    if (s->ends_dirty) cc_temporal_refresh_next(s);
+    return n;
+}
+
+static inline bool cc_temporal_shard_init(CCTemporalShard* s, int64_t now) {
+    int l, i;
+    if (!s) return false;
+    memset(s, 0, sizeof(*s));
+    for (l = 0; l < CC_TEMPORAL_LEVELS; l++) {
+        int64_t unit = cc_temporal_unit_ms[l];
+        for (i = 0; i < cc_temporal_slots[l]; i++) {
+            int64_t base = (now / unit) * unit;
+            int64_t end = base + unit;
+            while ((int)((end / unit) % (int64_t)cc_temporal_slots[l]) !=
+                   (i + 1) % cc_temporal_slots[l])
+                end += unit;
+            s->wheel[l][i].end = end;
+        }
+    }
+    cc_temporal_refresh_next(s);
+    return true;
+}
+
+static inline void cc_temporal_shard_destroy(CCTemporalShard* s) {
+    if (s) memset(s, 0, sizeof(*s));
+}
+
+static inline bool cc_temporal_index_init(CCTemporalIndex* ix, size_t nshards,
+                                         int64_t now_ms) {
+    size_t i;
+    if (!ix || nshards < 1 || nshards > CC_TEMPORAL_MAX_SHARDS) return false;
+    memset(ix, 0, sizeof(*ix));
+    ix->nshards = nshards;
+    ix->root = cc_arena_heap(nshards * sizeof(CCTemporalShard) + 64);
+    if (!cc_arena_valid(ix->root)) return false;
+    ix->shards = (CCTemporalShard*)cc_arena_alloc_local(ix->root,
+                                                       nshards * sizeof(CCTemporalShard),
+                                                       _Alignof(CCTemporalShard));
+    if (!ix->shards) {
+        cc_arena_destroy(&ix->root);
+        memset(ix, 0, sizeof(*ix));
+        return false;
+    }
+    memset(ix->shards, 0, nshards * sizeof(CCTemporalShard));
+    for (i = 0; i < nshards; i++) {
+        if (!cc_temporal_shard_init(&ix->shards[i], now_ms)) {
+            cc_arena_destroy(&ix->root);
+            memset(ix, 0, sizeof(*ix));
+            return false;
+        }
+    }
+    return true;
+}
+
+static inline void cc_temporal_index_destroy(CCTemporalIndex* ix) {
+    if (!ix) return;
+    if (cc_arena_valid(ix->root)) cc_arena_destroy(&ix->root);
+    memset(ix, 0, sizeof(*ix));
+}
+
+static inline CCTemporalShard* cc_temporal_index_shard(CCTemporalIndex* ix, size_t si) {
+    if (!ix || !ix->shards || si >= ix->nshards) return NULL;
+    return &ix->shards[si];
+}
+
+static inline bool cc_temporal_index_set(CCTemporalIndex* ix, size_t si, int64_t now,
+                                        CCTemporalNode* node, int64_t dies_at) {
+    CCTemporalShard* sh = cc_temporal_index_shard(ix, si);
+    return sh && cc_temporal_shard_set(sh, now, node, dies_at);
+}
+
+static inline void cc_temporal_index_drop(CCTemporalIndex* ix, size_t si,
+                                         CCTemporalNode* node) {
+    CCTemporalShard* sh = cc_temporal_index_shard(ix, si);
+    if (sh) cc_temporal_shard_drop(sh, node);
+}
+
+static inline size_t cc_temporal_index_sweep(CCTemporalIndex* ix, size_t si, int64_t now,
+                                            size_t budget, CCTemporalGone gone,
+                                            void* env) {
+    CCTemporalShard* sh = cc_temporal_index_shard(ix, si);
+    return sh ? cc_temporal_shard_sweep(sh, now, budget, gone, env) : 0;
+}
+
+static inline size_t cc_temporal_index_len_at(CCTemporalIndex* ix, size_t si) {
+    CCTemporalShard* sh = cc_temporal_index_shard(ix, si);
+    return sh ? cc_temporal_shard_len(sh) : 0;
+}
+
+static inline size_t cc_temporal_index_len_all(const CCTemporalIndex* ix) {
+    size_t i, n = 0;
+    if (!ix || !ix->shards) return 0;
+    for (i = 0; i < ix->nshards; i++) n += cc_temporal_shard_len(&ix->shards[i]);
+    return n;
+}
+
+static inline int64_t cc_temporal_index_next_due(CCTemporalIndex* ix, size_t si) {
+    CCTemporalShard* sh = cc_temporal_index_shard(ix, si);
+    return sh ? cc_temporal_shard_next_due(sh) : INT64_MAX;
+}
+
+#endif /* CC_STD_TEMPORAL_INDEX_H */

@@ -1,0 +1,53 @@
+/*
+ * Runtime memory seam — not part of the default CCS surface.
+ *
+ * Default CCS translation units do not include this header and do not get
+ * libc memory names (malloc, memcpy, memset, …). User .ccs code allocates
+ * through arenas and copies/fills through slice dest-bulk
+ * (`dst.copy(src)`, `dst.copy_overlap(src)`, `dst.fill(c)`). Generated zero uses
+ * cc__bytes_zero in cc_slice.cch.
+ *
+ * This header is empty unless a runtime/comptime build flag is set.
+ * Bodies: cc/runtime/cc_mem.c (gcc/clang host only). cc/runtime/cc_mem_heap.c
+ * always linked for shadow-emitted cc__heap_* calls. @comptime / host tcc
+ * alias to libc via macros below.
+ */
+#ifndef CC_MEM_H
+#define CC_MEM_H
+
+#include <stddef.h>
+
+#if defined(CC_COMPTIME) || defined(__TINYC__) || defined(CC_ARENA_IMPL) \
+    || defined(CC_RESULT_IMPL) || defined(CC_RUNTIME_BUILD)
+
+#if defined(CC_COMPTIME) || defined(__TINYC__)
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#define cc_malloc malloc
+#define cc_free free
+#define cc_realloc realloc
+#define cc_memcpy memcpy
+#define cc_memmove memmove
+#define cc_memset memset
+#define cc_memcmp memcmp
+#define cc_abort abort
+#define cc_exit exit
+#define cc_eprintf(...) fprintf(stderr, __VA_ARGS__)
+#else
+#include <ccc/cc_compat.h>
+void *cc_malloc(size_t n);
+void cc_free(void *p);
+void *cc_realloc(void *p, size_t n);
+void *cc_memcpy(void *d, const void *s, size_t n);
+void *cc_memmove(void *d, const void *s, size_t n);
+void *cc_memset(void *d, int c, size_t n);
+int cc_memcmp(const void *a, const void *b, size_t n);
+CC_NORETURN void cc_abort(void);
+CC_NORETURN void cc_exit(int code);
+int cc_eprintf(const char *fmt, ...);
+#endif
+
+#endif /* runtime / comptime */
+
+#endif /* CC_MEM_H */

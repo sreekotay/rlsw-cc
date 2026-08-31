@@ -26,8 +26,6 @@
 #include <ccc/cc_nursery.h>
 #include <ccc/cc_type.h>
 #include <ccc/cc_ufcs.h>
-#include <stdlib.h>
-#include <string.h>
 
 #ifndef CC_PARALLEL_TASK_MAX
 #define CC_PARALLEL_TASK_MAX 32
@@ -59,30 +57,11 @@ CC_DECL_RESULT_SPEC(CCResult_CCParallel_CCError, CCParallel, CCError)
 #endif
 
 static inline CCParallel cc_parallel_empty(void) {
-    CCParallel h;
-    memset(&h, 0, sizeof(h));
+    CCParallel h = {0};
     return h;
 }
 
-static inline CCResult_void_CCError cc_parallel_wait(CCParallel* h) {
-    int i;
-    if (!h)
-        return cc_err_CCResult_void_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "cc_parallel_wait"));
-    if (cc_atomic_load(&h->joined))
-        return cc_ok_CCResult_void_CCError();
-    if (h->n)
-        (void)cc_nursery_wait(h->n);
-    for (i = 0; i < h->nt; i++) {
-        cc_parallel_join(h->tasks[i]);
-        free(h->envs[i]);
-        h->envs[i] = NULL;
-    }
-    h->nt = 0;
-    cc_atomic_store(&h->joined, 1);
-    if (h->fail)
-        return cc_err_CCResult_void_CCError(h->err);
-    return cc_ok_CCResult_void_CCError();
-}
+CCResult_void_CCError cc_parallel_wait(CCParallel* h);
 
 static inline int cc__parallel_contains(const CCParallel* root,
                                         const CCParallel* needle) {
@@ -108,7 +87,7 @@ static inline int cc__parallel_cancel_one(CCParallel* h) {
     if (!cc_atomic_cas(&h->cancelled, &expected, 1))
         return 0;
     if (h->n)
-        cc_nursery_cancel(h->n);
+        cc_nursery_cancel_host(h->n);
     return 1;
 }
 
@@ -182,7 +161,7 @@ static inline CCSlice cc_parallel_lower_c(CCSlice recv_type,
                                           CCSlice mode,
                                           CCSliceArray argv,
                                           CCSliceArray arg_types,
-                                          CCArena *arena) {
+                                          CCArena arena) {
     (void)recv_type;
     (void)mode;
     (void)argv;

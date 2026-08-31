@@ -366,7 +366,7 @@ static inline CCResult_CCString_CCError cc_script_sh_read_at(CCString cmdline, C
     return cc_ok_CCResult_CCString_CCError(out);
 }
 
-#define cc_script_sh_read(cmd) cc_script_sh_read_at((cmd), &__cc_str_scratch)
+#define cc_script_sh_read(cmd) cc_script_sh_read_at((cmd), __cc_str_scratch)
 
 /*
  * Run `ccc` with a @string extra-argv line. $CCC, else <root>/cc/bin/ccc,

@@ -13,6 +13,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <ccc/cc_result.h>
 
 #if !defined(CC_PARSER_MODE) && !defined(CC_TASK_DEFINED)
 typedef struct CCTask CCTask;
@@ -142,10 +143,6 @@ void* cc_closure0_call(CCClosure0 c);
 void* cc_closure1_call(CCClosure1 c, intptr_t arg0);
 /* Invoke a 2-arg closure. */
 void* cc_closure2_call(CCClosure2 c, intptr_t arg0, intptr_t arg1);
-
-/* Spawn arity-1/2 closures in a nursery (bridge for `spawn(c, arg...)`). */
-int cc_nursery_spawn_closure1(CCNurseryHost* n, CCClosure1 c, intptr_t arg0);
-int cc_nursery_spawn_closure2(CCNurseryHost* n, CCClosure2 c, intptr_t arg0, intptr_t arg1);
 
 static inline CC_TSAN_NOSAN_FN CCClosure0 cc_closure0_make(void* (*fn)(void*), void* env, void (*drop)(void*)) {
 #if defined(CC_PARSER_MODE)

@@ -1,11 +1,9 @@
 #ifndef CC_UFCS_H
 #define CC_UFCS_H
 
-#include <string.h>
-
 #include <ccc/cc_arena.h>
 
-typedef CCSlice (*CCUfcsRewriteFn)(CCSlice recv_type, CCSlice method, CCSlice mode, CCSliceArray argv, CCSliceArray arg_types, CCArena *arena);
+typedef CCSlice (*CCUfcsRewriteFn)(CCSlice recv_type, CCSlice method, CCSlice mode, CCSliceArray argv, CCSliceArray arg_types, CCArena arena);
 
 typedef struct {
     CCSlice pattern;
@@ -28,24 +26,35 @@ static inline CCSlice cc_ufcs_pass(void) {
     return cc_slice_from_static((void*)CC_UFCS_PASS_TAG, sizeof(CC_UFCS_PASS_TAG) - 1);
 }
 
-static inline bool cc_ufcs_slice_eq_cstr(CCSlice s, const char *cstr) {
-    size_t len = cstr ? strlen(cstr) : 0;
-    return cstr && s.len == len && memcmp(s.ptr, cstr, len) == 0;
+static inline size_t cc__ufcs_cstr_len(const char *s) {
+    size_t n = 0;
+    if (s) while (s[n]) n++;
+    return n;
 }
 
-static inline CCSlice cc_ufcs_emit_value(CCArena *arena, CCSlice callee) {
+static inline void cc__ufcs_copy(void *d, const void *s, size_t n) {
+    unsigned char *o = (unsigned char *)d;
+    const unsigned char *i = (const unsigned char *)s;
+    while (n--) *o++ = *i++;
+}
+
+static inline bool cc_ufcs_slice_eq_cstr(CCSlice s, const char *cstr) {
+    return cc_slice_eq_cstr(&s, cstr);
+}
+
+static inline CCSlice cc_ufcs_emit_value(CCArena arena, CCSlice callee) {
     size_t prefix_len = sizeof(CC_UFCS_VALUE_TAG) - 1;
     size_t total = prefix_len + callee.len;
-    CCSlice out = arena ? cc_arena_alloc_slice_bytes(arena, total) : cc_slice_empty();
+    CCSlice out = arena.p ? cc_arena_alloc_slice_bytes(arena, total) : cc_slice_empty();
     char *buf = (char *)out.ptr;
     if (total > 0 && !buf) return cc_slice_empty();
-    memcpy(buf, CC_UFCS_VALUE_TAG, prefix_len);
-    if (callee.len > 0 && callee.ptr) memcpy(buf + prefix_len, callee.ptr, callee.len);
+    cc__ufcs_copy(buf, CC_UFCS_VALUE_TAG, prefix_len);
+    if (callee.len > 0 && callee.ptr) cc__ufcs_copy(buf + prefix_len, callee.ptr, callee.len);
     return out;
 }
 
-static inline CCSlice cc_ufcs_emit_value_cstr(CCArena *arena, const char *callee) {
-    CCSlice callee_slice = callee ? cc_slice_from_static((void *)callee, strlen(callee)) : cc_slice_empty();
+static inline CCSlice cc_ufcs_emit_value_cstr(CCArena arena, const char *callee) {
+    CCSlice callee_slice = callee ? cc_slice_from_static((void *)callee, cc__ufcs_cstr_len(callee)) : cc_slice_empty();
     return cc_ufcs_emit_value(arena, callee_slice);
 }
 
@@ -63,12 +72,12 @@ static inline CCSlice cc_ufcs_emit_value_cstr(CCArena *arena, const char *callee
 /* Prefer `@typehooks on T { .ufcs = rewrite, };` — see docs/deprecated.md. */
 static inline CCUfcsRegistration cc_ufcs_register(const char *pattern, CCUfcsRewriteFn rewrite) {
     CCUfcsRegistration reg = {0};
-    reg.pattern = pattern ? cc_slice_from_static((void *)pattern, strlen(pattern)) : cc_slice_empty();
+    reg.pattern = pattern ? cc_slice_from_static((void *)pattern, cc__ufcs_cstr_len(pattern)) : cc_slice_empty();
     reg.rewrite = rewrite;
     return reg;
 }
 
-static inline CCSlice cc_ufcs_apply(CCUfcsRegistration reg, CCSlice recv_type, CCSlice method, CCSlice mode, CCSliceArray argv, CCSliceArray arg_types, CCArena *arena) {
+static inline CCSlice cc_ufcs_apply(CCUfcsRegistration reg, CCSlice recv_type, CCSlice method, CCSlice mode, CCSliceArray argv, CCSliceArray arg_types, CCArena arena) {
     if (!reg.rewrite) return cc_slice_empty();
     return reg.rewrite(recv_type, method, mode, argv, arg_types, arena);
 }

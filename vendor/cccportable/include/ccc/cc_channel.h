@@ -12,7 +12,6 @@
 #include <ccc/cc_compat.h>
 #include <time.h>
 #include <errno.h>
-#include <string.h>
 
 #include <ccc/cc_sched.h>
 #include <ccc/cc_slice.h>
@@ -63,7 +62,7 @@ CCIoError cc__chan_get_close_error(CCChan* ch, bool is_recv);
 
 /*
  * Typed result helper with channel context. Behaves like
- * cc_chan_result_from_errno for legacy int-returning close_err paths, but
+ * cc_chan_result_from_errno for int-returning close_err paths, but
  * additionally promotes a stored structured CCIoError to the Err arm when
  * cc_chan_close_with() / cc_chan_cancel() set one. is_recv selects which side
  * of the close to read (tx-side error on recv, rx-side error on send).
@@ -142,15 +141,14 @@ int cc_chan_is_ordered(CCChan* ch);
  * FIFO contract marker and the channel uses the normal machinery, so the
  * unordered branch below is the data path.
  */
-#include <string.h>
 static inline CCResult_bool_CCIoError cc__chan_recv_ordered(CCChanRx rx, void* out, size_t out_sz) {
     if (cc_chan_is_ordered(rx.raw)) {
         CCTask task;
         int rc = cc_chan_recv(rx.raw, &task, sizeof(task));
         if (rc == 0) {
             void* cap = (void*)cc_block_on_intptr(task);
-            if (cap) memcpy(out, cap, out_sz);
-            else memset(out, 0, out_sz);
+            if (cap) cc__bytes_copy(out, cap, out_sz);
+            else cc__bytes_zero(out, out_sz);
         }
         return cc_chan_result_with(rx.raw, rc, /*is_recv=*/true);
     }
@@ -417,9 +415,8 @@ static inline CCChan* cc_channel_pair_create_returning(size_t capacity,
  *   1. Inside `@async` bodies, the state-machine frame promotion
  *      mangles locals declared inside `({ ... })` (e.g. `CCChan* __cc_ch`
  *      gets rewritten to `CCChan* __f->__cc_ch`, which is invalid C).
- *   2. A single inline function generates the same code paths as before
- *      while keeping the lowering's emit small and the lowered C
- *      hand-crafted-looking (one call, no `do { ... } while(0)` block). */
+ *   2. A single inline function keeps the lowering emit small and produces
+ *      one clean call site in lowered C (no statement-expression block). */
 static inline CCChan* cc_channel_pair_create_named(size_t capacity,
                                                     CCChanMode mode,
                                                     bool allow_send_take,
@@ -656,11 +653,10 @@ static inline CCResult_bool_CCIoError cc_channel_try_send_into_typed_call(CCChan
 #define cc_channel_recv_task(...) CC__CHANNEL_SELECT_2_OR_3(__VA_ARGS__, cc_channel_recv_task_raw3, cc_channel_recv_task_typed)(__VA_ARGS__)
 
 static inline bool cc__channel_lower_c_eq(CCSlice s, const char *cstr) {
-    size_t len = cstr ? strlen(cstr) : 0;
-    return cstr && s.len == len && memcmp(s.ptr, cstr, len) == 0;
+    return cc_slice_eq_cstr(&s, cstr);
 }
 
-static inline CCSlice cc_channel_tx_lower_c(CCSlice recv_type, CCSlice method, CCSlice mode, CCSliceArray argv, CCSliceArray arg_types, CCArena *arena) {
+static inline CCSlice cc_channel_tx_lower_c(CCSlice recv_type, CCSlice method, CCSlice mode, CCSliceArray argv, CCSliceArray arg_types, CCArena arena) {
     (void)recv_type;
     (void)argv;
     (void)arg_types;
@@ -681,7 +677,7 @@ static inline CCSlice cc_channel_tx_lower_c(CCSlice recv_type, CCSlice method, C
     return cc_slice_empty();
 }
 
-static inline CCSlice cc_channel_rx_lower_c(CCSlice recv_type, CCSlice method, CCSlice mode, CCSliceArray argv, CCSliceArray arg_types, CCArena *arena) {
+static inline CCSlice cc_channel_rx_lower_c(CCSlice recv_type, CCSlice method, CCSlice mode, CCSliceArray argv, CCSliceArray arg_types, CCArena arena) {
     (void)recv_type;
     (void)argv;
     (void)arg_types;
@@ -699,11 +695,9 @@ static inline CCSlice cc_channel_rx_lower_c(CCSlice recv_type, CCSlice method, C
 
 
 
-/* Raw (untyped) aliases: `CCChanTx tx = ...; tx.send(1)` used to hit
-   the builtin-callable lookup in ufcs.c.  Now that the AST dispatch is
-   registry-only, the bare aliases also need explicit hooks — the
-   wildcard pattern `CCChanTx_*` only matches the typed family
-   (CCChanTx_int, CCChanTx_Foo, ...), not the plain CCChanTx typedef. */
+/* Raw (untyped) aliases: bare CCChanTx / CCChanRx also need explicit hooks.
+   The wildcard pattern `CCChanTx_*` matches the typed family only, not the
+   plain CCChanTx typedef. */
 
 
 

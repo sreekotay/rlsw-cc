@@ -14,7 +14,7 @@ static inline CCResult_bool_CCIoError cc__bufio_unsupported_read(void *src, char
                                                                  size_t max, size_t *out) {
     (void)src; (void)buf; (void)max;
     if (out) *out = 0;
-    return cc_err_CCResult_bool_CCIoError(cc_io_error_os(CC_IO_INVALID_ARGUMENT, EINVAL));
+    return cc_err_CCResult_bool_CCIoError(cc_io_error_os(CC_IO_INVALID_ARGUMENT, 0));
 }
 
                                   
@@ -31,8 +31,7 @@ static inline CCResult_bool_CCIoError cc__bufio_unsupported_read(void *src, char
              
                                                                                           
                    
-                             
-                                             
+                                                                                 
  
                                                                                                
               
@@ -51,14 +50,15 @@ static inline CCResult_bool_CCIoError cc__bufio_unsupported_read(void *src, char
                         
                           
                                             
-                                                
+                                                           
                                     
                                         
-                                                          
+                                      
+                                                               
                                      
                                                             
                             
-                                                        
+                                                                   
                            
                    
                                             
@@ -75,7 +75,7 @@ static inline CCResult_bool_CCIoError cc__bufio_unsupported_read(void *src, char
                         
  
                                                                                     
-                                                          
+                                                                     
                                         
                                                    
                                                        
@@ -87,7 +87,7 @@ static inline CCResult_bool_CCIoError cc__bufio_unsupported_read(void *src, char
  
                                                                          
              
-                                                    
+                                                               
               
                                            
                                         
@@ -114,14 +114,14 @@ static inline CCResult_bool_CCIoError cc__bufio_unsupported_read(void *src, char
                   
                                                                                         
                                                           
-                                                                            
+                                                                                       
                                  
                                  
                         
                              
                            
                                               
-                                                                   
+                                                              
                                             
  
                                         

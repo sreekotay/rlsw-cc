@@ -19,9 +19,23 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdio.h>
+#if defined(CC_COMPTIME) || defined(__TINYC__) || defined(CC_ARENA_IMPL)
+#include <ccc/cc_mem.h>
+#if defined(CC_ARENA_IMPL)
+#define CC__ARENA_SYS
+#else
+#define CC__ARENA_SYS static inline
+#endif
+#define CC__BI_MEMCPY cc_memcpy
+#define CC__BI_MEMMOVE cc_memmove
+#define CC__BI_MEMSET cc_memset
+#define CC__BI_MEMCMP cc_memcmp
+#else
+#define CC__BI_MEMCPY __builtin_memcpy
+#define CC__BI_MEMMOVE __builtin_memmove
+#define CC__BI_MEMSET __builtin_memset
+#define CC__BI_MEMCMP __builtin_memcmp
+#endif
 typedef struct CCArenaHost CCArenaHost;
 typedef struct CCArena CCArena;
 typedef struct CCArenaPool CCArenaPool;
@@ -45,9 +59,9 @@ typedef struct CCArenaCheckpoint CCArenaCheckpoint;
 #define CC_ARENA_FLAG_USED_HEAP_OVERFLOW  0x10
 #define CC_ARENA_FLAG_NON_REWINDABLE      0x20
 #define CC_ARENA_FLAG_WALKING             0x40  // teardown walk in progress (attach/adopt refuse)
-#define CC_ARENA_FLAG_HOST_INLINE         0x80  // host at front of L1 region; never free(base) separately
+#define CC_ARENA_FLAG_HOST_INLINE         0x80  // host at front of L1 region; never cc_free(base) separately
 #define CC_ARENA_FLAG_HOST_OWNED          0x100 // host malloced separately from L1; free host at destroy
-#define CC_ARENA_FLAG_REGION_OWNED        0x200 // host overlay lives in malloc(region); free host at destroy
+#define CC_ARENA_FLAG_REGION_OWNED        0x200 // host overlay lives in cc_malloc(region); free host at destroy
 
 #define CC_ARENA_POOL_FLAG_OWNED  0x1  // Pool owns its arena (should free it)
 
@@ -90,9 +104,11 @@ struct CCArenaHost {
 };
 
 typedef struct CCArena {
-    /* `.a` is the host. `.base` is the same pointer — last-good / host C
-     * still write `if (ar.base)` as liveness (same bits as `.a`); it is not the L1 slab. */
+    /* Same ABI as CCBox::[CCArenaHost]: one host pointer. `.p` is the box
+     * field. `.a` / `.base` are the same bits — last-good / host C still
+     * write `if (ar.base)` as liveness; `.base` is not the L1 slab. */
     union {
+        CCArenaHost *p;
         CCArenaHost *a;
         uint8_t *base;
     };
@@ -113,36 +129,30 @@ static inline CCResult_CCArena_CCError cc__arena_err(CCErrorKind k, const char *
 
 static inline CCArena cc_arena_handle(CCArenaHost *h) {
     CCArena r;
-    r.a = h;
+    r.p = h;
     return r;
 }
 
 static inline int cc_arena_is_live(CCArena a) {
-    return a.a != NULL && a.a->base != NULL;
+    return a.p != NULL && a.p->base != NULL;
 }
 
 static inline CCArenaHost *cc_arena_host(CCArena a) {
-    return a.a;
+    return a.p;
 }
 
 static inline CCArenaHost *cc_arena_hostp(const CCArena *p) {
     return p ? p->a : NULL;
 }
 
-/* Peel Host* / handle / handle* so existing C and .cch call sites keep
- * compiling during the box migration. Functions, not `(x)->a`, so a
+/* Peel Host* or handle. `CCArena*` is a slot only — not an allocate
+ * argument — so it is not listed here. Functions, not `(x)->a`, so a
  * parameter named `new_arena` cannot eat the field token. */
 static inline CCArenaHost *cc__arena_host_from_host(CCArenaHost *h) { return h; }
 static inline CCArenaHost *cc__arena_host_from_chost(const CCArenaHost *h) {
     return (CCArenaHost *)(uintptr_t)(const void *)h;
 }
 static inline CCArenaHost *cc__arena_host_from_handle(CCArena a) { return a.a; }
-static inline CCArenaHost *cc__arena_host_from_handlep(CCArena *p) {
-    return p ? p->a : NULL;
-}
-static inline CCArenaHost *cc__arena_host_from_chandlep(const CCArena *p) {
-    return p ? p->a : NULL;
-}
 static inline CCArena cc__arena_handle_from_host(CCArenaHost *h) {
     return cc_arena_handle(h);
 }
@@ -150,48 +160,44 @@ static inline CCArena cc__arena_handle_from_chost(const CCArenaHost *h) {
     return cc_arena_handle((CCArenaHost *)(uintptr_t)(const void *)h);
 }
 static inline CCArena cc__arena_handle_from_handle(CCArena a) { return a; }
-static inline CCArena cc__arena_handle_from_handlep(CCArena *p) {
-    return p ? *p : cc_arena_handle(NULL);
-}
-static inline CCArena cc__arena_handle_from_chandlep(const CCArena *p) {
-    return p ? *p : cc_arena_handle(NULL);
-}
-/* No void* association: TinyCC's _Generic treats every pointer as matching
- * void*, which would skip `.a` and operate on the handle as if it were a
- * host (unaligned atomics / EXC_BAD_ACCESS in the comptime executor).
- * Associations use the tag `struct CCArena` so TinyCC and Clang both match
- * a handle value (TinyCC does not match the typedef name). */
+/* Handle-by-value is `default`, not `struct CCArena`. Clang takes `&` of a
+ * `_Generic` controlling expression when both `struct T` and `struct T *`
+ * are listed; we do not list `T*`. `default` also matches TinyCC, which
+ * does not associate the typedef name. No void* arm on HOST/HANDLE:
+ * TinyCC treats every pointer as void*. */
 #define CC__ARENA_HOST(x) _Generic((x), \
     CCArenaHost *: cc__arena_host_from_host, \
     const CCArenaHost *: cc__arena_host_from_chost, \
-    struct CCArena *: cc__arena_host_from_handlep, \
-    const struct CCArena *: cc__arena_host_from_chandlep, \
-    struct CCArena: cc__arena_host_from_handle \
+    default: cc__arena_host_from_handle \
 )(x)
 /* Identity as a handle. Allocator arguments and stored fields use this —
  * never a pointer to the caller's binding. */
 #define CC__ARENA_HANDLE(x) _Generic((x), \
     CCArenaHost *: cc__arena_handle_from_host, \
     const CCArenaHost *: cc__arena_handle_from_chost, \
-    struct CCArena *: cc__arena_handle_from_handlep, \
-    const struct CCArena *: cc__arena_handle_from_chandlep, \
-    struct CCArena: cc__arena_handle_from_handle \
+    default: cc__arena_handle_from_handle \
 )(x)
-/* Last-good / tests still pass NULL for “no arena”. No void* arm — TinyCC
- * would then treat every pointer as void* and skip `.a`. Unlisted pointer
- * types (NULL) take default. */
+/* Optional arena: handle, Host*, or NULL. TinyCC cannot list void*
+ * (every pointer would match). */
 static inline CCArena cc__arena_handle_none(void *unused) {
     (void)unused;
     return cc_arena_handle(NULL);
 }
+#if defined(__TINYC__)
 #define CC__ARENA_HANDLE_OR_NULL(x) _Generic((x), \
     CCArenaHost *: cc__arena_handle_from_host, \
     const CCArenaHost *: cc__arena_handle_from_chost, \
-    struct CCArena *: cc__arena_handle_from_handlep, \
-    const struct CCArena *: cc__arena_handle_from_chandlep, \
     struct CCArena: cc__arena_handle_from_handle, \
     default: cc__arena_handle_none \
 )(x)
+#else
+#define CC__ARENA_HANDLE_OR_NULL(x) _Generic((x), \
+    CCArenaHost *: cc__arena_handle_from_host, \
+    const CCArenaHost *: cc__arena_handle_from_chost, \
+    void *: cc__arena_handle_none, \
+    default: cc__arena_handle_from_handle \
+)(x)
+#endif
 
 struct CCArenaCheckpoint {
     CCArenaHost* arena;
@@ -283,8 +289,40 @@ static inline size_t cc__arena_host_prefix(void) {
     return CC__ARENA_HOST_PREFIX;
 }
 
-/* Region bytes for a caller buffer that should yield `usable` L1 bytes. */
+/* Region bytes for a caller buffer that should yield `usable` L1 bytes.
+ * Overlay may skip up to `_Alignof(CCArenaHost)-1` pad bytes if `buf` is
+ * unaligned — oversize by that, or use attach_buffer (no overlay). */
 #define CC_ARENA_REGION_BYTES(usable) (CC__ARENA_HOST_PREFIX + (size_t)(usable))
+
+#ifdef CC__ARENA_SYS
+CC__ARENA_SYS void cc__arena_die(const char *msg) {
+    cc_eprintf( "cc_arena: %s\n", msg);
+    cc_abort();
+}
+#else
+void cc__arena_die(const char *msg);
+#endif
+
+
+/* Place an aligned host inside `region`. Pad is 0..align-1. L1 follows the
+ * host prefix. 0 = can place; -1 = null/empty or not enough bytes left. */
+static inline int cc__arena_region_place(void *region, size_t region_bytes,
+                                         CCArenaHost **host_out, size_t *l1_out) {
+    size_t prefix = cc__arena_host_prefix();
+    size_t align = _Alignof(CCArenaHost);
+    uintptr_t base, aligned, end;
+    size_t remain;
+    if (!region || region_bytes == 0 || align == 0) return -1;
+    base = (uintptr_t)region;
+    end = base + region_bytes;
+    aligned = (base + (align - 1u)) & ~(uintptr_t)(align - 1u);
+    if (aligned < base || aligned >= end) return -1;
+    remain = (size_t)(end - aligned);
+    if (remain <= prefix) return -1;
+    if (host_out) *host_out = (CCArenaHost *)aligned;
+    if (l1_out) *l1_out = remain - prefix;
+    return 0;
+}
 
 /* L1 of a HOST_INLINE region lives after the host prefix. Never
  * free that address as a standalone slab — it dies with the region. */
@@ -293,12 +331,18 @@ static inline uint8_t *cc__arena_inline_l1(const CCArenaHost *a) {
     return (uint8_t *)(uintptr_t)(const void *)a + cc__arena_host_prefix();
 }
 
-static inline void cc__arena_maybe_free_slab(const CCArenaHost *host, uint8_t *base,
+#ifdef CC__ARENA_SYS
+CC__ARENA_SYS void cc__arena_maybe_free_slab(const CCArenaHost *host, uint8_t *base,
                                             unsigned flags) {
     if (!base || !(flags & CC_ARENA_FLAG_HEAP_OWNED)) return;
     if (host && base == cc__arena_inline_l1(host)) return;
-    free(base);
+    cc_free(base);
 }
+#else
+void cc__arena_maybe_free_slab(const CCArenaHost *host, uint8_t *base,
+                                            unsigned flags);
+#endif
+
 
 static inline void cc__arena_cpu_relax(void) {
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
@@ -465,7 +509,8 @@ static inline void cc__arena_ovf_steal_locked(CCArenaHost *arena,
     CC_ATOMIC_STORE(&arena->overflow_bytes, 0);
 }
 
-static inline void cc__arena_ovf_free_stolen(CCArenaOvfHeader *heads,
+#ifdef CC__ARENA_SYS
+CC__ARENA_SYS void cc__arena_ovf_free_stolen(CCArenaOvfHeader *heads,
                                             CCArenaOvfChunk *chunks) {
     while (heads) {
         CCArenaOvfHeader *next = heads->next;
@@ -475,15 +520,20 @@ static inline void cc__arena_ovf_free_stolen(CCArenaOvfHeader *heads,
         heads->raw_delta = 0;
         heads->next = NULL;
         heads->prev = NULL;
-        if (raw) free(raw);
+        if (raw) cc_free(raw);
         heads = next;
     }
     while (chunks) {
         CCArenaOvfChunk *next = chunks->next;
-        free(chunks);
+        cc_free(chunks);
         chunks = next;
     }
 }
+#else
+void cc__arena_ovf_free_stolen(CCArenaOvfHeader *heads,
+                                            CCArenaOvfChunk *chunks);
+#endif
+
 
 /* Checkpoint seals the active overflow chunk so later overflow cannot share
  * a chunk with the keep-set. An empty head chunk is restamped to the new epoch
@@ -609,7 +659,8 @@ static inline bool cc__arena_ovf_take(CCArenaHost *arena, void *payload, void **
 
 /* Per-object overflow — used by cc_arena_malloc (block_max == 1).
  * `out_epoch` is written under the same lock as the header provenance. */
-static inline void *cc__arena_alloc_ovf_object(CCArenaHost *arena, size_t size, size_t align,
+#ifdef CC__ARENA_SYS
+CC__ARENA_SYS void *cc__arena_alloc_ovf_object(CCArenaHost *arena, size_t size, size_t align,
                                               uint64_t *out_epoch) {
     void *raw;
     void *payload;
@@ -618,17 +669,17 @@ static inline void *cc__arena_alloc_ovf_object(CCArenaHost *arena, size_t size, 
     size_t total = cc__arena_ovf_total(size, a);
     size_t delta;
     if (!total) return NULL;
-    raw = malloc(total);
+    raw = cc_malloc(total);
     if (!raw) return NULL;
     payload = cc__arena_ovf_payload_from_raw(raw, a);
     h = cc__arena_ovf_header(payload);
     if ((uint8_t *)h < (uint8_t *)raw) {
-        free(raw);
+        cc_free(raw);
         return NULL;
     }
     delta = (size_t)((uint8_t *)h - (uint8_t *)raw);
     if (delta > UINT32_MAX) {
-        free(raw);
+        cc_free(raw);
         return NULL;
     }
     h->magic = CC_ARENA_OVF_MAGIC;
@@ -647,9 +698,15 @@ static inline void *cc__arena_alloc_ovf_object(CCArenaHost *arena, size_t size, 
     cc__arena_meta_unlock(arena);
     return payload;
 }
+#else
+void *cc__arena_alloc_ovf_object(CCArenaHost *arena, size_t size, size_t align,
+                                              uint64_t *out_epoch);
+#endif
+
 
 /* Chunk-bump overflow — growable scratch after slab budget. */
-static inline void *cc__arena_alloc_ovf_chunked(CCArenaHost *arena, size_t size, size_t align,
+#ifdef CC__ARENA_SYS
+CC__ARENA_SYS void *cc__arena_alloc_ovf_chunked(CCArenaHost *arena, size_t size, size_t align,
                                                uint64_t *out_epoch) {
     size_t a = cc__arena_ovf_align(align);
     size_t need = sizeof(CCArenaOvfHeader) + (a - 1) + size;
@@ -668,7 +725,7 @@ static inline void *cc__arena_alloc_ovf_chunked(CCArenaHost *arena, size_t size,
         size_t cap = CC_ARENA_OVF_CHUNK_SIZE;
         CCArenaOvfChunk *fresh;
         if (cap < need) cap = need;
-        fresh = (CCArenaOvfChunk *)malloc(sizeof(CCArenaOvfChunk) + cap);
+        fresh = (CCArenaOvfChunk *)cc_malloc(sizeof(CCArenaOvfChunk) + cap);
         if (!fresh) {
             cc__arena_meta_unlock(arena);
             return NULL;
@@ -709,6 +766,11 @@ static inline void *cc__arena_alloc_ovf_chunked(CCArenaHost *arena, size_t size,
     cc__arena_meta_unlock(arena);
     return payload;
 }
+#else
+void *cc__arena_alloc_ovf_chunked(CCArenaHost *arena, size_t size, size_t align,
+                                               uint64_t *out_epoch);
+#endif
+
 
 static inline void *cc__arena_alloc_heap_overflow(CCArenaHost *arena, size_t size, size_t align,
                                                  uint64_t *out_epoch) {
@@ -757,19 +819,17 @@ static inline int cc_arena_buffer(CCArenaHost *arena, void *buffer, size_t capac
     return 0;
 }
 
-/* Overlay the host at byte 0 of `region`. User L1 starts after the prefix;
- * usable capacity is `region_bytes - prefix`. Marks HOST_INLINE.
- * `region` must be `_Alignof(CCArenaHost)`-aligned; else refuse. */
+/* Overlay the host at the first aligned address in `region`. L1 starts
+ * after the host prefix. Unaligned caller bytes are valid — pad is wasted.
+ * Returns -1 if the region cannot hold an aligned host plus 1 L1 byte. */
 static inline int cc_arena_init_region(void *region, size_t region_bytes,
                                        unsigned block_max) {
     size_t prefix = cc__arena_host_prefix();
-    CCArenaHost *h;
-    if (!region || region_bytes <= prefix) return -1;
-    if (((uintptr_t)region % _Alignof(CCArenaHost)) != 0) return -1;
-    h = (CCArenaHost *)region;
-    memset(h, 0, sizeof(*h));
-    if (cc_arena_buffer(h, (uint8_t *)region + prefix, region_bytes - prefix) != 0)
-        return -1;
+    size_t l1 = 0;
+    CCArenaHost *h = NULL;
+    if (cc__arena_region_place(region, region_bytes, &h, &l1) != 0) return -1;
+    CC__BI_MEMSET(h, 0, sizeof(*h));
+    if (cc_arena_buffer(h, (uint8_t *)h + prefix, l1) != 0) return -1;
     h->block_max = block_max;
     h->_flags |= CC_ARENA_FLAG_HOST_INLINE;
     return 0;
@@ -777,9 +837,15 @@ static inline int cc_arena_init_region(void *region, size_t region_bytes,
 
 static inline CCArena cc_arena_wrap_region(void *region, size_t region_bytes,
                                           unsigned block_max) {
+    CCArenaHost *h = NULL;
+    size_t l1 = 0;
+    if (!region || region_bytes == 0) return cc_arena_handle(NULL);
+    if (cc__arena_region_place(region, region_bytes, &h, &l1) != 0)
+        cc__arena_die("overlay region cannot hold an aligned host + L1 "
+                      "(size with CC_ARENA_REGION_BYTES, or use attach_buffer)");
     if (cc_arena_init_region(region, region_bytes, block_max) != 0)
-        return cc_arena_handle(NULL);
-    return cc_arena_handle((CCArenaHost *)region);
+        cc__arena_die("overlay region init failed");
+    return cc_arena_handle(h);
 }
 
 // Thread-local (non-atomic) fast path for arenas owned by exactly one fiber/thread.
@@ -842,7 +908,8 @@ static inline void cc__arena_note_live_locked(CCArenaHost *arena, uint8_t *base,
 
 /* Push current slab to prev; install a new root at least max(1.5× old, min_cap, 4096).
  * Caller must hold meta_lock, or be the exclusive owner (local_* path). */
-static inline int cc__arena_grow_locked(CCArenaHost *arena, size_t size, size_t align) {
+#ifdef CC__ARENA_SYS
+CC__ARENA_SYS int cc__arena_grow_locked(CCArenaHost *arena, size_t size, size_t align) {
     CCArenaHost *extent;
     uint8_t *new_buf;
     size_t aligned;
@@ -870,12 +937,12 @@ static inline int cc__arena_grow_locked(CCArenaHost *arena, size_t size, size_t 
     if (new_cap < min_cap) new_cap = min_cap;
     if (new_cap < 4096) new_cap = 4096;
 
-    extent = (CCArenaHost *)malloc(sizeof(CCArenaHost));
+    extent = (CCArenaHost *)cc_malloc(sizeof(CCArenaHost));
     if (!extent) return -1;
 
-    new_buf = (uint8_t *)malloc(new_cap);
+    new_buf = (uint8_t *)cc_malloc(new_cap);
     if (!new_buf) {
-        free(extent);
+        cc_free(extent);
         return -1;
     }
 
@@ -885,8 +952,8 @@ static inline int cc__arena_grow_locked(CCArenaHost *arena, size_t size, size_t 
     CC_ATOMIC_STORE(&extent->live_allocs, CC_ATOMIC_LOAD(&arena->live_allocs));
     extent->provenance = arena->provenance;
     /* Extent struct is its own malloc. Do not inherit HOST_INLINE /
-     * HOST_OWNED (those name the root host). A retired HOST_INLINE L1 is
-     * not a standalone slab — clear HEAP_OWNED so free/reset skip it. */
+     * HOST_OWNED (those name the root host). A HOST_INLINE L1 slab that is
+     * no longer active is not a standalone slab — clear HEAP_OWNED so free/reset skip it. */
     extent->_flags = (arena->_flags | CC_ARENA_FLAG_IS_EXTENT)
                    & ~(CC_ARENA_FLAG_HOST_INLINE | CC_ARENA_FLAG_HOST_OWNED
                        | CC_ARENA_FLAG_REGION_OWNED);
@@ -918,6 +985,10 @@ static inline int cc__arena_grow_locked(CCArenaHost *arena, size_t size, size_t 
 
     return 0;
 }
+#else
+int cc__arena_grow_locked(CCArenaHost *arena, size_t size, size_t align);
+#endif
+
 
 // Allocate `size` bytes aligned to `align` (power-of-two, >=1).
 // Returns NULL on exhaustion (fixed arena) or OOM (growable arena).
@@ -970,6 +1041,8 @@ static inline void *cc_arena_alloc_host(CCArenaHost *arena, size_t size, size_t 
     return cc__arena_alloc_host_epoch(arena, size, align, NULL);
 }
 
+/* cc_arena_alloc takes CCArena by value (not CCArena*). CC__ARENA_HOST peels
+ * Host* or handle; pass the binding, not &arena. */
 #define cc_arena_alloc(a, n, al) cc_arena_alloc_host(CC__ARENA_HOST(a), (n), (al))
 
 /* Exclusive-owner grow path: plain bump, unlocked slab grow, then chunk/object
@@ -988,7 +1061,7 @@ static inline void *cc_arena_alloc_local_grow(CCArenaHost *arena, size_t size, s
     return cc__arena_alloc_heap_overflow(arena, size, align, NULL);
 }
 
-static inline bool cc_arena_release(CCArenaHost* arena, void* ptr);
+bool cc_arena_release(CCArenaHost* arena, void* ptr);
 
 /* Single-owner tip realloc: plain offset bump when ptr is the active-slab tip
  * and the new size fits. No find_block walk, no CAS. Returns NULL when the
@@ -1044,7 +1117,8 @@ static inline void *cc_arena_realloc_local(CCArenaHost *arena,
 // Heap-overflow pointers use realloc only when ownership stays in the
 // same arena; cross-arena moves allocate in the new arena and release
 // through the old one.
-static inline void *cc_arena_realloc_host(CCArenaHost *old_arena,
+#ifdef CC__ARENA_SYS
+CC__ARENA_SYS void *cc_arena_realloc_host(CCArenaHost *old_arena,
                                           CCArenaHost *new_arena,
                                           void *ptr,
                                           size_t old_size,
@@ -1062,7 +1136,7 @@ static inline void *cc_arena_realloc_host(CCArenaHost *old_arena,
         void* out = cc_arena_alloc(new_arena, new_size, align);
         if (!out) return NULL;
         size_t copy_bytes = old_size < new_size ? old_size : new_size;
-        memcpy(out, ptr, copy_bytes);
+        CC__BI_MEMCPY(out, ptr, copy_bytes);
         (void)cc_arena_release(old_arena, ptr);
         return out;
     }
@@ -1100,7 +1174,7 @@ static inline void *cc_arena_realloc_host(CCArenaHost *old_arena,
                 void* out = cc_arena_alloc(new_arena, new_size, align);
                 if (!out) return NULL;
                 size_t copy_bytes = old_size < new_size ? old_size : new_size;
-                memcpy(out, ptr, copy_bytes);
+                CC__BI_MEMCPY(out, ptr, copy_bytes);
                 (void)cc_arena_release(old_arena, ptr);
                 return out;
             }
@@ -1132,7 +1206,7 @@ static inline void *cc_arena_realloc_host(CCArenaHost *old_arena,
             {
                 void *out = cc_arena_alloc(new_arena, new_size, align);
                 if (!out) return NULL;
-                memcpy(out, ptr, old_size < new_size ? old_size : new_size);
+                CC__BI_MEMCPY(out, ptr, old_size < new_size ? old_size : new_size);
                 (void)cc_arena_release(old_arena, ptr);
                 return out;
             }
@@ -1161,7 +1235,7 @@ static inline void *cc_arena_realloc_host(CCArenaHost *old_arena,
             }
             cc__arena_ovf_unlink_locked(old_arena, h);
             cc__arena_meta_unlock(old_arena);
-            new_raw = realloc(old_raw, total);
+            new_raw = cc_realloc(old_raw, total);
             if (!new_raw) {
                 h->next = NULL;
                 h->prev = NULL;
@@ -1175,7 +1249,7 @@ static inline void *cc_arena_realloc_host(CCArenaHost *old_arena,
             new_off = (size_t)((uint8_t *)new_payload - (uint8_t *)new_raw);
             copy_bytes = old_size < new_size ? old_size : new_size;
             if (new_off != old_off && copy_bytes > 0) {
-                memmove(new_payload, (uint8_t *)new_raw + old_off, copy_bytes);
+                CC__BI_MEMMOVE(new_payload, (uint8_t *)new_raw + old_off, copy_bytes);
             }
             h = cc__arena_ovf_header(new_payload);
             if ((uint8_t *)h < (uint8_t *)new_raw ||
@@ -1183,7 +1257,7 @@ static inline void *cc_arena_realloc_host(CCArenaHost *old_arena,
                 /* Unstampable header (pad > 4GiB). realloc already moved
                  * the block; cannot relink. Current ovf_align never
                  * produces this. */
-                free(new_raw);
+                cc_free(new_raw);
                 return NULL;
             }
             h->magic = CC_ARENA_OVF_MAGIC;
@@ -1209,6 +1283,15 @@ static inline void *cc_arena_realloc_host(CCArenaHost *old_arena,
 
     return NULL;
 }
+#else
+void *cc_arena_realloc_host(CCArenaHost *old_arena,
+                                          CCArenaHost *new_arena,
+                                          void *ptr,
+                                          size_t old_size,
+                                          size_t new_size,
+                                          size_t align);
+#endif
+
 
 #define cc_arena_realloc(o, n, p, os, ns, al) \
     cc_arena_realloc_host(CC__ARENA_HOST(o), CC__ARENA_HOST(n), (p), (os), (ns), (al))
@@ -1231,7 +1314,7 @@ static inline void *cc_arena_realloc_local_grow(CCArenaHost *arena,
     out = cc_arena_alloc_local_grow(arena, new_size, align);
     if (!out) return NULL;
     copy_bytes = old_size < new_size ? old_size : new_size;
-    if (copy_bytes) memcpy(out, ptr, copy_bytes);
+    if (copy_bytes) CC__BI_MEMCPY(out, ptr, copy_bytes);
     (void)cc_arena_release(arena, ptr);
     return out;
 }
@@ -1258,8 +1341,8 @@ static inline CCSlice cc_slice_concat2(CCSlice left, CCSlice right, CCArenaHost 
     CCSlice out = arena ? cc_arena_alloc_slice_bytes(arena, total) : cc_slice_empty();
     char *buf = (char *)out.ptr;
     if (total > 0 && !buf) return cc_slice_empty();
-    if (left.len > 0 && left.ptr) memcpy(buf, left.ptr, left.len);
-    if (right.len > 0 && right.ptr) memcpy(buf + left.len, right.ptr, right.len);
+    if (left.len > 0 && left.ptr) CC__BI_MEMCPY(buf, left.ptr, left.len);
+    if (right.len > 0 && right.ptr) CC__BI_MEMCPY(buf + left.len, right.ptr, right.len);
     return out;
 }
 
@@ -1279,6 +1362,7 @@ static inline CCSlice cc_slice_concat2(CCSlice left, CCSlice right, CCArenaHost 
  *      CCArenaCheckpoint cp;  cp.restore()    -> cc_arena_checkpoint_restore(&cp)
  *                                 cp.abandon()    -> cc_arena_checkpoint_abandon(&cp)
  *      CCArenaPool* p;        p.alloc()      -> cc_arena_pool_alloc(p)
+ *                                 p.alloc_local() -> cc_arena_pool_alloc_local(p)
  *      CCString s;            s.len()         -> cc_string_len(&s)
  *      CCNursery n;          n.wait()       -> cc_nursery_wait(n)
  *
@@ -1304,16 +1388,14 @@ static inline CCSlice cc_slice_concat2(CCSlice left, CCSlice right, CCArenaHost 
  * @comptime hook TU compiler defines CC_PARSER_MODE while still needing
  * this helper as a referenceable symbol for `.ufcs = ...` registrations.
  *
- * The name retains the historical `_cc_prefix_lower_c` suffix for
- * backwards compatibility with existing `.ufcs = ...` registrations that
- * spell it out explicitly; the `CC`-prefix case is now one of two shapes
- * it handles, not a hard requirement. */
+ * The `_cc_prefix_lower_c` suffix names both CC-prefixed and bare-user-type
+ * shapes; explicit `.ufcs = ...` registrations may spell it out. */
 static inline CCSlice cc_ufcs_generic_cc_prefix_lower_c(CCSlice recv_type,
                                                         CCSlice method,
                                                         CCSlice mode,
                                                         CCSliceArray argv,
                                                         CCSliceArray arg_types,
-                                                        CCArenaHost *arena) {
+                                                        CCArena arena) {
     const char *t;
     size_t tlen;
     size_t max_total;
@@ -1332,11 +1414,11 @@ static inline CCSlice cc_ufcs_generic_cc_prefix_lower_c(CCSlice recv_type,
     (void)arg_types;
     t = (const char *)recv_type.ptr;
     tlen = recv_type.len;
-    if (!t || tlen == 0 || !arena) return cc_slice_empty();
+    if (!t || tlen == 0 || !arena.p) return cc_slice_empty();
     /* Strip optional leading "struct " / "union " qualifiers that TCC
        occasionally reports for elaborated type names. */
-    if (tlen >= 7 && memcmp(t, "struct ", 7) == 0) { t += 7; tlen -= 7; }
-    else if (tlen >= 6 && memcmp(t, "union ", 6) == 0) { t += 6; tlen -= 6; }
+    if (tlen >= 7 && CC__BI_MEMCMP(t, "struct ", 7) == 0) { t += 7; tlen -= 7; }
+    else if (tlen >= 6 && CC__BI_MEMCMP(t, "union ", 6) == 0) { t += 6; tlen -= 6; }
     /* Strip trailing pointer stars and whitespace so both `CCFoo` and
        `CCFoo*` resolve to the same callee. */
     while (tlen > 0 && (t[tlen - 1] == '*' || t[tlen - 1] == ' ' || t[tlen - 1] == '\t')) tlen--;
@@ -1346,19 +1428,19 @@ static inline CCSlice cc_ufcs_generic_cc_prefix_lower_c(CCSlice recv_type,
        of appearance is preserved: `const volatile T*` → `const_volatile_…`. */
     for (;;) {
         while (tlen > 0 && (t[0] == ' ' || t[0] == '\t')) { t++; tlen--; }
-        if (tlen >= 6 && memcmp(t, "const", 5) == 0 &&
+        if (tlen >= 6 && CC__BI_MEMCMP(t, "const", 5) == 0 &&
             (t[5] == ' ' || t[5] == '\t')) {
             has_const = 1;
             t += 5; tlen -= 5;
             continue;
         }
-        if (tlen >= 9 && memcmp(t, "volatile", 8) == 0 &&
+        if (tlen >= 9 && CC__BI_MEMCMP(t, "volatile", 8) == 0 &&
             (t[8] == ' ' || t[8] == '\t')) {
             has_volatile = 1;
             t += 8; tlen -= 8;
             continue;
         }
-        if (tlen >= 9 && memcmp(t, "restrict", 8) == 0 &&
+        if (tlen >= 9 && CC__BI_MEMCMP(t, "restrict", 8) == 0 &&
             (t[8] == ' ' || t[8] == '\t')) {
             has_restrict = 1;
             t += 8; tlen -= 8;
@@ -1372,19 +1454,19 @@ static inline CCSlice cc_ufcs_generic_cc_prefix_lower_c(CCSlice recv_type,
     for (;;) {
         while (tlen > 0 && (t[tlen - 1] == ' ' || t[tlen - 1] == '\t')) tlen--;
         if (tlen >= 6 && (t[tlen - 6] == ' ' || t[tlen - 6] == '\t') &&
-            memcmp(t + tlen - 5, "const", 5) == 0) {
+            CC__BI_MEMCMP(t + tlen - 5, "const", 5) == 0) {
             has_const = 1;
             tlen -= 6;
             continue;
         }
         if (tlen >= 9 && (t[tlen - 9] == ' ' || t[tlen - 9] == '\t') &&
-            memcmp(t + tlen - 8, "volatile", 8) == 0) {
+            CC__BI_MEMCMP(t + tlen - 8, "volatile", 8) == 0) {
             has_volatile = 1;
             tlen -= 9;
             continue;
         }
         if (tlen >= 9 && (t[tlen - 9] == ' ' || t[tlen - 9] == '\t') &&
-            memcmp(t + tlen - 8, "restrict", 8) == 0) {
+            CC__BI_MEMCMP(t + tlen - 8, "restrict", 8) == 0) {
             has_restrict = 1;
             tlen -= 9;
             continue;
@@ -1420,17 +1502,17 @@ static inline CCSlice cc_ufcs_generic_cc_prefix_lower_c(CCSlice recv_type,
        their longer-prefix patterns win over `*` so we never even
        reach this helper for those — we list them defensively anyway
        so a future refactor that drops those hooks still compiles. */
-    if ((tlen == 6 && memcmp(t, "CCChan", 6) == 0) ||
-        (tlen >= 8 && memcmp(t, "CCChanTx", 8) == 0 &&
+    if ((tlen == 6 && CC__BI_MEMCMP(t, "CCChan", 6) == 0) ||
+        (tlen >= 8 && CC__BI_MEMCMP(t, "CCChanTx", 8) == 0 &&
          (tlen == 8 || t[8] == '_')) ||
-        (tlen >= 8 && memcmp(t, "CCChanRx", 8) == 0 &&
+        (tlen >= 8 && CC__BI_MEMCMP(t, "CCChanRx", 8) == 0 &&
          (tlen == 8 || t[8] == '_')) ||
         /* Stdlib container families use `Type_method` (CCVec_int_push,
            Map_K_V_insert, ArrayMap_K_V_insert), not snake_case. */
-        (tlen >= 6 && memcmp(t, "CCVec_", 6) == 0) ||
-        (tlen >= 9 && memcmp(t, "ArrayMap_", 9) == 0) ||
-        (tlen >= 4 && memcmp(t, "Map_", 4) == 0) ||
-        (tlen >= 9 && memcmp(t, "CCResult_", 9) == 0)) {
+        (tlen >= 6 && CC__BI_MEMCMP(t, "CCVec_", 6) == 0) ||
+        (tlen >= 9 && CC__BI_MEMCMP(t, "ArrayMap_", 9) == 0) ||
+        (tlen >= 4 && CC__BI_MEMCMP(t, "Map_", 4) == 0) ||
+        (tlen >= 9 && CC__BI_MEMCMP(t, "CCResult_", 9) == 0)) {
         /* Inline the CC_UFCS_PASS_TAG literal: cc_ufcs.cch (which defines
            the macro + helper) includes this header, so we can't reference
            cc_ufcs_pass() here without a circular include. */
@@ -1441,20 +1523,20 @@ static inline CCSlice cc_ufcs_generic_cc_prefix_lower_c(CCSlice recv_type,
        `cc_` + `_` separator + method. */
     max_total = 6 /* const_ */ + 9 /* volatile_ */ + 9 /* restrict_ */ +
                 3 /* "cc_" */ + tlen * 2 + 1 /* "_" */ + method.len;
-    out = cc_arena_alloc_slice_bytes(arena, max_total);
+    out = cc_arena_alloc_slice_bytes(CC__ARENA_HOST(arena), max_total);
     buf = (char *)out.ptr;
     if (!buf) return cc_slice_empty();
     wi = 0;
     if (has_const) {
-        memcpy(buf + wi, "const_", 6);
+        CC__BI_MEMCPY(buf + wi, "const_", 6);
         wi += 6;
     }
     if (has_volatile) {
-        memcpy(buf + wi, "volatile_", 9);
+        CC__BI_MEMCPY(buf + wi, "volatile_", 9);
         wi += 9;
     }
     if (has_restrict) {
-        memcpy(buf + wi, "restrict_", 9);
+        CC__BI_MEMCPY(buf + wi, "restrict_", 9);
         wi += 9;
     }
     if (has_cc_prefix) {
@@ -1485,7 +1567,7 @@ static inline CCSlice cc_ufcs_generic_cc_prefix_lower_c(CCSlice recv_type,
     if (wi > 0 && buf[wi - 1] == '_') wi--;
     buf[wi++] = '_';
     if (method.len > 0 && method.ptr) {
-        memcpy(buf + wi, method.ptr, method.len);
+        CC__BI_MEMCPY(buf + wi, method.ptr, method.len);
         wi += method.len;
     }
     total = wi;
@@ -1502,7 +1584,7 @@ static inline CCSlice cc_ufcs_generic_cc_slice_family_c(CCSlice recv_type,
                                                         CCSlice mode,
                                                         CCSliceArray argv,
                                                         CCSliceArray arg_types,
-                                                        CCArenaHost *arena) {
+                                                        CCArena arena) {
     static const char prefix[] = "cc_slice_";
     size_t prefix_len = sizeof(prefix) - 1;
     size_t total;
@@ -1512,25 +1594,21 @@ static inline CCSlice cc_ufcs_generic_cc_slice_family_c(CCSlice recv_type,
     (void)mode;
     (void)argv;
     (void)arg_types;
-    if (!arena) return cc_slice_empty();
+    if (!arena.p) return cc_slice_empty();
     total = prefix_len + method.len;
-    out = cc_arena_alloc_slice_bytes(arena, total);
+    out = cc_arena_alloc_slice_bytes(CC__ARENA_HOST(arena), total);
     buf = (char *)out.ptr;
     if (!buf) return cc_slice_empty();
-    memcpy(buf, prefix, prefix_len);
-    if (method.len > 0 && method.ptr) memcpy(buf + prefix_len, method.ptr, method.len);
+    CC__BI_MEMCPY(buf, prefix, prefix_len);
+    if (method.len > 0 && method.ptr) CC__BI_MEMCPY(buf + prefix_len, method.ptr, method.len);
     return out;
 }
 
 /* ------------------------------------------------------------
  * Size-helper sugar.
  *
- * Lives next to the arena constructor — every call site that
- * allocates an arena reads better with `kilobytes(8)` than
- * `8 * 1024`, and it's silly to require a `prelude.cch` include
- * just for this.  Smoke tests that include only `cc_arena.cch`
- * (e.g. `tests/cc_dyn_vec_basic_smoke.ccs`) get the helpers
- * automatically.
+ * Lives next to the arena constructor — `kilobytes(8)` reads better than
+ * `8 * 1024` at every call site that allocates an arena.
  * ------------------------------------------------------------ */
 
 static inline size_t kilobytes(size_t n) {
@@ -1572,19 +1650,22 @@ static inline size_t gigabytes(size_t n) {
 #endif
 
 /* Heap-rooted arena: one malloc (host at the front, L1 after). block_max
- * defaults to 4, overflow after the slab budget. Create always returns a
- * handle; OOM is empty (first alloc fails). CCS Result face: cc_arena_try_heap. */
-static inline CCResult_CCArena_CCError cc_arena_try_heap(size_t bytes) {
+ * defaults to 4, overflow after the slab budget. Create never fails: the
+ * handle is always returned. Malloc failure is an empty handle; first
+ * alloc is the OOM. `cc_arena_try_heap` is the C face that reports that
+ * malloc. CCS birth is `CCArena a = cc_arena_heap(n) @destroy`. */
+#ifdef CC__ARENA_SYS
+CC__ARENA_SYS CCResult_CCArena_CCError cc_arena_try_heap(size_t bytes) {
     size_t total;
     void *raw;
     CCArenaHost *h;
     if (bytes == 0) bytes = 1;
     total = CC_ARENA_REGION_BYTES(bytes);
-    raw = malloc(total);
+    raw = cc_malloc(total);
     if (!raw)
         return cc__arena_err(CC_ERR_OUT_OF_MEMORY, "cc_arena_heap: out of memory");
     if (cc_arena_init_region(raw, total, CC_ARENA_DEFAULT_BLOCK_MAX) != 0) {
-        free(raw);
+        cc_free(raw);
         return cc__arena_err(CC_ERR_INVALID_ARG, "cc_arena_heap: buffer init failed");
     }
     h = (CCArenaHost *)raw;
@@ -1592,6 +1673,10 @@ static inline CCResult_CCArena_CCError cc_arena_try_heap(size_t bytes) {
                  | CC_ARENA_FLAG_REGION_OWNED;
     return cc__arena_ok(cc_arena_handle(h));
 }
+#else
+CCResult_CCArena_CCError cc_arena_try_heap(size_t bytes);
+#endif
+
 
 static inline CCArena cc_arena_heap(size_t bytes) {
     CCResult_CCArena_CCError r = cc_arena_try_heap(bytes);
@@ -1639,11 +1724,12 @@ static inline int cc_arena_init_buffer(CCArenaHost *h, void *buffer, size_t capa
     return 0;
 }
 
-/* 3-arg expert path: overlay the host at byte 0 of `buffer`. `capacity`
- * is the whole region; usable L1 is capacity - prefix. GROWABLE / N
- * slabs as `block_max`. Size with CC_ARENA_REGION_BYTES(N) for N usable
- * bytes. CCS 2-arg `@create(buf, cap)` is bind_buffer (frame host, whole
- * buffer is L1). */
+/* 3-arg expert path: overlay the host at the first aligned address in
+ * `buffer`. `capacity` is the whole region; usable L1 is what remains
+ * after pad + prefix. GROWABLE / N slabs as `block_max`. Size with
+ * CC_ARENA_REGION_BYTES(N) for N usable bytes (plus align-1 if `buffer`
+ * may be unaligned). CCS 2-arg `@create(buf, cap)` is bind_buffer
+ * (frame host, whole buffer is L1) — no overlay. */
 static inline CCArena cc_arena_create_buffer(void *buffer, size_t capacity,
                                             unsigned block_max) {
     return cc_arena_wrap_region(buffer, capacity, block_max);
@@ -1652,21 +1738,26 @@ static inline CCArena cc_arena_create_buffer(void *buffer, size_t capacity,
 /* C / last-good 2-arg folklore: malloced host + caller L1, FIXED (no
  * overlay). CCS `@create(buf, cap)` is decl-form `cc_arena_bind_buffer`.
  * Tiny buffers (smaller than the host prefix) stay valid L1 here. */
-static inline CCArena cc_arena_fixed_buffer(void *buffer, size_t capacity) {
+#ifdef CC__ARENA_SYS
+CC__ARENA_SYS CCArena cc_arena_fixed_buffer(void *buffer, size_t capacity) {
     CCArenaHost *h;
     if (!buffer || capacity == 0)
         return cc_arena_handle(NULL);
-    h = (CCArenaHost *)malloc(sizeof(CCArenaHost));
+    h = (CCArenaHost *)cc_malloc(sizeof(CCArenaHost));
     if (!h)
         return cc_arena_handle(NULL);
-    memset(h, 0, sizeof(*h));
+    CC__BI_MEMSET(h, 0, sizeof(*h));
     if (cc_arena_init_buffer(h, buffer, capacity, CC_ARENA_FIXED) != 0) {
-        free(h);
+        cc_free(h);
         return cc_arena_handle(NULL);
     }
     h->_flags |= CC_ARENA_FLAG_HOST_OWNED;
     return cc_arena_handle(h);
 }
+#else
+CCArena cc_arena_fixed_buffer(void *buffer, size_t capacity);
+#endif
+
 
 /* Overlay host on `buffer`. `h` is ignored (host lives in the region). */
 static inline CCArena cc_arena_wrap_buffer(CCArenaHost *h, void *buffer, size_t capacity,
@@ -1746,7 +1837,8 @@ static inline CCArena cc_arena_attach_buffer(CCArenaHost *h, void *buf, size_t n
 #define CC_ARENA_POOL_STACK(name, elem_size, nbytes) \
     cc_arena_pool_stack(name, elem_size, nbytes)
 
-static inline bool cc_arena_release(CCArenaHost* arena, void* ptr) {
+#ifdef CC__ARENA_SYS
+CC__ARENA_SYS bool cc_arena_release(CCArenaHost* arena, void* ptr) {
     CCArenaHost* block;
     if (!arena || !ptr) return false;
 
@@ -1817,7 +1909,7 @@ static inline bool cc_arena_release(CCArenaHost* arena, void* ptr) {
                 }
             }
             cc__arena_meta_unlock(arena);
-            free(raw);
+            cc_free(raw);
             return true;
         }
     }
@@ -1825,6 +1917,10 @@ static inline bool cc_arena_release(CCArenaHost* arena, void* ptr) {
     cc__arena_meta_unlock(arena);
     return false;
 }
+#else
+bool cc_arena_release(CCArenaHost* arena, void* ptr);
+#endif
+
 
 /* Drop this host's parent record so a later walk skips it. Writes the
  * parent's node under that parent's meta_lock (retry if re-homed). */
@@ -1896,7 +1992,8 @@ static inline void cc__arena_children_run(CCArenaHost *parent, CCAttachNode *n) 
  * heap-owned L1. Never frees a stack or caller L1. HOST_INLINE / HOST_OWNED
  * free the host pointer; a stack host is left in place (zeroed). Individual
  * cc_arena_release remains for mid-lifetime reclaim. */
-static inline void cc_arena_free(CCArenaHost* a) {
+#ifdef CC__ARENA_SYS
+CC__ARENA_SYS void cc_arena_free(CCArenaHost* a) {
     CCArenaHost *cur;
     uint8_t* base;
     unsigned int flags;
@@ -1936,7 +2033,7 @@ static inline void cc_arena_free(CCArenaHost* a) {
         CC_ATOMIC_STORE(&a->overflow_bytes, 0);
         cc__arena_meta_unlock(a);
         if (loans) {
-            fprintf(stderr, "cc_arena_free: %zu outstanding checkpoint loan(s)\n",
+            cc_eprintf( "cc_arena_free: %zu outstanding checkpoint loan(s)\n",
                     loans);
         }
 
@@ -1946,21 +2043,25 @@ static inline void cc_arena_free(CCArenaHost* a) {
             CCArenaHost *next = cur->prev;
             if (cur->base && (cur->_flags & CC_ARENA_FLAG_HEAP_OWNED) &&
                 cur->base != inline_l1) {
-                free(cur->base);
+                cc_free(cur->base);
             }
-            free(cur);
+            cc_free(cur);
             cur = next;
         }
 
         if (base && (flags & CC_ARENA_FLAG_HEAP_OWNED) && base != inline_l1)
-            free(base);
-        /* REGION_OWNED: heap ctor malloced the overlay. HOST_OWNED: legacy
-         * separately malloced host. Grow sets HEAP_OWNED on the root for the
+            cc_free(base);
+        /* REGION_OWNED: heap ctor malloced the overlay. HOST_OWNED:
+         * separately malloced host overlay. Grow sets HEAP_OWNED on the root for the
          * current slab — that must not free a stack/caller overlay. */
         if (flags & (CC_ARENA_FLAG_REGION_OWNED | CC_ARENA_FLAG_HOST_OWNED))
-            free(a);
+            cc_free(a);
     }
 }
+#else
+void cc_arena_free(CCArenaHost* a);
+#endif
+
 
 /* Teardown-idempotent: second destroy on a nulled binding is a no-op.
  * Use of a dead handle after this is fail-closed at the next Host* peel. */
@@ -2075,17 +2176,40 @@ static inline int cc__arena_attach_host(CCArenaHost *parent, CCArenaHost *child)
     return 0;
 }
 
-/* Default L1 for heap-backed children (create_arena(owner, 0)). */
+/* Default L1 for heap-backed children (create_arena(owner, 0) /
+ * create_heap_arena(owner, 0)). */
 #ifndef CC_ARENA_CHILD_DEFAULT_BYTES
 #define CC_ARENA_CHILD_DEFAULT_BYTES 4096
 #endif
 
+/* Heap-backed child with a sized L1. Movable (adopt/detach work). bytes == 0
+ * uses CC_ARENA_CHILD_DEFAULT_BYTES. The owner holds the destroy record. */
+static inline CCResult_CCArena_CCError create_heap_arena(CCArenaHost* owner, size_t bytes) {
+    if (!owner || !owner->base)
+        return cc__arena_err(CC_ERR_INVALID_ARG, "create_heap_arena: owner arena is dead");
+    if (bytes == 0) bytes = CC_ARENA_CHILD_DEFAULT_BYTES;
+    {
+        CCResult_CCArena_CCError r = cc_arena_try_heap(bytes);
+        if (!r.ok) return r;
+        if (cc__arena_attach_host(owner, r.u.value.a) != 0) {
+            cc_arena_destroy(&r.u.value);
+            return cc__arena_err(CC_ERR_INVALID_ARG, "create_heap_arena: attach failed");
+        }
+        return r;
+    }
+}
+
+static inline CCResult_CCArena_CCError cc_arena_create_heap_arena(CCArenaHost* owner,
+                                                                size_t bytes) {
+    return create_heap_arena(owner, bytes);
+}
+
 /* Child-arena constructor: a destroy record is attached so the child dies
  * when the owner does. The size selects the child's storage class:
  *   n > 0  — one owner region (host at front, n usable L1): storage-bound.
- *   n == 0 — heap-backed child (one malloc): movable (adopt/detach work).
- * Both grow to heap L2 after the L1. Birth is Result — never a dummy empty
- * handle. No scope sigil: the owner holds the obligation. */
+ *   n == 0 — create_heap_arena(owner, 0): movable.
+ * Both grow to heap overflow after the L1. Birth is Result — never a dummy
+ * empty handle. No scope sigil: the owner holds the obligation. */
 static inline CCResult_CCArena_CCError create_arena(CCArenaHost* owner, size_t n) {
     CCArenaHost* h;
     if (!owner || !owner->base)
@@ -2108,15 +2232,7 @@ static inline CCResult_CCArena_CCError create_arena(CCArenaHost* owner, size_t n
         }
         return cc__arena_ok(cc_arena_handle(h));
     }
-    {
-        CCResult_CCArena_CCError r = cc_arena_try_heap(CC_ARENA_CHILD_DEFAULT_BYTES);
-        if (!r.ok) return r;
-        if (cc__arena_attach_host(owner, r.u.value.a) != 0) {
-            cc_arena_destroy(&r.u.value);
-            return cc__arena_err(CC_ERR_INVALID_ARG, "create_arena: attach failed");
-        }
-        return r;
-    }
+    return create_heap_arena(owner, 0);
 }
 
 /* UFCS alias: `owner.create_arena(n)` / `owner->create_arena(n)` compose
@@ -2176,7 +2292,8 @@ static inline CCResult_CCArena_CCError cc_arena_adopt(CCArena* parent, CCArena* 
  * Provenance bumps so pre-reset slices are stale.
  * Attached children are contents: they die at reset like every other
  * allocation (their handles live in the slabs being rewound). */
-static inline void cc_arena_reset(CCArenaHost *arena) {
+#ifdef CC__ARENA_SYS
+CC__ARENA_SYS void cc_arena_reset(CCArenaHost *arena) {
     CCArenaHost *to_free = NULL;
     CCArenaHost *tail = NULL;
     uint8_t *free_root = NULL;
@@ -2227,21 +2344,25 @@ static inline void cc_arena_reset(CCArenaHost *arena) {
                        | CC_ARENA_FLAG_WALKING);
     cc__arena_meta_unlock(arena);
     if (loans) {
-        fprintf(stderr, "cc_arena_reset: %zu outstanding checkpoint loan(s)\n",
+        cc_eprintf( "cc_arena_reset: %zu outstanding checkpoint loan(s)\n",
                 loans);
     }
 
     cc__arena_ovf_free_stolen(ovf_heads, ovf_chunks);
 
-    if (free_root) free(free_root);
+    if (free_root) cc_free(free_root);
     while (to_free) {
         CCArenaHost *next = to_free->prev;
         if (to_free != tail)
             cc__arena_maybe_free_slab(arena, to_free->base, to_free->_flags);
-        free(to_free);
+        cc_free(to_free);
         to_free = next;
     }
 }
+#else
+void cc_arena_reset(CCArenaHost *arena);
+#endif
+
 
 /* Capture current arena allocation state (including block index for
  * cross-block restore). Restore is LIFO: only the latest armed loan
@@ -2296,7 +2417,8 @@ static inline CCArenaCheckpoint cc_arena_checkpoint(CCArenaHost* arena) {
 // Returns false (and does not mutate) on a null handle, a slab hole, a
 // punctured overflow keep-set, attached children, a non-top loan, or a
 // checkpoint that would advance the tip.
-static inline bool cc_arena_restore(CCArenaCheckpoint checkpoint) {
+#ifdef CC__ARENA_SYS
+CC__ARENA_SYS bool cc_arena_restore(CCArenaCheckpoint checkpoint) {
     CCArenaHost* arena = checkpoint.arena;
     uint8_t *free_root = NULL;
     CCArenaHost *free_chain = NULL;
@@ -2387,16 +2509,20 @@ static inline bool cc_arena_restore(CCArenaCheckpoint checkpoint) {
 
     cc__arena_ovf_free_stolen(kill_heads, kill_chunks);
 
-    if (free_root) free(free_root);
+    if (free_root) cc_free(free_root);
     while (free_chain) {
         CCArenaHost *next = free_chain->prev;
         cc__arena_maybe_free_slab(arena, free_chain->base, free_chain->_flags);
-        free(free_chain);
+        cc_free(free_chain);
         free_chain = next;
     }
-    if (free_target) free(free_target);
+    if (free_target) cc_free(free_target);
     return true;
 }
+#else
+bool cc_arena_restore(CCArenaCheckpoint checkpoint);
+#endif
+
 
 /* Pointer-taking UFCS wrapper: `cp.restore()` lowers to
    cc_arena_checkpoint_restore(&cp) via the smart snake_case generic
@@ -2530,7 +2656,8 @@ static inline size_t cc_arena_remaining(const CCArenaHost *arena) {
 /* --- Committed backing (for memory accounting / diagnostics) ----------------
  * Slab chain: every heap-owned bump block (current root + each extent in ->prev).
  * Overflow: sum of raw malloc sizes for live heap-overflow nodes on this root.
- * Extent meta: malloc(CCArenaHost) wrappers for retired slabs (not the root struct).
+ * Extent meta: cc_malloc(CCArenaHost) wrappers for previous slabs in the
+ * chain (not the root struct).
  * Gross is the arena-owned malloc total from these sources (excludes
  * caller-owned initial buffers without HEAP_OWNED). Bump accounting uses
  * slab membership (pointer range) + per-slab live_allocs, not per-alloc nodes. */
@@ -2608,27 +2735,32 @@ static inline CCSlice cc_arena_alloc_slice(CCArenaHost *arena, size_t elem_size,
 static inline bool cc_slice_is_from_arena_epoch(CCSlice slice, const CCArenaHost *arena) {
     uint64_t e;
     if (!arena || cc_slice_is_untracked(slice)) return false;
-    e = cc_slice_alloc_id(slice.id);
+    e = cc_slice_id_epoch(slice.id);
     return e >= arena->epoch_floor && e <= arena->provenance;
 }
 
 /* Debug belt: abort if a tracked slice's alloc epoch does not match the arena.
  * Comptime capture/reset rules are the primary enforcement; this is for cases
  * analysis cannot see. No-op unless CC_DEBUG_ARENA_PROVENANCE is non-zero. */
-static inline void cc_slice_debug_assert_arena_epoch(CCSlice slice, const CCArenaHost *arena) {
+#ifdef CC__ARENA_SYS
+CC__ARENA_SYS void cc_slice_debug_assert_arena_epoch(CCSlice slice, const CCArenaHost *arena) {
 #if defined(CC_DEBUG_ARENA_PROVENANCE) && CC_DEBUG_ARENA_PROVENANCE
     if (!arena || cc_slice_is_untracked(slice)) return;
     if (!cc_slice_is_from_arena_epoch(slice, arena)) {
-        fprintf(stderr, "CC: stale arena slice (id epoch %llu, arena epoch %llu)\n",
+        cc_eprintf( "CC: stale arena slice (id epoch %llu, arena epoch %llu)\n",
                 (unsigned long long)cc_slice_alloc_id(slice.id),
                 (unsigned long long)arena->provenance);
-        abort();
+        cc_abort();
     }
 #else
     (void)slice;
     (void)arena;
 #endif
 }
+#else
+void cc_slice_debug_assert_arena_epoch(CCSlice slice, const CCArenaHost *arena);
+#endif
+
 
 /* CCArena's UFCS dispatch is covered by the global `*` registration
  * (see end of this file).  Only the lifecycle hooks (`.create` /
@@ -2750,6 +2882,32 @@ static inline CCArena cc_arena_pool_detach(CCArenaPool* p) {
     return a;
 }
 
+/* Exclusive-owner pool: Treiber head is a plain store; bump is
+ * alloc_local_grow. Caller must be the only mutator of this pool (the
+ * shard exclusive in wstore3). Shared sites stay on alloc/free. */
+static inline void* cc_arena_pool_alloc_local(CCArenaPool* p) {
+    uint64_t head;
+    void* item;
+    if (!p) return NULL;
+    head = cc_atomic_load(&p->freelist);
+    item = cc__pool_head_ptr(head);
+    if (item) {
+        cc_atomic_store(&p->freelist,
+                        cc__pool_head_pack(*(void**)item, head >> CC__POOL_TAG_SHIFT));
+        return item;
+    }
+    return cc_arena_alloc_local_grow(p->arena, p->elem_size, sizeof(void*));
+}
+
+static inline void cc_arena_pool_free_local(CCArenaPool* p, void* ptr) {
+    uint64_t head;
+    if (!p || !ptr) return;
+    head = cc_atomic_load(&p->freelist);
+    *(void**)ptr = cc__pool_head_ptr(head);
+    cc_atomic_store(&p->freelist,
+                    cc__pool_head_pack(ptr, head >> CC__POOL_TAG_SHIFT));
+}
+
 // Allocate one element from the pool (reuses a freed slot if available).
 // Lock-free: Treiber-stack pop with ABA-safe tagged head.
 static inline void* cc_arena_pool_alloc(CCArenaPool* p) {
@@ -2843,9 +3001,9 @@ static inline void* cc_arena_pool_iter_next(CCArenaPoolIter* it) {
  *                 while bare user types like `RedisConn` map directly to
  *                 `redis_conn_<method>` with no synthetic prefix).
  * Types whose C API diverges further (CCNursery, CCChanTx/Rx families with
- * renamed methods) can still register their own specific pattern with a
- * bespoke rewrite to win over the generic default.  Per-type `.ufcs = ...`
- * opt-ins in the std headers are no longer needed and have been removed. */
+ * renamed methods) register a specific pattern with a bespoke rewrite to
+ * win over the generic default. */
+
 
 
 
@@ -2943,6 +3101,7 @@ static inline void cc__arena_pool_init_impl(CCArenaPool *p, CCArenaHost *a, size
 #define cc_arena_valid(a) cc__arena_valid_impl(CC__ARENA_HOST(a))
 #define cc_arena_adopt(p, s) cc__arena_adopt_impl((p), (s))
 #define cc_arena_create_arena(a, n) create_arena(CC__ARENA_HOST(a), n)
+#define cc_arena_create_heap_arena(a, n) create_heap_arena(CC__ARENA_HOST(a), n)
 #define cc_arena_create_pool(a, sz) create_pool(CC__ARENA_HOST(a), sz)
 #define cc_arena_free(x) _Generic((x), \
     struct CCArena *: cc__arena_free_handlep, \
@@ -3005,5 +3164,10 @@ static inline int cc__arena_would_fit_impl(const CCArenaHost *a, size_t n, size_
     cc__arena_realloc_local_grow_impl(CC__ARENA_HOST(a), (p), (os), (ns), (al))
 #define cc__arena_find_block(a, p) cc__arena_find_block_impl(CC__ARENA_HOST(a), (p))
 #define cc_arena_would_fit(a, n, al) cc__arena_would_fit_impl(CC__ARENA_HOST(a), (n), (al))
+
+#undef CC__BI_MEMCPY
+#undef CC__BI_MEMMOVE
+#undef CC__BI_MEMSET
+#undef CC__BI_MEMCMP
 
 #endif // CC_ARENA_H

@@ -9,11 +9,7 @@
 
 #include <ccc/cc_arena.h>
 #include <ccc/cc_result.h>
-#include <errno.h>
-#include <math.h>
 #include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
 
 #ifndef CCResult_CCSlice_CCError_DEFINED
 #define CCResult_CCSlice_CCError_DEFINED 1
@@ -50,21 +46,19 @@ CC_DECL_RESULT_SPEC(CCResult_uint64_t_CCError, uint64_t, CCError)
 CC_DECL_RESULT_SPEC(CCResult_double_CCError, double, CCError)
 #endif
 
-static inline CCResult_CCSlice_CCError cc_slice_clone_into(CCSlice* src, CCArena arena) {
-    if (!src || !cc_arena_is_live(arena)) {
-        return cc_err_CCResult_CCSlice_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "clone_into without arena"));
-    }
-    if (src->len == 0) {
-        return cc_ok_CCResult_CCSlice_CCError(cc_slice_empty());
-    }
+/* Bodies in runtime/slice_mem.c — this face does not include string.h. */
+CCResult_CCSlice_CCError cc_slice_clone_into(CCSlice* src, CCArena arena);
 
-    CCSlice stable = cc_arena_alloc_slice_bytes(arena, src->len);
-    if (!stable.ptr) {
-        return cc_err_CCResult_CCSlice_CCError(CC_ERROR(CC_ERR_OUT_OF_MEMORY, "clone slice"));
-    }
+/* `to_c`: `char[:0]` with `is_cstr`. Copy into `arena` only when the bit
+ * is clear (or the view has no pointer). `to_cstr` is that view's `.ptr`. */
+CCResult_CCSlice_CCError cc_slice_to_c(CCSlice* s, CCArena arena);
+CCResult_charptr_CCError cc_slice_to_cstr(CCSlice* s, CCArena arena);
 
-    memcpy(stable.ptr, src->ptr, src->len);
-    return cc_ok_CCResult_CCSlice_CCError(stable);
+static inline CCResult_CCSlice_CCError CCSlice_to_c(CCSlice* s, CCArena arena) {
+    return cc_slice_to_c(s, arena);
+}
+static inline CCResult_charptr_CCError CCSlice_to_cstr(CCSlice* s, CCArena arena) {
+    return cc_slice_to_cstr(s, arena);
 }
 
 /* Ensure `*s` is stable in `arena` for a later release of its source lifetime.
@@ -91,23 +85,7 @@ static inline CCResult_bool_CCError CCSlice_materialize_in(CCSlice* s, CCArena a
     return cc_slice_materialize_in(s, arena);
 }
 
-static inline CCResult_CCSliceHdr_CCError cc_slice_hdr_clone_into(CCSliceHdr* src, CCArena arena) {
-    if (!src || !cc_arena_is_live(arena)) {
-        return cc_err_CCResult_CCSliceHdr_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "clone_into without arena"));
-    }
-    if (src->len == 0) {
-        CCSliceHdr empty = {0};
-        return cc_ok_CCResult_CCSliceHdr_CCError(empty);
-    }
-
-    CCSlice stable = cc_arena_alloc_slice_bytes(arena, src->len);
-    if (!stable.ptr) {
-        return cc_err_CCResult_CCSliceHdr_CCError(CC_ERROR(CC_ERR_OUT_OF_MEMORY, "clone slice hdr"));
-    }
-
-    memcpy(stable.ptr, src->ptr, src->len);
-    return cc_ok_CCResult_CCSliceHdr_CCError((CCSliceHdr){ .ptr = stable.ptr, .len = stable.len });
-}
+CCResult_CCSliceHdr_CCError cc_slice_hdr_clone_into(CCSliceHdr* src, CCArena arena);
 
 static inline CCResult_CCSliceHdr_CCError CCSliceHdr_clone_into(CCSliceHdr* src, CCArena arena) {
     return cc_slice_hdr_clone_into(src, arena);
@@ -183,42 +161,8 @@ static inline CCResult_uint64_t_CCError cc_slice_to_u64(const CCSlice* s_ptr) {
     return cc_ok_CCResult_uint64_t_CCError(value);
 }
 
-/* strtod needs a NUL-terminated buffer; slice length is caller controlled,
- * so bound the stack copy and take a malloc round-trip for pathological
- * lengths (same policy as cc__slice_parse_buf in string.cch). */
-#ifndef CC_SLICE_TO_F64_STACK_MAX
-#define CC_SLICE_TO_F64_STACK_MAX 256
-#endif
-
-static inline CCResult_double_CCError cc_slice_to_f64(const CCSlice* s_ptr) {
-    CCSlice s = s_ptr ? *s_ptr : cc_slice_empty();
-    char stack_buf[CC_SLICE_TO_F64_STACK_MAX];
-    char* buf;
-    char* end = NULL;
-    double v;
-    bool consumed_all, range;
-    if (!s.ptr || s.len == 0) {
-        return cc_err_CCResult_double_CCError(CC_ERROR(CC_ERR_PARSE, "to_f64: empty input"));
-    }
-    buf = (s.len + 1 <= sizeof(stack_buf)) ? stack_buf : (char*)malloc(s.len + 1);
-    if (!buf) {
-        return cc_err_CCResult_double_CCError(CC_ERROR(CC_ERR_OUT_OF_MEMORY, "to_f64: buffer"));
-    }
-    memcpy(buf, s.ptr, s.len);
-    buf[s.len] = '\0';
-    errno = 0;
-    v = strtod(buf, &end);
-    consumed_all = (end == buf + s.len);
-    range = ((v == HUGE_VAL || v == -HUGE_VAL) && errno == ERANGE);
-    if (buf != stack_buf) free(buf);
-    if (!consumed_all) {
-        return cc_err_CCResult_double_CCError(CC_ERROR(CC_ERR_PARSE, "to_f64: not a number"));
-    }
-    if (range) {
-        return cc_err_CCResult_double_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "to_f64: out of range"));
-    }
-    return cc_ok_CCResult_double_CCError(v);
-}
+/* strtod + optional malloc for long inputs: runtime/slice_mem.c. */
+CCResult_double_CCError cc_slice_to_f64(const CCSlice* s_ptr);
 
 /*
  * Overflow-checked int64 arithmetic (spec/draft_variants.md §9.3).
@@ -243,6 +187,9 @@ static inline CCResult_char_CCError cc_slice_get_checked(CCSlice* s, size_t idx)
     if (!s || !s->ptr || idx >= s->len) {
         return cc_err_CCResult_char_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "slice get: index out of bounds"));
     }
+    if (cc_slice_grower_stale(s->id)) {
+        return cc_err_CCResult_char_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "slice: backing moved"));
+    }
     return cc_ok_CCResult_char_CCError(((char*)s->ptr)[idx]);
 }
 static inline CCResult_char_CCError CCSlice_get_checked(CCSlice* s, size_t idx) {
@@ -260,6 +207,9 @@ static inline CCResult_char_CCError CCSlice_at(CCSlice* s, size_t idx) {
 static inline CCResult_bool_CCError cc_slice_set(CCSlice* s, size_t idx, char c) {
     if (!s || !s->ptr || idx >= s->len) {
         return cc_err_CCResult_bool_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "slice set: index out of bounds"));
+    }
+    if (cc_slice_grower_stale(s->id)) {
+        return cc_err_CCResult_bool_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "slice: backing moved"));
     }
     ((char*)s->ptr)[idx] = c;
     return cc_ok_CCResult_bool_CCError(true);
@@ -299,6 +249,23 @@ static inline CCResult_bool_CCError CCSliceUnique_truncate(CCSliceUnique* s, siz
     return cc_slice_truncate((CCSlice*)s, n);
 }
 
+/* Dest-bulk. Bodies live in runtime/slice_mem.c so this header does not
+ * pull memcpy/memmove/memset into user TUs. UFCS: dst.copy(src) !>,
+ * dst.copy_overlap(src) !> (overlap-safe copy; source stays live).
+ * Ownership transfer is cc_move / return / send_take, not dest-bulk. */
+CCResult_bool_CCError cc_slice_copy(CCSlice* dst, CCSlice src);
+CCResult_bool_CCError cc_slice_copy_overlap(CCSlice* dst, CCSlice src);
+CCResult_bool_CCError cc_slice_fill(CCSlice* dst, char c);
+static inline CCResult_bool_CCError CCSlice_copy(CCSlice* dst, CCSlice src) {
+    return cc_slice_copy(dst, src);
+}
+static inline CCResult_bool_CCError CCSlice_copy_overlap(CCSlice* dst, CCSlice src) {
+    return cc_slice_copy_overlap(dst, src);
+}
+static inline CCResult_bool_CCError CCSlice_fill(CCSlice* dst, char c) {
+    return cc_slice_fill(dst, c);
+}
+
 /*
  * UTF-8 bytes → Unicode scalar values (codepoints), arena-backed.
  *
@@ -322,96 +289,7 @@ CC_DECL_RESULT_SPEC(CCResult_CCSlice_uint32_t_CCError, CCSlice_uint32_t, CCError
 CC_DECL_RESULT_SPEC(CCResult_CCSlice_uint32_t_CCError, CCSlice_uint32_t, CCError)
 #endif
 
-static inline CCResult_CCSlice_uint32_t_CCError cc_slice_utf8_codepoints(const CCSlice *s_ptr, CCArena arena) {
-    CCSlice s = s_ptr ? *s_ptr : cc_slice_empty();
-    const unsigned char *p = (const unsigned char *)s.ptr;
-    size_t i = 0, n = 0;
-    uint32_t *cp;
-    CCSlice base;
-    CCSlice_uint32_t out;
-    if (!cc_arena_is_live(arena)) {
-        return cc_err_CCResult_CCSlice_uint32_t_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "utf8_codepoints without arena"));
-    }
-    if (s.len == 0) {
-        memset(&out, 0, sizeof(out));
-        return cc_ok_CCResult_CCSlice_uint32_t_CCError(out);
-    }
-    if (!p) {
-        return cc_err_CCResult_CCSlice_uint32_t_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "utf8_codepoints: null pointer"));
-    }
-    base = cc_arena_alloc_slice(arena, sizeof(uint32_t), s.len, _Alignof(uint32_t));
-    if (!base.ptr) {
-        return cc_err_CCResult_CCSlice_uint32_t_CCError(CC_ERROR(CC_ERR_OUT_OF_MEMORY, "utf8_codepoints"));
-    }
-    cp = (uint32_t *)base.ptr;
-    /* ASCII prefix in 8-byte gulps: one wide high-bit test, then a fixed
-     * widen the compiler unrolls. */
-    while (i + 8 <= s.len) {
-        uint64_t w;
-        memcpy(&w, p + i, 8);
-        if (w & 0x8080808080808080ull) break;
-        for (size_t k = 0; k < 8; k++) cp[n + k] = p[i + k];
-        n += 8;
-        i += 8;
-    }
-    while (i < s.len && p[i] < 0x80) cp[n++] = p[i++];
-    while (i < s.len) {
-        unsigned char c = p[i];
-        uint32_t v;
-        size_t more;
-        size_t k;
-        if (c < 0x80) {
-            cp[n++] = c;
-            i++;
-            continue;
-        }
-        if (c < 0xC2) {
-            return cc_err_CCResult_CCSlice_uint32_t_CCError(CC_ERROR(CC_ERR_PARSE, "utf8_codepoints: invalid leading byte"));
-        } else if (c < 0xE0) {
-            v = c & 0x1Fu;
-            more = 1;
-        } else if (c < 0xF0) {
-            v = c & 0x0Fu;
-            more = 2;
-        } else if (c < 0xF5) {
-            v = c & 0x07u;
-            more = 3;
-        } else {
-            return cc_err_CCResult_CCSlice_uint32_t_CCError(CC_ERROR(CC_ERR_PARSE, "utf8_codepoints: invalid leading byte"));
-        }
-        if (i + more >= s.len) {
-            return cc_err_CCResult_CCSlice_uint32_t_CCError(CC_ERROR(CC_ERR_PARSE, "utf8_codepoints: truncated sequence"));
-        }
-        for (k = 1; k <= more; k++) {
-            unsigned char cont = p[i + k];
-            if ((cont & 0xC0u) != 0x80u) {
-                return cc_err_CCResult_CCSlice_uint32_t_CCError(CC_ERROR(CC_ERR_PARSE, "utf8_codepoints: bad continuation"));
-            }
-            v = (v << 6) | (uint32_t)(cont & 0x3Fu);
-        }
-        /* Reject overlong encodings and UTF-16 surrogates. */
-        if (more == 1 && v < 0x80u) {
-            return cc_err_CCResult_CCSlice_uint32_t_CCError(CC_ERROR(CC_ERR_PARSE, "utf8_codepoints: overlong encoding"));
-        }
-        if (more == 2 && v < 0x800u) {
-            return cc_err_CCResult_CCSlice_uint32_t_CCError(CC_ERROR(CC_ERR_PARSE, "utf8_codepoints: overlong encoding"));
-        }
-        if (more == 3 && v < 0x10000u) {
-            return cc_err_CCResult_CCSlice_uint32_t_CCError(CC_ERROR(CC_ERR_PARSE, "utf8_codepoints: overlong encoding"));
-        }
-        if (v >= 0xD800u && v <= 0xDFFFu) {
-            return cc_err_CCResult_CCSlice_uint32_t_CCError(CC_ERROR(CC_ERR_PARSE, "utf8_codepoints: surrogate code point"));
-        }
-        if (v > 0x10FFFFu) {
-            return cc_err_CCResult_CCSlice_uint32_t_CCError(CC_ERROR(CC_ERR_PARSE, "utf8_codepoints: code point out of range"));
-        }
-        cp[n++] = v;
-        i += more + 1;
-    }
-    base.len = n;
-    out.base = base;
-    return cc_ok_CCResult_CCSlice_uint32_t_CCError(out);
-}
+CCResult_CCSlice_uint32_t_CCError cc_slice_utf8_codepoints(const CCSlice *s_ptr, CCArena arena);
 
 static inline CCResult_CCSlice_uint32_t_CCError CCSlice_utf8_codepoints(const CCSlice *s, CCArena arena) {
     return cc_slice_utf8_codepoints(s, arena);
@@ -484,5 +362,160 @@ static inline CCResult_int64_t_CCError cc_mul_i64_checked(int64_t a, int64_t b) 
     (cc_slice_materialize_in)((s), CC__ARENA_HANDLE(a))
 #define CCSlice_materialize_in(s, a) \
     (CCSlice_materialize_in)((s), CC__ARENA_HANDLE(a))
+
+/* `.cast` on CCSlice / CCSlice_*: dest may wrap a matching owner as
+ * `as_slice` (a view header). Dest must not peel. For-in does not use
+ * this — a vec walk stays on the live grower. */
+static inline void cc__slice_cast_trim(const char **p, size_t *n) {
+    while (*n && (**p == ' ' || **p == '\t')) {
+        (*p)++;
+        (*n)--;
+    }
+    while (*n && ((*p)[*n - 1] == ' ' || (*p)[*n - 1] == '\t'))
+        (*n)--;
+}
+
+static inline int cc__slice_cast_bytes_eq(const char *a, const char *b, size_t n) {
+    if (!n) return 1;
+    if (!a || !b) return 0;
+    while (n--) {
+        if (*a++ != *b++) return 0;
+    }
+    return 1;
+}
+
+static inline void cc__slice_cast_trim_kw(const char **p, size_t *n) {
+    for (;;) {
+        cc__slice_cast_trim(p, n);
+        if (*n >= 7 && cc__slice_cast_bytes_eq(*p, "static ", 7)) {
+            *p += 7;
+            *n -= 7;
+            continue;
+        }
+        if (*n >= 6 && cc__slice_cast_bytes_eq(*p, "const ", 6)) {
+            *p += 6;
+            *n -= 6;
+            continue;
+        }
+        if (*n >= 8 && cc__slice_cast_bytes_eq(*p, "_Atomic ", 8)) {
+            *p += 8;
+            *n -= 8;
+            continue;
+        }
+        if (*n >= 9 && cc__slice_cast_bytes_eq(*p, "volatile ", 9)) {
+            *p += 9;
+            *n -= 9;
+            continue;
+        }
+        break;
+    }
+}
+
+static inline int cc__slice_cast_is_byte_slice(CCSlice dest) {
+    const char *p = (const char *)dest.ptr;
+    size_t n = dest.len;
+    if (!p) return 0;
+    cc__slice_cast_trim_kw(&p, &n);
+    if (n == 7 && cc__slice_cast_bytes_eq(p, "CCSlice", 7)) return 1;
+    if (n == 13 && cc__slice_cast_bytes_eq(p, "CCSliceUnique", 13)) return 1;
+    if (n == 13 && cc__slice_cast_bytes_eq(p, "CCSliceShared", 13)) return 1;
+    return 0;
+}
+
+static inline int cc__slice_cast_is_string(CCSlice src) {
+    const char *p = (const char *)src.ptr;
+    size_t n = src.len;
+    if (!p || !n) return 0;
+    cc__slice_cast_trim_kw(&p, &n);
+    if (n && p[n - 1] == '*') {
+        n--;
+        cc__slice_cast_trim(&p, &n);
+    }
+    return n == 8 && cc__slice_cast_bytes_eq(p, "CCString", 8);
+}
+
+/* Vec elem from `CCVec_T` / `CCVec_T*`. 0 if not a vec instance. */
+static inline int cc__slice_cast_vec_elem(CCSlice src, const char **ep,
+                                          size_t *en) {
+    const char *p = (const char *)src.ptr;
+    size_t n = src.len;
+    if (!p || !n || !ep || !en) return 0;
+    cc__slice_cast_trim_kw(&p, &n);
+    if (n && p[n - 1] == '*') {
+        n--;
+        cc__slice_cast_trim(&p, &n);
+    }
+    if (n <= 6 || !cc__slice_cast_bytes_eq(p, "CCVec_", 6)) return 0;
+    *ep = p + 6;
+    *en = n - 6;
+    return *en > 0;
+}
+
+/* Dest element: byte slice → char; `CCSlice_T` → T. */
+static inline int cc__slice_cast_dest_elem(CCSlice dest, const char **ep,
+                                           size_t *en, int *typed) {
+    const char *p = (const char *)dest.ptr;
+    size_t n = dest.len;
+    if (!p || !ep || !en || !typed) return 0;
+    *typed = 0;
+    cc__slice_cast_trim_kw(&p, &n);
+    if (cc__slice_cast_is_byte_slice(dest)) {
+        *ep = "char";
+        *en = 4;
+        return 1;
+    }
+    if (n > 8 && cc__slice_cast_bytes_eq(p, "CCSlice_", 8)) {
+        *ep = p + 8;
+        *en = n - 8;
+        *typed = 1;
+        return *en > 0;
+    }
+    return 0;
+}
+
+static inline CCSlice cc__slice_cast_vec_callee(const char *elem, size_t elen) {
+    static char buf[96];
+    const char pre[] = "CCVec_";
+    const char suf[] = "_as_slice";
+    size_t i, o = 0;
+    if (!elem || 6 + elen + 9 >= sizeof(buf))
+        return cc_slice_from_static((void *)"__cc_ufcs_pass__", 16);
+    for (i = 0; i < 6; i++)
+        buf[o++] = pre[i];
+    for (i = 0; i < elen; i++)
+        buf[o++] = elem[i];
+    for (i = 0; i < 9; i++)
+        buf[o++] = suf[i];
+    buf[o] = 0;
+    return cc_slice_from_static((void *)buf, o);
+}
+
+static inline CCSlice cc__slice_cast_pass(void) {
+    static const char pass_tag[] = "__cc_ufcs_pass__";
+    return cc_slice_from_static((void *)pass_tag, sizeof(pass_tag) - 1);
+}
+
+static inline CCSlice cc_slice_cast_lower_c(CCSlice src, CCSlice dest, CCSlice kind,
+                                           CCArena arena) {
+    const char *se = NULL;
+    const char *de = NULL;
+    size_t sn = 0, dn = 0;
+    int typed = 0;
+    (void)kind;
+    (void)arena;
+    if (cc__slice_cast_is_byte_slice(dest) && cc__slice_cast_is_string(src))
+        return cc_slice_from_static((void *)"cc_string_as_slice", 18);
+    if (cc__slice_cast_vec_elem(src, &se, &sn) &&
+        cc__slice_cast_dest_elem(dest, &de, &dn, &typed) && sn == dn &&
+        cc__slice_cast_bytes_eq(se, de, sn)) {
+        /* Byte dest only from a char vec. Typed dest is T[:] ← Vec::[T]. */
+        if (typed || (sn == 4 && cc__slice_cast_bytes_eq(se, "char", 4)))
+            return cc__slice_cast_vec_callee(se, sn);
+    }
+    return cc__slice_cast_pass();
+}
+
+
+
 
 #endif /* CC_STD_SLICE_H */

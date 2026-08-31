@@ -8,11 +8,11 @@
 
 #include <ccc/cc_compat.h>
 #include <ccc/cc_sched.h>
+#include <ccc/cc_box.h>
 #include <ccc/cc_closure.h>
 #include <ccc/cc_chan_handle.h>
 #include <ccc/cc_result.h>
 #include <ccc/cc_type.h>
-#include <ccc/cc_ufcs.h>
 #include <signal.h>
 
 typedef struct CCChan CCChan;
@@ -21,11 +21,12 @@ typedef struct CCArena CCArena;
 /* Runtime object (malloc or arena-backed). Not the surface type. */
 typedef struct CCNurseryHost CCNurseryHost;
 
-/* Surface handle. Create returns this; methods are `n.spawn` / `n.wait`.
- * UFCS peels `.n`. Copying the handle copies the pointer. */
-typedef struct CCNursery {
-    CCNurseryHost* n;
-} CCNursery;
+/* Teaching name is the box instance. Host C cannot spell `typedef CCBox::[H]`
+ * in a lowered .h — mint the factory name, then alias. */
+#ifndef CCBox_CCNurseryHost_DEFINED
+#define CCBox_CCNurseryHost_DEFINED
+CC_DECL_BOX_ALIAS(CCNursery, CCNurseryHost);
+#endif
 
 #ifndef CCResult_CCNursery_CCError_DEFINED
 #define CCResult_CCNursery_CCError_DEFINED 1
@@ -37,109 +38,233 @@ CC_DECL_RESULT_SPEC(CCResult_CCNursery_CCError, CCNursery, CCError)
 CC_DECL_RESULT_SPEC(CCResult_CCNursery_CCError, CCNursery, CCError)
 #endif
 
-/* Self-owned nursery (malloc). The abandonable form: no arena record.
+static inline CCNursery cc_nursery_handle(CCNurseryHost* h) {
+    CCNursery r;
+    r.p = h;
+    return r;
+}
+
+static inline int cc_nursery_is_live(CCNursery n) {
+    return n.p != NULL;
+}
+
+static inline CCNurseryHost* cc_nursery_host(CCNursery n) {
+    return n.p;
+}
+
+/* Self-owned nursery (malloc). The leave-capable form: no arena record.
  * Join with wait/free or `@destroy`. Programmer errors abort. */
 CCResult_CCNursery_CCError cc_nursery_create(void);
 
 /* Cancel-tree nest: inherit cancel/deadline snapshot from `parent`.
- * Parent handle is required (empty `.n` aborts). UFCS: `parent.create_child()`.
- * Malloc handle — join with `@destroy` or wait; `abandon` is allowed. */
+ * Parent handle is required (empty `.p` aborts). UFCS: `parent.create_child()`.
+ * Malloc handle — join with `@destroy` or wait; `leave` is allowed. */
 CCResult_CCNursery_CCError cc_nursery_create_child(CCNursery parent);
 
 /* Lifetime-parent birth. Handle lives in `a`; `a` must be live (null/dead
- * abort). Walk of `a` joins. `abandon` is refused. UFCS: `a.create_nursery()`
+ * abort). Walk of `a` joins. `leave` is refused. UFCS: `a.create_nursery()`
  * via the generic `cc_arena_` prefix — writing this function installs it. */
 CCResult_CCNursery_CCError cc_nursery_create_on(CCArena a);
-/* UFCS `a.create_nursery()` emits this name with `&a`; peel. */
+/* UFCS `a.create_nursery()`; peel via CC__ARENA_HANDLE. */
 #define cc_arena_create_nursery(a) cc_nursery_create_on(CC__ARENA_HANDLE(a))
 
+/* Host* seam: runtime, fiber_sched `cur_nursery`, signal thread, walk.
+ * Surface wrappers take the box and peel `.p` once. */
+CCArena cc_nursery_arena_host(CCNurseryHost* n);
+void cc_nursery_cancel_host(CCNurseryHost* n);
+CCResult_void_CCError cc_nursery_on_signals_n_host(CCNurseryHost* n, const int* signos,
+                                               size_t count, CCClosure1 handler);
+CCResult_void_CCError cc_nursery_cancel_on_signals_n_host(CCNurseryHost* n,
+                                                     const int* signos,
+                                                     size_t count);
+void cc_nursery_set_deadline_host(CCNurseryHost* n, struct timespec abs_deadline);
+const struct timespec* cc_nursery_deadline_host(const CCNurseryHost* n,
+                                                struct timespec* out);
+CCDeadline cc_nursery_as_deadline_host(const CCNurseryHost* n);
+CCResult_void_CCError cc_nursery_add_closing_chan_host(CCNurseryHost* n, CCChan* ch);
+bool cc_nursery_is_cancelled_host(const CCNurseryHost* n);
+uint32_t cc_nursery_cancel_gen_host(const CCNurseryHost* n);
+void cc_nursery_cancel_wait_host(CCNurseryHost* n, uint32_t expected_gen,
+                                 uint32_t timeout_ms);
+CCResult_void_CCError cc_nursery_spawn_host(CCNurseryHost* n, void* (*fn)(void*),
+                                      void* arg);
+CCResult_void_CCError cc_nursery_spawn_closure0_host(CCNurseryHost* n, CCClosure0 c);
+CCResult_void_CCError cc_nursery_spawn_closure1_host(CCNurseryHost* n, CCClosure1 c,
+                                               intptr_t arg0);
+CCResult_void_CCError cc_nursery_spawn_closure2_host(CCNurseryHost* n, CCClosure2 c,
+                                               intptr_t arg0, intptr_t arg1);
+CCResult_void_CCError cc_nursery_spawn_async_closure0_host(CCNurseryHost* n,
+                                                     CCAsyncClosure0 c);
+CCResult_void_CCError cc_nursery_spawn_async_named_host(CCNurseryHost* n, CCTask task,
+                                  const char* diag_user_name,
+                                  const char* diag_file,
+                                  int diag_line);
+void* cc_nursery_closure_env_alloc_host(CCNurseryHost* n, size_t size,
+                                       size_t align);
+CCResult_void_CCError cc_nursery_wait_host(CCNurseryHost* n);
+CCResult_void_CCError cc_nursery_register_leftover_host(CCNurseryHost* n, void* ctx,
+                                                  void (*finish)(void*));
+void cc_nursery_leave_host(CCNurseryHost* n);
+void cc_nursery_free_host(CCNurseryHost* n);
+
+/* Deprecated host names — use register_leftover / leave_host (docs/deprecated.md). */
+#define cc_nursery_on_last_host cc_nursery_register_leftover_host
+#define cc_nursery_abandon_host cc_nursery_leave_host
+
 /* The nursery's lifetime-parent arena (Region face). Host C cannot see
- * the field on the host; UFCS peels through this accessor. */
-CCArena* cc_nursery_arena(CCNurseryHost* n);
+ * the field on the host; UFCS peels through this accessor. Handle copy. */
+static inline CCArena cc_nursery_arena(CCNursery n) {
+    return cc_nursery_arena_host(n.p);
+}
 
 // Cancel all tasks (sets flag; tasks must poll cooperatively).
-void cc_nursery_cancel(CCNurseryHost* n);
+static inline void cc_nursery_cancel(CCNursery n) {
+    cc_nursery_cancel_host(n.p);
+}
 
 /* Install a handler for process signals. Blocks those signals on the calling
  * thread (pthread_sigmask) so workers inherit the mask, then detaches a
  * sigwait thread that invokes handler(n) once (CCClosure1, single-shot).
  *
  * Call once, BEFORE spawning into `n`. Nursery must outlive the wait.
- * Does not compose with `abandon` (the signal thread holds a raw pointer).
+ * Does not compose with `leave` (the signal thread holds a raw pointer).
  *
  *   n.on_shutdown((CCNursery n) => { n.cancel(); }) !>;
  *   n.cancel_on_signals(SIGINT, SIGTERM) !>;   // cancel-only
  *   n.cancel_on_shutdown() !>;
  * Dynamic lists: on_signals_n / cancel_on_signals_n. */
-CCResult_void_CCError cc_nursery_on_signals_n(CCNurseryHost* n, const int* signos,
-                                               size_t count, CCClosure1 handler);
+static inline CCResult_void_CCError cc_nursery_on_signals_n(CCNursery n,
+                                                      const int* signos,
+                                                      size_t count,
+                                                      CCClosure1 handler) {
+    return cc_nursery_on_signals_n_host(n.p, signos, count, handler);
+}
 
-CCResult_void_CCError cc_nursery_on_shutdown(CCNurseryHost* n, CCClosure1 handler);
+static inline CCResult_void_CCError cc_nursery_on_shutdown(CCNursery n,
+                                                     CCClosure1 handler) {
+    static const int sigs[] = { SIGINT, SIGTERM };
+    return cc_nursery_on_signals_n(n, sigs, sizeof(sigs) / sizeof(sigs[0]),
+                                   handler);
+}
 
-CCResult_void_CCError cc_nursery_cancel_on_signals_n(CCNurseryHost* n,
-                                                     const int* signos,
-                                                     size_t count);
+static inline CCResult_void_CCError cc_nursery_cancel_on_signals_n(CCNursery n,
+                                                             const int* signos,
+                                                             size_t count) {
+    return cc_nursery_cancel_on_signals_n_host(n.p, signos, count);
+}
 
 #define cc_nursery_cancel_on_signals(n, ...)                                       \
     cc_nursery_cancel_on_signals_n(                                                \
         (n), (const int[]){__VA_ARGS__},                                           \
         sizeof((const int[]){__VA_ARGS__}) / sizeof(int))
 
-static inline CCResult_void_CCError cc_nursery_cancel_on_shutdown(CCNurseryHost* n) {
+static inline CCResult_void_CCError cc_nursery_cancel_on_shutdown(CCNursery n) {
     return cc_nursery_cancel_on_signals(n, SIGINT, SIGTERM);
 }
 
 // Set an absolute deadline for the nursery (CLOCK_REALTIME). Zeroed timespec clears.
-void cc_nursery_set_deadline(CCNurseryHost* n, struct timespec abs_deadline);
+static inline void cc_nursery_set_deadline(CCNursery n,
+                                           struct timespec abs_deadline) {
+    cc_nursery_set_deadline_host(n.p, abs_deadline);
+}
 
 // Get the deadline as timespec; returns NULL if none.
-const struct timespec* cc_nursery_deadline(const CCNurseryHost* n, struct timespec* out);
+static inline const struct timespec* cc_nursery_deadline(CCNursery n,
+                                                         struct timespec* out) {
+    return cc_nursery_deadline_host(n.p, out);
+}
 
 // Convert nursery deadline/cancel state into a CCDeadline helper.
-CCDeadline cc_nursery_as_deadline(const CCNurseryHost* n);
+static inline CCDeadline cc_nursery_as_deadline(CCNursery n) {
+    return cc_nursery_as_deadline_host(n.p);
+}
 
-// Register a channel to be auto-closed after wait, or on abandon last-exit.
-int cc_nursery_add_closing_chan(CCNurseryHost* n, CCChan* ch);
+// Register a channel to be auto-closed at EMPTY (wait / @destroy, or leave).
+static inline CCResult_void_CCError cc_nursery_add_closing_chan(CCNursery n,
+                                                          CCChan* ch) {
+    return cc_nursery_add_closing_chan_host(n.p, ch);
+}
 // Preferred: register a send-only handle to be auto-closed (spec-level capability).
-int cc_nursery_add_closing_tx(CCNurseryHost* n, CCChanTx tx);
+static inline CCResult_void_CCError cc_nursery_add_closing_tx(CCNursery n,
+                                                        CCChanTx tx) {
+    return cc_nursery_add_closing_chan(n, tx.raw);
+}
+/* Surface: `n.close(tx)` arms this nursery's EMPTY to close `tx` (both paths). */
+static inline CCResult_void_CCError cc_nursery_close(CCNursery n, CCChanTx tx) {
+    return cc_nursery_add_closing_tx(n, tx);
+}
 
 // Check cancellation flag.
-bool cc_nursery_is_cancelled(const CCNurseryHost* n);
+static inline bool cc_nursery_is_cancelled(CCNursery n) {
+    return cc_nursery_is_cancelled_host(n.p);
+}
 
 // Check if current fiber's nursery is cancelled (convenience for user code).
-// Returns true if cancelled or no nursery context.
+// False when there is no nursery (a missing lifetime is not cancelled).
 bool cc_cancelled(void);
 
 // Get cancel wake generation (for cancel-aware waits). Returns 0 if no nursery.
-uint32_t cc_nursery_cancel_gen(const CCNurseryHost* n);
+static inline uint32_t cc_nursery_cancel_gen(CCNursery n) {
+    return cc_nursery_cancel_gen_host(n.p);
+}
 
 // Wait on nursery's cancel primitive with timeout (ms). Returns if cancelled or timeout.
-void cc_nursery_cancel_wait(CCNurseryHost* n, uint32_t expected_gen, uint32_t timeout_ms);
+static inline void cc_nursery_cancel_wait(CCNursery n, uint32_t expected_gen,
+                                          uint32_t timeout_ms) {
+    cc_nursery_cancel_wait_host(n.p, expected_gen, timeout_ms);
+}
 
-// Spawn a task owned by the nursery. Returns 0 on success.
-int cc_nursery_spawn(CCNurseryHost* n, void* (*fn)(void*), void* arg);
-// Spawn on the distinct hybrid/V2 scheduler backend with stackful suspension.
-// Returns 0 on success.
-int cc_nursery_spawnhybrid(CCNurseryHost* n, void* (*fn)(void*), void* arg);
-int cc_nursery_spawnhybrid_closure0(CCNurseryHost* n, CCClosure0 c);
-// Spawn a CCClosure0 (env freed via drop, if provided). Returns 0 on success.
-int cc_nursery_spawn_closure0(CCNurseryHost* n, CCClosure0 c);
-// Spawn an async closure under nursery ownership.
-int cc_nursery_spawn_async_closure0(CCNurseryHost* n, CCAsyncClosure0 c);
-// Spawn an async closure on the hybrid/V2 path.
-int cc_nursery_spawnhybrid_async_closure0(CCNurseryHost* n, CCAsyncClosure0 c);
-// Spawn an existing async task under nursery ownership without blocking a worker.
-// Surface UFCS: `n.spawn(async_fn(...))` (also `n.spawn_async(...)` alias).
-int cc_nursery_spawn_async(CCNurseryHost* n, CCTask task);
+/* Admission. Dead host / OOM / left nursery is err. Child body error is wait. */
+static inline CCResult_void_CCError cc_nursery_spawn(CCNursery n, void* (*fn)(void*),
+                                               void* arg) {
+    return cc_nursery_spawn_host(n.p, fn, arg);
+}
+static inline CCResult_void_CCError cc_nursery_spawnhybrid(CCNursery n,
+                                                     void* (*fn)(void*),
+                                                     void* arg) {
+    return cc_nursery_spawn(n, fn, arg);
+}
+static inline CCResult_void_CCError cc_nursery_spawn_closure0(CCNursery n,
+                                                        CCClosure0 c) {
+    return cc_nursery_spawn_closure0_host(n.p, c);
+}
+static inline CCResult_void_CCError cc_nursery_spawnhybrid_closure0(CCNursery n,
+                                                              CCClosure0 c) {
+    return cc_nursery_spawn_closure0(n, c);
+}
+static inline CCResult_void_CCError cc_nursery_spawn_closure1(CCNursery n,
+                                                        CCClosure1 c,
+                                                        intptr_t arg0) {
+    return cc_nursery_spawn_closure1_host(n.p, c, arg0);
+}
+static inline CCResult_void_CCError cc_nursery_spawn_closure2(CCNursery n,
+                                                        CCClosure2 c,
+                                                        intptr_t arg0,
+                                                        intptr_t arg1) {
+    return cc_nursery_spawn_closure2_host(n.p, c, arg0, arg1);
+}
+static inline CCResult_void_CCError cc_nursery_spawn_async_closure0(CCNursery n,
+                                                              CCAsyncClosure0 c) {
+    return cc_nursery_spawn_async_closure0_host(n.p, c);
+}
+static inline CCResult_void_CCError cc_nursery_spawnhybrid_async_closure0(
+    CCNursery n, CCAsyncClosure0 c) {
+    return cc_nursery_spawn_async_closure0(n, c);
+}
 /* R1 — spawn an async task and stamp its fiber with user-facing naming
  * (callee name + spawn-site file/line) so any code running inside the
  * fiber can answer "what task am I?" via `cc_rt_diag_current_async_info`.
  * The strings must outlive the fiber; UFCS for `n.spawn(callee(...))`
  * (and the `spawn_async` alias) supplies C string literals. */
-int cc_nursery_spawn_async_named(CCNurseryHost* n, CCTask task,
-                                  const char* diag_user_name,
-                                  const char* diag_file,
-                                  int diag_line);
+static inline CCResult_void_CCError cc_nursery_spawn_async_named(
+    CCNursery n, CCTask task, const char* diag_user_name, const char* diag_file,
+    int diag_line) {
+    return cc_nursery_spawn_async_named_host(n.p, task, diag_user_name,
+                                             diag_file, diag_line);
+}
+static inline CCResult_void_CCError cc_nursery_spawn_async(CCNursery n, CCTask task) {
+    return cc_nursery_spawn_async_named(n, task, NULL, NULL, 0);
+}
 /* R1 — answer "what async task am I running inside?" from any code that
  * runs on a CC scheduler fiber.  Implementation in `cc/runtime/cc_rt_diag.c`.
  * Returns 1 if any field was populated, 0 if no naming info is associated
@@ -163,72 +288,92 @@ CCResult_CCNursery_CCError cc_nursery_spawn_child_closure2(CCNursery parent, CCC
 
 // Allocate closure environment storage owned by the nursery lifetime.
 // Memory is reclaimed when the nursery is freed; no per-closure free is required.
-void* cc_nursery_closure_env_alloc(CCNurseryHost* n, size_t size, size_t align);
+static inline void* cc_nursery_closure_env_alloc(CCNursery n, size_t size,
+                                                 size_t align) {
+    return cc_nursery_closure_env_alloc_host(n.p, size, align);
+}
 
-// Wait for all tasks to finish. Returns first join error if any.
-int cc_nursery_wait(CCNurseryHost* n);
+/* Join. First child join error, if any. Dead host is err. */
+static inline CCResult_void_CCError cc_nursery_wait(CCNursery n) {
+    return cc_nursery_wait_host(n.p);
+}
 
-// Register a hook that runs after the last child is dead on the abandon
-// path, before the nursery is freed. One hook. Not run by wait/free.
-// The hook must not touch this nursery at all (it runs before release, so
-// anyone it wakes races the teardown) — in particular it must not wait,
-// free, or abandon it.
-int cc_nursery_on_last(CCNurseryHost* n, void* ctx, void (*finish)(void*));
+/* Register leftover at EMPTY on the LEFT path only. Prefer
+ * `n.leave(ctx, finish)` which registers then consumes. One hook. */
+static inline CCResult_void_CCError cc_nursery_register_leftover(CCNursery n, void* ctx,
+                                                          void (*finish)(void*)) {
+    return cc_nursery_register_leftover_host(n.p, ctx, finish);
+}
 
-// Consume the handle. The last child to exit (or this call, if none are
-// live) frees the nursery at an unpredictable time on a worker thread, so
-// any later call on `n` is a use-after-free unless the caller owns
-// independent proof that a child is still live (e.g. it holds the channel a
-// child is provably blocked on); such calls get EINVAL but are not part of
-// the supported lifecycle. When the join set is empty the runtime closes
-// registered channels, runs on_last if set, and frees the nursery. Not
-// cancel. Requires worker-frees mode (the default). An abandon-capable
-// nursery must be self-owned (`cc_nursery_create()`): `abandon` on a
-// `cc_arena_create_nursery` nursery is refused — the owner's record would
-// fire on freed storage.
-void cc_nursery_abandon(CCNurseryHost* n);
+/* OPEN → LEFT. Consume the handle. Last child (or this call, if none are
+ * live) reaches EMPTY then DEAD on a worker at an unpredictable time, so
+ * any later call on `n` is a use-after-free unless the caller owns
+ * independent proof that a child is still live. At EMPTY the runtime closes
+ * registered channels, runs leftover if this path came via LEFT, and frees.
+ * Not cancel. Requires worker-frees mode (the default). A leave-capable
+ * nursery must be self-owned (`cc_nursery_create()`): `leave` on a
+ * `cc_arena_create_nursery` nursery is refused — the owner's record would
+ * fire on freed storage. */
+static inline void cc_nursery_leave1(CCNursery n) {
+    cc_nursery_leave_host(n.p);
+}
+
+/* Register leftover, then OPEN → LEFT. UFCS: `n.leave(ctx, finish)`. */
+static inline CCResult_void_CCError cc_nursery_leave_with(CCNursery n, void* ctx,
+                                                    void (*finish)(void*)) {
+    CCResult_void_CCError r = cc_nursery_register_leftover_host(n.p, ctx, finish);
+    if (!r.ok) return r;
+    cc_nursery_leave1(n);
+    return cc_ok_CCResult_void_CCError();
+}
+
+/* UFCS `n.leave()` / `n.leave(ctx, finish)` and the C twin. */
+#define CC__NURSERY_LEAVE_PICK(_1, _2, _3, NAME, ...) NAME
+#define cc_nursery_leave(...)                                                      \
+    CC__NURSERY_LEAVE_PICK(__VA_ARGS__, cc_nursery_leave_with,                      \
+                           cc__nursery_leave_needs_0_or_2, cc_nursery_leave1)(     \
+        __VA_ARGS__)
 
 // Destroy nursery and free task handles (tasks must be finished).
-void cc_nursery_free(CCNurseryHost* n);
+static inline void cc_nursery_free(CCNursery n) {
+    cc_nursery_free_host(n.p);
+}
 
 static inline void cc_nursery_destroy(CCNursery* wrap) {
-    if (!wrap || !wrap->n) return;
-    (void)cc_nursery_wait(wrap->n);
-    cc_nursery_free(wrap->n);
-    wrap->n = NULL;
+    CCResult_void_CCError w;
+    if (!wrap || !wrap->p) return;
+    w = cc_nursery_wait(*wrap);
+    cc_nursery_free(*wrap);
+    wrap->p = NULL;
+    /* Join error is not dropped: handle with `n.wait() !>` before destroy,
+     * or this path exits. */
+    if (!w.ok) cc_error_exit(w.u.error);
 }
 
-/* CCNursery keeps its bespoke `cc_nursery_lower_c` because the surface
-   names `spawn` / `spawnhybrid` collide with existing raw-fn-pointer
-   entry points (`cc_nursery_spawn(n, fn, arg)`); the hook routes the
-   UFCS short names to the closure-taking implementations
-   (`cc_nursery_spawn_closure0`, etc.) and aliases `close_on` ->
-   `cc_nursery_add_closing_tx`.  Migration to the generic helper would
-   require renaming the raw-fn-pointer entry points first. */
-static inline CCSlice cc_nursery_lower_c(CCSlice recv_type,
-                                         CCSlice method,
-                                         CCSlice mode,
-                                         CCSliceArray argv,
-                                         CCSliceArray arg_types,
-                                         CCArena *arena) {
-    (void)recv_type;
-    (void)mode;
-    (void)argv;
-    (void)arg_types;
-    if (cc_ufcs_slice_eq_cstr(method, "spawn")) {
-        return cc_ufcs_emit_value_cstr(arena, "cc_nursery_spawn_closure0");
-    }
-    if (cc_ufcs_slice_eq_cstr(method, "spawnhybrid")) {
-        return cc_ufcs_emit_value_cstr(arena, "cc_nursery_spawnhybrid_closure0");
-    }
-    if (cc_ufcs_slice_eq_cstr(method, "close_on")) {
-        return cc_ufcs_emit_value_cstr(arena, "cc_nursery_add_closing_tx");
-    }
-    return cc_slice_concat2(cc_slice_from_static((void*)"cc_nursery_", sizeof("cc_nursery_") - 1), method, arena);
+/* Spawn / spawnhybrid stay leftover overload (closure0 vs async_named vs
+ * raw fn-ptr). `close` / `leave` are prefix-shaped (`cc_nursery_close`,
+ * `cc_nursery_leave` arity macro). Generic `cc_` prefix covers the rest. */
+
+
+/* ============================================================================
+ * Deprecated nursery aliases — use close / leave (docs/deprecated.md)
+ * ============================================================================ */
+
+/* Deprecated — use cc_nursery_close / n.close(tx). */
+static inline CCResult_void_CCError cc_nursery_close_on(CCNursery n, CCChanTx tx) {
+    return cc_nursery_close(n, tx);
 }
 
+/* Deprecated — use cc_nursery_register_leftover / n.leave(ctx, finish). */
+static inline CCResult_void_CCError cc_nursery_on_last(CCNursery n, void* ctx,
+                                                 void (*finish)(void*)) {
+    return cc_nursery_register_leftover(n, ctx, finish);
+}
 
-
+/* Deprecated — use cc_nursery_leave / n.leave(). */
+static inline void cc_nursery_abandon(CCNursery n) {
+    cc_nursery_leave1(n);
+}
 
 
 #endif // CC_NURSERY_H

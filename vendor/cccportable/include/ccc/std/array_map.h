@@ -9,6 +9,7 @@
  * 24-bit dense index+1 in the low bits, so lookup can reject mismatches
  * without touching dense rows / EQ_FN.  Dense length is capped just below
  * 2^24 so an occupied pack never collides with the tomb sentinel.
+ * Swap-remove retargets the moved row via dense_bkt (no second probe).
  *
  * EQ_FN returns non-zero when keys are equal (same convention as cc_map_eq_*).
  */
@@ -17,9 +18,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <string.h>
 #include <stdbool.h>
-#include <limits.h>
 #include <ccc/cc_arena.h>
 
 /* Sugar: ArrayMap::[K,V] / array_map_new::[K,V] / array_map_new_count::[K,V]. */
@@ -54,7 +53,7 @@ static inline size_t cc_array_map_quad(uint32_t displacement) {
 
 /* High 8 bits of the hash (uncorrelated with low bits used for home bucket). */
 static inline uint32_t cc_array_map_hash_frag8(size_t hash) {
-    return (uint32_t)(hash >> ((sizeof(size_t) - 1u) * (size_t)CHAR_BIT)) & 0xffu;
+    return (uint32_t)(hash >> ((sizeof(size_t) - 1u) * 8u)) & 0xffu;
 }
 
 static inline uint32_t cc_array_map_pack_slot(size_t dense_index, size_t hash) {
@@ -69,6 +68,17 @@ static inline size_t cc_array_map_slot_dense(uint32_t slot) {
 
 static inline uint32_t cc_array_map_slot_frag(uint32_t slot) {
     return slot >> CC_ARRAY_MAP_FRAG_SHIFT;
+}
+
+static inline void cc__am_zero(void *p, size_t n) {
+    unsigned char *b = (unsigned char *)p;
+    while (n--) *b++ = 0;
+}
+
+static inline void cc__am_copy(void *d, const void *s, size_t n) {
+    unsigned char *o = (unsigned char *)d;
+    const unsigned char *i = (const unsigned char *)s;
+    while (n--) *o++ = *i++;
 }
 
 static inline void cc_array_map_prefetch(const void *p) {
@@ -98,6 +108,7 @@ typedef struct CCArrayMapCore {
     CCArena arena;
     uint32_t *buckets; /* 0 empty, UINT32_MAX tomb, else dense_index+1 */
     void *dense;
+    uint32_t *dense_bkt; /* probe bucket for dense[i]; del retargets without re-probe */
     size_t len;
     size_t dense_cap;
     size_t bucket_mask; /* buckets_cap - 1; 0 ⇒ no table */
@@ -126,16 +137,30 @@ static inline int cc_array_map_core_reserve_dense(CCArrayMapCore *m,
         if (next <= new_cap) next = new_cap + 1u;
         new_cap = next;
     }
-    if (m->dense) {
-        p = cc_arena_realloc(m->arena, m->arena, m->dense,
-                             m->dense_cap * k->slot_size, new_cap * k->slot_size,
-                             k->slot_align);
-    } else {
-        p = cc_arena_alloc(m->arena, new_cap * k->slot_size, k->slot_align);
+    {
+        uint32_t *bp;
+        if (m->dense_bkt) {
+            bp = (uint32_t *)cc_arena_realloc(
+                m->arena, m->arena, m->dense_bkt,
+                m->dense_cap * sizeof(uint32_t), new_cap * sizeof(uint32_t),
+                _Alignof(uint32_t));
+        } else {
+            bp = (uint32_t *)cc_arena_alloc(m->arena, new_cap * sizeof(uint32_t),
+                                            _Alignof(uint32_t));
+        }
+        if (!bp) return -1;
+        if (m->dense) {
+            p = cc_arena_realloc(m->arena, m->arena, m->dense,
+                                 m->dense_cap * k->slot_size,
+                                 new_cap * k->slot_size, k->slot_align);
+        } else {
+            p = cc_arena_alloc(m->arena, new_cap * k->slot_size, k->slot_align);
+        }
+        if (!p) return -1;
+        m->dense_bkt = bp;
+        m->dense = p;
+        m->dense_cap = new_cap;
     }
-    if (!p) return -1;
-    m->dense = p;
-    m->dense_cap = new_cap;
     return 0;
 }
 
@@ -152,7 +177,7 @@ static inline int cc_array_map_core_rehash(CCArrayMapCore *m,
         nb = (uint32_t *)cc_arena_alloc(m->arena, new_bucket_cap * sizeof(uint32_t),
                                         _Alignof(uint32_t));
         if (!nb) return -1;
-        memset(nb, 0, new_bucket_cap * sizeof(uint32_t));
+        cc__am_zero(nb, new_bucket_cap * sizeof(uint32_t));
         mask = new_bucket_cap - 1u;
         for (i = 0; i < m->len; i++) {
             size_t h = k->hash(cc_array_map_core_slot(m, k, i));
@@ -161,6 +186,7 @@ static inline int cc_array_map_core_rehash(CCArrayMapCore *m,
                 size_t b = (h + cc_array_map_quad(d)) & mask;
                 if (nb[b] == CC_ARRAY_MAP_EMPTY) {
                     nb[b] = cc_array_map_pack_slot(i, h);
+                    if (m->dense_bkt) m->dense_bkt[i] = (uint32_t)b;
                     break;
                 }
             }
@@ -276,12 +302,19 @@ static inline bool cc_array_map_core_del_at(CCArrayMapCore *m,
     m->tomb_count++;
     if (di != last) {
         void *lp = cc_array_map_core_slot(m, k, last);
-        size_t mb = 0;
-        size_t mh = k->hash(lp);
-        size_t mdi = cc_array_map_core_lookup_h(m, k, lp, mh, &mb);
-        memcpy(cc_array_map_core_slot(m, k, di), lp, k->slot_size);
-        if (mdi != SIZE_MAX && mb != SIZE_MAX)
-            m->buckets[mb] = cc_array_map_pack_slot(di, mh);
+        uint32_t old_pack;
+        size_t mb;
+        cc__am_copy(cc_array_map_core_slot(m, k, di), lp, k->slot_size);
+        if (m->dense_bkt) {
+            mb = (size_t)m->dense_bkt[last];
+            m->dense_bkt[di] = (uint32_t)mb;
+            old_pack = (mb <= m->bucket_mask) ? m->buckets[mb] : 0;
+            if (old_pack && old_pack != CC_ARRAY_MAP_TOMB &&
+                cc_array_map_slot_dense(old_pack) == last)
+                m->buckets[mb] = (cc_array_map_slot_frag(old_pack)
+                                  << CC_ARRAY_MAP_FRAG_SHIFT) |
+                                 (((uint32_t)di + 1u) & CC_ARRAY_MAP_IDX_MASK);
+        }
     }
     m->len--;
     return true;
@@ -304,17 +337,18 @@ static inline int cc_array_map_core_insert(CCArrayMapCore *m,
         di = cc_array_map_core_lookup_h(m, k, key, h, &bucket);
     }
     if (di != SIZE_MAX) {
-        memcpy((char *)cc_array_map_core_slot(m, k, di) + k->val_off, val,
-               k->val_size);
+        cc__am_copy((char *)cc_array_map_core_slot(m, k, di) + k->val_off, val,
+                    k->val_size);
         return 0;
     }
     if (bucket == SIZE_MAX || !m->buckets) return -1;
     if (m->buckets[bucket] == CC_ARRAY_MAP_TOMB && m->tomb_count)
         m->tomb_count--;
     sp = cc_array_map_core_slot(m, k, m->len);
-    memcpy(sp, key, k->key_size);
-    memcpy((char *)sp + k->val_off, val, k->val_size);
+    cc__am_copy(sp, key, k->key_size);
+    cc__am_copy((char *)sp + k->val_off, val, k->val_size);
     m->buckets[bucket] = cc_array_map_pack_slot(m->len, h);
+    if (m->dense_bkt) m->dense_bkt[m->len] = (uint32_t)bucket;
     m->len++;
     return 0;
 }
@@ -336,13 +370,14 @@ static inline void cc_array_map_core_clear(CCArrayMapCore *m) {
     m->len = 0;
     m->tomb_count = 0;
     bcap = cc_array_map_core_buckets_cap(m);
-    if (m->buckets && bcap) memset(m->buckets, 0, bcap * sizeof(uint32_t));
+    if (m->buckets && bcap) cc__am_zero(m->buckets, bcap * sizeof(uint32_t));
 }
 
 static inline void cc_array_map_core_destroy(CCArrayMapCore *m) {
     if (!m || !cc_arena_is_live(m->arena)) return;
     if (m->buckets) (void)cc_arena_release(m->arena, m->buckets);
     if (m->dense) (void)cc_arena_release(m->arena, m->dense);
+    if (m->dense_bkt) (void)cc_arena_release(m->arena, m->dense_bkt);
     (void)cc_arena_release(m->arena, m);
 }
 
@@ -356,6 +391,7 @@ static inline CCArrayMapCore *cc_array_map_core_init(CCArena arena,
     m->arena = arena;
     m->buckets = NULL;
     m->dense = NULL;
+    m->dense_bkt = NULL;
     m->len = 0;
     m->dense_cap = 0;
     m->bucket_mask = 0;
@@ -395,6 +431,7 @@ static inline CCArrayMapCore *cc_array_map_core_init_count(CCArena arena,
         CCArena arena;                                                               \
         uint32_t *buckets; /* 0 empty, UINT32_MAX tomb, else dense_index+1 */        \
         Name##Slot *dense;                                                            \
+        uint32_t *dense_bkt;                                                          \
         size_t len;                                                                   \
         size_t dense_cap;                                                             \
         size_t bucket_mask; /* buckets_cap - 1; 0 ⇒ no table */                      \
@@ -425,7 +462,7 @@ static inline CCArrayMapCore *cc_array_map_core_init_count(CCArena arena,
     static inline size_t Name##_live_bytes(const Name *m) {                           \
         if (!m) return 0;                                                             \
         return sizeof(*m) + Name##_buckets_cap(m) * sizeof(uint32_t) +                \
-               m->dense_cap * sizeof(Name##Slot);                                     \
+               m->dense_cap * (sizeof(Name##Slot) + sizeof(uint32_t));                \
     }                                                                                 \
                                                                                       \
     static inline Name *Name##_init(CCArena arena) {                                 \
@@ -536,6 +573,10 @@ static inline CCArrayMapCore *cc_array_map_core_init_count(CCArena arena,
  * instantiate this family. The concrete type is `ArrayMap_<K>_<V>*`.
  * A hand-written `CC_ARRAY_MAP_DECL` that names the same instance
  * suppresses the splice. Header lowering blanks the factory from `.h`. */
+#if defined(CC_COMPTIME) || defined(__TINYC__)
+#include <stdio.h>
+#include <string.h>
+#endif
                                  
                                                   
                                             

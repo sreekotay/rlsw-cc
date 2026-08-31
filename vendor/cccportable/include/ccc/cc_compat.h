@@ -45,4 +45,28 @@ typedef int bool;
 #define cc_static_assert(cond, why) \
     ((void)sizeof(struct { int why : (cond) ? 1 : -1; }))
 
+/* Diverging helpers (`cc_error_exit`, …). Host C must see the same
+ * noreturn the language already treats as a hard leave. */
+#ifndef CC_NORETURN
+#if defined(_MSC_VER)
+#define CC_NORETURN __declspec(noreturn)
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#define CC_NORETURN _Noreturn
+#elif defined(__GNUC__) || defined(__clang__) || defined(__TINYC__)
+#define CC_NORETURN __attribute__((noreturn))
+#else
+#define CC_NORETURN
+#endif
+#endif
+
+/* Compiler-emitted heap (closures, frames). Not malloc — that name stays
+ * undeclared until the user includes <stdlib.h>. */
+void *cc__heap_alloc(size_t n);
+void *cc__heap_calloc(size_t n, size_t sz);
+void cc__heap_free(void *p);
+
+/* Generated zero/copy: `cc__bytes_zero` / `cc__bytes_copy` in cc_slice.cch.
+ * Do not emit memset / memcpy / __builtin_memset — TinyCC has no builtins,
+ * and default CCS TUs must not declare the libc names. */
+
 #endif /* CC_COMPAT_H */
