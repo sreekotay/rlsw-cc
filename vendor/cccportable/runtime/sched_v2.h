@@ -49,6 +49,12 @@ void   sched_v2_deadline_scope_pop(void* prev);
 int    sched_v2_current_worker_id(void); /* -1 if not on a V2 worker thread */
 void   sched_v2_shutdown(void);
 
+/* Current ready-queue depth (relaxed snapshot). Used by cc_parallel_spawn
+ * for backlog-keyed spawn denial: when the queue is already deep, another
+ * spawn only adds scheduling overhead — the denied arm runs inline on the
+ * caller instead (the lowering's documented spawn-failure fallback). */
+size_t sched_v2_ready_depth(void);
+
 /* Accessors for task.c integration */
 int    sched_v2_fiber_done(fiber_v2* f);
 void*  sched_v2_fiber_result(fiber_v2* f);

@@ -2698,6 +2698,10 @@ char* sched_v2_fiber_result_buf(fiber_v2* f) {
     return f ? f->result_buf : NULL;
 }
 
+size_t sched_v2_ready_depth(void) {
+    return atomic_load_explicit(&g_v2.ready_queue.count, memory_order_relaxed);
+}
+
 void sched_v2_fiber_release(fiber_v2* f) {
     if (f) fiber_v2_free(f);
 }

@@ -4,7 +4,8 @@
  * Design:
  * - 1.6x growth factor
  * - Initial capacity of 8 (skips 2→4 dance for common cases)
- * - Growth allocates in arena; old buffers reclaimed on arena reset
+ * - Growth allocates in arena; realloc releases the replaced backing
+ * - destroy() releases arena-backed storage; from() wraps and does neither
  * - Fails gracefully when arena exhausted
  *
  * Optional heap-backed variant provided via CC_VEC_DECL_HEAP for tools/tests.
@@ -12,6 +13,7 @@
  * API:
  * - Name_get(v, i)     -> T* (mutable, NULL if out of bounds)
  * - Name_pop(v, out)   -> bool (writes *out if non-empty; false if empty)
+ * - Name_truncate(v, n)-> shrink len to n; n >= len is a no-op
  * - Name_push(v, val)  -> int (0 success, -1 failure)
  */
 #ifndef CC_STD_VEC_H
@@ -56,15 +58,29 @@
 typedef struct __CCVecGeneric {
     void *data;
     size_t len;
+    size_t cap;
 } __CCVecGeneric;
 #endif
 
 /* Generic constructor - parser fallback doesn't actually run, so just return a
    zeroed struct for type checking. */
 static inline __CCVecGeneric __cc_vec_generic_init(void *arena) {
-    __CCVecGeneric v = {NULL, 0};
+    __CCVecGeneric v = {NULL, 0, 0};
     (void)arena;
     return v;
+}
+
+static inline __CCVecGeneric __cc_vec_generic_from(void *p, size_t len,
+                                                   size_t cap) {
+    __CCVecGeneric v = {p, len, cap};
+    return v;
+}
+
+static inline void __cc_vec_generic_destroy(__CCVecGeneric *v) {
+    if (!v) return;
+    v->data = NULL;
+    v->len = 0;
+    v->cap = 0;
 }
 
 /* Parser fallback method stubs - just need to type-check, not actually run.
@@ -100,11 +116,15 @@ static inline int __cc_vec_generic_reserve(__CCVecGeneric *v, size_t n) {
 static inline void __cc_vec_generic_clear(__CCVecGeneric *v) {
     (void)v;
 }
+static inline void __cc_vec_generic_truncate(__CCVecGeneric *v, size_t n) {
+    if (!v) return;
+    if (n < v->len) v->len = n;
+}
 static inline size_t __cc_vec_generic_len(const __CCVecGeneric *v) {
     return v ? v->len : 0;
 }
 static inline size_t __cc_vec_generic_cap(const __CCVecGeneric *v) {
-    return v ? v->len : 0;
+    return v ? (v->cap & ~CC_VEC_FROM) : 0;
 }
 static inline void* __cc_vec_generic_begin(__CCVecGeneric *v) {
     return v ? v->data : NULL;
@@ -127,6 +147,7 @@ static inline CCSlice __cc_vec_generic_as_slice(__CCVecGeneric *v) {
  *
  * API:
  * - Name_init(arena, initial_cap)   -> Name
+ * - Name_from(ptr, len, cap)        -> Name (fixed cap; no grow / no release)
  * - Name_push(v, value)             -> 0 on success, -1 on failure
  * - Name_pop(v, T* out)             -> bool (true + writes *out, false if empty)
  * - Name_get(v, i)                  -> T* (mutable, NULL if out of bounds)
@@ -137,6 +158,8 @@ static inline CCSlice __cc_vec_generic_as_slice(__CCVecGeneric *v) {
  * - Name_len(v), Name_cap(v)
  * - Name_begin(v), Name_end(v)
  * - Name_clear(v)
+ * - Name_truncate(v, n)             -> shrink len; n >= len is a no-op
+ * - Name_destroy(v)                 -> releases arena backing; from() unbinds
  */
 /* Everything but the slice view. `CC_VEC_DECL_ARENA` adds the erased
  * `Name##_as_slice`; `CC_VEC_DECL_ARENA_TSLICE` adds a typed one
@@ -147,14 +170,27 @@ static inline CCSlice __cc_vec_generic_as_slice(__CCVecGeneric *v) {
     typedef struct {                                                              \
         T *data;                                                                  \
         size_t len;                                                               \
+        size_t cap;                                                               \
     } Name;                                                                       \
                                                                                   \
     static inline Name Name##_init(CCArena arena, size_t initial_cap) {          \
-        Name v = {NULL, 0};                                                       \
+        Name v = {NULL, 0, 0};                                                    \
         if (cc_vec_init((CCVec *)&v, arena, sizeof(T), _Alignof(T),                \
                         initial_cap > 0 ? initial_cap : CC_VEC_INITIAL_CAP)        \
             != 0) {                                                               \
             v.data = NULL;                                                        \
+            v.len = 0;                                                            \
+            v.cap = 0;                                                            \
+        }                                                                         \
+        return v;                                                                 \
+    }                                                                             \
+                                                                                  \
+    static inline Name Name##_from(T *p, size_t len, size_t cap) {                \
+        Name v = {NULL, 0, 0};                                                    \
+        if (cc_vec_from((CCVec *)&v, (void *)p, len, cap) != 0) {                  \
+            v.data = NULL;                                                        \
+            v.len = 0;                                                            \
+            v.cap = 0;                                                            \
         }                                                                         \
         return v;                                                                 \
     }                                                                             \
@@ -209,11 +245,12 @@ static inline CCSlice __cc_vec_generic_as_slice(__CCVecGeneric *v) {
         cc_vec_clear((CCVec *)v);                                                 \
     }                                                                             \
                                                                                   \
-    /* Header teardown only — the arena owns the buffer. */                       \
+    static inline void Name##_truncate(Name *v, size_t n) {                       \
+        cc_vec_truncate((CCVec *)v, n);                                           \
+    }                                                                             \
+                                                                                  \
     static inline void Name##_destroy(Name *v) {                                  \
-        if (!v) return;                                                           \
-        v->data = NULL;                                                           \
-        v->len = 0;                                                               \
+        cc_vec_destroy((CCVec *)v);                                               \
     }                                                                             \
                                                                                   \
     static inline uint64_t Name##_provenance(const Name *v) {                     \
@@ -344,6 +381,10 @@ static inline CCVec_size_t cc__CCVec_size_t_new(CCArena __a) {
         return &v->data[i];                                                       \
     }                                                                             \
     static inline void Name##_clear(Name *v) { if (v) v->len = 0; }               \
+    static inline void Name##_truncate(Name *v, size_t n) {                       \
+        if (!v) return;                                                           \
+        if (n < v->len) v->len = n;                                               \
+    }                                                                             \
     static inline size_t Name##_len(const Name *v) { return v ? v->len : 0; }     \
     static inline size_t Name##_cap(const Name *v) { return v ? v->cap : 0; }     \
     static inline T *Name##_begin(Name *v) { return v ? v->data : NULL; }         \
