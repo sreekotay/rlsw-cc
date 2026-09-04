@@ -36,6 +36,14 @@
 #include <mach/mach_time.h>
 #endif
 
+/* Ready-depth cell consumed by the lowering's inline @parallel deny gate
+ * (declared in cc_sched.cch). Boots pointing at a static zero so a read
+ * that somehow precedes scheduler init sees an empty queue (gate stays
+ * open — the safe, admit-everything direction); sched_v2_init_impl
+ * repoints it at the real queue counter. */
+static volatile size_t g_par_depth_boot = 0;
+volatile size_t* __cc_par_depth_addr = &g_par_depth_boot;
+
 /* ============================================================================
  * v2_slock: short-critical-section lock
  *
@@ -163,6 +171,13 @@ struct fiber_v2 {
     _Atomic int state;    /* Base state plus FIBER_V2_FLAG_SIGNAL_PENDING. */
     int        last_thread_id;
     uint64_t   generation;
+    /* Times this fiber left the CPU without dying (park or requeue).
+     * Consumers: the adaptive spawn gate's sampler (scheduler.c), which
+     * rejects arm-duration samples from fibers that ever suspended —
+     * their wall time measures the subtree they joined, not their own
+     * body. Relaxed atomics: incremented by the worker that ran the
+     * fiber, read from inside the fiber possibly after migration. */
+    _Atomic uint32_t suspends;
 
     void* (*entry_fn)(void*);
     void*      entry_arg;
@@ -210,6 +225,7 @@ struct fiber_v2 {
     void* current_deadline_scope;
     CCNurseryHost* saved_nursery;
     CCNurseryHost* admission_nursery;
+    void* par_gate; /* CCParallel*; cancel wakes parks on this fiber */
 
     /* R1 — user-facing async backtrace metadata.
      *
@@ -358,7 +374,17 @@ struct sched_v2_state {
      * A v2_slock costs one uncontended CAS, same as the ready queue's
      * own lock which is taken on every push/pop anyway. */
     v2_slock free_list_mu;
-    fiber_v2* _Atomic free_list;
+    /* Two stacks under one lock, split by whether the record still
+     * carries a pooled coroutine (struct + ~2 MB stack). Alloc prefers
+     * the carrying list. With a single LIFO, a spawn burst that
+     * overflowed the coro-pool cap buried every retained stack under a
+     * layer of bare records; steady state then popped a bare record
+     * (mmap a fresh stack) and freed at the cap (munmap) on EVERY
+     * spawn/join — measured at ~37% of storm CPU — while the pooled
+     * stacks sat idle at the bottom, pinning the cap's worth of memory
+     * to boot. */
+    fiber_v2* _Atomic free_list;      /* records with f->coro != NULL */
+    fiber_v2* _Atomic free_list_bare; /* records with f->coro == NULL */
     pthread_mutex_t all_fibers_mu;
     fiber_v2* all_fibers;
     _Atomic size_t fiber_count;
@@ -951,13 +977,22 @@ static void fiber_v2_entry(mco_coro* co) {
  * ============================================================================ */
 
 static fiber_v2* fiber_v2_alloc(void) {
-    /* Try free list first (see free_list_mu: pop must be ABA-safe). */
+    /* Try the free lists first (see free_list_mu: pop must be ABA-safe).
+     * Prefer a record that still carries a pooled coroutine — popping a
+     * bare one while carrying ones exist costs an mmap now and, at the
+     * coro-pool cap, a munmap on the eventual free. */
     fiber_v2* f = NULL;
-    if (atomic_load_explicit(&g_v2.free_list, memory_order_acquire)) {
+    if (atomic_load_explicit(&g_v2.free_list, memory_order_acquire) ||
+        atomic_load_explicit(&g_v2.free_list_bare, memory_order_acquire)) {
         v2_slock_lock(&g_v2.free_list_mu);
         f = atomic_load_explicit(&g_v2.free_list, memory_order_relaxed);
         if (f) {
             atomic_store_explicit(&g_v2.free_list, f->next, memory_order_relaxed);
+        } else {
+            f = atomic_load_explicit(&g_v2.free_list_bare, memory_order_relaxed);
+            if (f)
+                atomic_store_explicit(&g_v2.free_list_bare, f->next,
+                                      memory_order_relaxed);
         }
         v2_slock_unlock(&g_v2.free_list_mu);
     }
@@ -980,6 +1015,7 @@ static fiber_v2* fiber_v2_alloc(void) {
             f->last_thread_id = -1;
             f->saved_nursery = NULL;
             f->admission_nursery = NULL;
+            f->par_gate = NULL;
             atomic_store_explicit(&f->done, 0, memory_order_relaxed);
             atomic_store_explicit(&f->wait_ticket, 0, memory_order_relaxed);
             atomic_store_explicit(&f->join_waiter_fiber, NULL, memory_order_relaxed);
@@ -1006,6 +1042,7 @@ static fiber_v2* fiber_v2_alloc(void) {
     f->current_deadline_scope = NULL;
     f->saved_nursery = NULL;
     f->admission_nursery = NULL;
+    f->par_gate = NULL;
     atomic_store_explicit(&f->join_waiter_fiber, NULL, memory_order_relaxed);
     wake_primitive_init(&f->done_wake);
 
@@ -1027,6 +1064,7 @@ static void fiber_v2_free(fiber_v2* f) {
     f->current_deadline_scope = NULL;
     f->saved_nursery = NULL;
     f->admission_nursery = NULL;
+    f->par_gate = NULL;
     /* Clear detector metadata so the next spawn starts clean and the
      * detector never observes stale park_obj/suppress/external-wait state
      * on a pooled fiber. */
@@ -1061,10 +1099,13 @@ static void fiber_v2_free(fiber_v2* f) {
         }
     }
     /* Push under free_list_mu (see the field comment: the lock-free pop
-     * was ABA-unsafe, and push/pop must share the same discipline). */
+     * was ABA-unsafe, and push/pop must share the same discipline).
+     * Carrying and bare records go to separate stacks so alloc can
+     * prefer the carrying ones (see the field comment). */
+    fiber_v2* _Atomic* list = f->coro ? &g_v2.free_list : &g_v2.free_list_bare;
     v2_slock_lock(&g_v2.free_list_mu);
-    f->next = atomic_load_explicit(&g_v2.free_list, memory_order_relaxed);
-    atomic_store_explicit(&g_v2.free_list, f, memory_order_release);
+    f->next = atomic_load_explicit(list, memory_order_relaxed);
+    atomic_store_explicit(list, f, memory_order_release);
     v2_slock_unlock(&g_v2.free_list_mu);
 }
 
@@ -1163,6 +1204,22 @@ static int sched_v2_grow_or_defer(void) {
     if (n < g_v2_eager_threads) return sched_v2_try_expand_pool();
     sched_v2_request_grow();
     return 0;
+}
+
+/* No idle worker while the ready queue is non-empty. Still grow when
+ * we are under the eager cap (inline thread #2) or the queue is deeper
+ * than the live pool. Skip otherwise: SPSC rendezvous and 2-arm join
+ * ping-pong have ready<=n and must not CAS grow_pending / poke sysmon
+ * on every handshake. Sysmon's tick is the safety net. */
+static void sched_v2_grow_if_backlogged(void) {
+    int n = atomic_load_explicit(&g_v2.num_threads, memory_order_acquire);
+    size_t ready = atomic_load_explicit(&g_v2.ready_queue.count,
+                                        memory_order_relaxed);
+    if (n < g_v2_eager_threads || ready > (size_t)n) {
+        (void)sched_v2_grow_or_defer();
+        return;
+    }
+    V2_STAT_INC(g_v2_wake_no_idle);
 }
 
 static void thread_v2_run_fiber(int tid, fiber_v2* f);
@@ -1298,13 +1355,11 @@ static void sched_v2_wake(int worker_hint) {
             break;
         }
         if (atomic_load_explicit(&g_v2.idle_workers, memory_order_acquire) <= 0) {
-            if (!sched_v2_grow_or_defer()) {
-                V2_STAT_INC(g_v2_wake_no_idle);
-            }
+            sched_v2_grow_if_backlogged();
             break;
         }
         if (!sched_v2_try_wake_one()) {
-            (void)sched_v2_grow_or_defer();
+            sched_v2_grow_if_backlogged();
             break;
         }
     }
@@ -1446,6 +1501,10 @@ static void thread_v2_run_fiber(int tid, fiber_v2* f) {
         }
         return;
     }
+
+    /* Every path below is a suspension (yield/pending requeue or park
+     * commit); the fiber comes back to the CPU later. See field comment. */
+    atomic_fetch_add_explicit(&f->suspends, 1, memory_order_relaxed);
 
     int raw_state = atomic_load_explicit(&f->state, memory_order_acquire);
     int yk = f->yield_kind;
@@ -1700,6 +1759,14 @@ void sched_v2_fiber_clear_park_deadline(fiber_v2* f) {
     if (!f) return;
     int was = atomic_exchange_explicit(&f->has_park_deadline, 0, memory_order_release);
     if (was) atomic_fetch_sub_explicit(&g_v2_park_deadlines, 1, memory_order_relaxed);
+}
+
+void sched_v2_fiber_set_par_gate(fiber_v2* f, void* gate) {
+    if (f) f->par_gate = gate;
+}
+
+void* sched_v2_fiber_par_gate(fiber_v2* f) {
+    return f ? f->par_gate : NULL;
 }
 
 /* Walk the all_fibers list and signal any parked fiber whose deadline
@@ -2517,6 +2584,10 @@ static void sched_v2_init_impl(void) {
     atomic_store_explicit(&g_v2.running, 1, memory_order_release);
     atomic_store_explicit(&g_v2.idle_workers, 0, memory_order_relaxed);
     v2_queue_init(&g_v2.ready_queue);
+    /* Publish the ready-depth cell for the lowering's inline @parallel
+     * deny gate (cc_sched.cch). _Atomic size_t read as volatile size_t:
+     * same object representation; the gate only needs a relaxed load. */
+    __cc_par_depth_addr = (volatile size_t*)&g_v2.ready_queue.count;
     v2_slock_init(&g_v2.free_list_mu);
     pthread_mutex_init(&g_v2.all_fibers_mu, NULL);
     g_v2.all_fibers = NULL;
@@ -2678,6 +2749,7 @@ void sched_v2_shutdown(void) {
         f = next;
     }
     atomic_store_explicit(&g_v2.free_list, NULL, memory_order_relaxed);
+    atomic_store_explicit(&g_v2.free_list_bare, NULL, memory_order_relaxed);
     g_v2.all_fibers = NULL;
     g_v2.initialized = 0;
 }
@@ -2700,6 +2772,11 @@ char* sched_v2_fiber_result_buf(fiber_v2* f) {
 
 size_t sched_v2_ready_depth(void) {
     return atomic_load_explicit(&g_v2.ready_queue.count, memory_order_relaxed);
+}
+
+uint32_t sched_v2_current_fiber_suspends(void) {
+    fiber_v2* f = tls_v2_current_fiber;
+    return f ? atomic_load_explicit(&f->suspends, memory_order_relaxed) : 0;
 }
 
 void sched_v2_fiber_release(fiber_v2* f) {
@@ -3108,6 +3185,10 @@ void sched_v2_check_deadlock(void) {
 
 int sched_v2_join(fiber_v2* f, void** out_result) {
     if (!f) return -1;
+    /* A dest list can still hold the kick (this fiber). Parking on
+     * our own done bit never completes. */
+    if (f == sched_v2_current_fiber())
+        return 0;
 
     if (atomic_load_explicit(&f->done, memory_order_acquire)) {
         V2_STAT_INC(g_v2_join_fast);
@@ -3193,6 +3274,7 @@ fiber_v2* sched_v2_spawn_in_nursery(void* (*fn)(void*), void* arg, CCNurseryHost
     f->entry_arg = arg;
     f->saved_nursery = nursery;
     f->admission_nursery = nursery;
+    atomic_store_explicit(&f->suspends, 0, memory_order_relaxed);
     /* Do NOT create/init the coroutine here.
      *
      * We park the task on the global run queue with only fn/arg attached;

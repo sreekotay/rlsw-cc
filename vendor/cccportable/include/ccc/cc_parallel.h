@@ -4,16 +4,36 @@
  * `@parallel { … }` is CCParallel !>(CCError): create can fail.
  * `.wait()` is the join: it synchronizes-with every arm; captured
  * writes are visible after it returns. Binding the handle does not
- * join. UFCS is the surface (`h.wait()` is `cc_parallel_wait(h)`).
+ * join. `h.close(tx)` arms this dest's EMPTY to close `tx` on both
+ * `.wait()` and `.leave()`. `h.leave()` consumes the handle without
+ * joining (OPEN → LEFT); leftover runs at EMPTY on the LEFT path
+ * only (`h.leave(ctx, finish)`). Mixing wait and leave is a
+ * programming error. UFCS is the surface (`h.wait()` is
+ * `cc_parallel_wait(h)`).
  * A void host unwraps in place: `h.wait() !>(e) { (void)e; };`.
  * `.cancel()` is bool !>(CCIoError): Ok(true) means this call
  * stored live→cancelled on this handle or an adopted descendant.
  * Joined dest: wait is ok; cancel/pause/resume are ok(false).
- * `cancelled` is atomic. Spawned arms do not inherit the caller's
- * deadline; poll `h.cancelled`. `.pause()` / `.resume()` are
- * bool !>(CCIoError). `.adopt(child)` links a cancel tree: parent
- * cancel walks children first, then self. Child cancel does not
- * cancel the parent.
+ * `h.live()` is planted and not joined or left. `cc_parallel_empty()` is
+ * idle (`!h.live()`). The construct plants a dest (`cc_parallel_dest`);
+ * seq / pragma-off go idle→joined with no live window. Pause/resume/
+ * cancel of idle are `ok(false)`, same as joined. `cancelled` and
+ * `paused` are atomic. Spawned arms do not inherit
+ * the caller's deadline; poll `h.cancelled`. Poll `h.paused` /
+ * `h.paused()` the same way — live, before `.wait()`. `.pause()` /
+ * `.resume()` flip that flag on a live dest (`ok(true)` is this
+ * call's transition). The construct honors `paused` at the seams
+ * it emits: thunk entry, the next `@parallel for` half, the next
+ * leaf iteration. `cc_parallel_honor(h)` yields while paused.
+ * Cancel is a mark: it does not skip a thunk, and it unsticks a
+ * paused honor. A body still polls if it cares mid-arm. `.wait()`
+ * does not resume. Cancel wakes parks on fibers attached to the
+ * dest (channel send/recv, exclusive wait). Pause does not complete
+ * those parks. Wait-for dest is live during enter; the construct
+ * joins before the statement ends (`h.n` is the nursery). Honor at
+ * enter, ticket entry, and after `@stage` wait before the block.
+ * `.adopt(child)` links a cancel tree: parent cancel walks children
+ * first, then self. Child cancel does not cancel the parent.
  */
 #ifndef CC_PARALLEL_H
 #define CC_PARALLEL_H
@@ -27,6 +47,8 @@
 #include <ccc/cc_type.h>
 #include <ccc/cc_ufcs.h>
 
+/* Brace width and dest inline pad — not in-flight backpressure.
+ * `@parallel(h)` is the growing form: live index, no TASK_MAX die. */
 #ifndef CC_PARALLEL_TASK_MAX
 #define CC_PARALLEL_TASK_MAX 32
 #endif
@@ -35,24 +57,42 @@
 #define CC_PARALLEL_CHILD_MAX 8
 #endif
 
+#ifndef CC_PARALLEL_CLOSE_MAX
+#define CC_PARALLEL_CLOSE_MAX 8
+#endif
+
 typedef struct CCParallel {
     cc_atomic_int joined;
-    int paused;
+    cc_atomic_int planted;
+    cc_atomic_int paused;
     cc_atomic_int cancelled;
+    cc_atomic_int left;
     int fail;
     int fin;
     int nt;
+    int ncap;
     int nch;
+    int nclose;
     CCError err;
     CCNurseryHost* n;
+    struct CCChan* closing[CC_PARALLEL_CLOSE_MAX];
+    void (*leftover_fn)(void*);
+    void* leftover_ctx;
     struct CCParallel* parent;
     struct CCParallel* children[CC_PARALLEL_CHILD_MAX];
     CCTask tasks[CC_PARALLEL_TASK_MAX];
     void* envs[CC_PARALLEL_TASK_MAX];
+    CCTask* xtasks;
+    void** xenvs;
 } CCParallel;
 
 #ifndef CCResult_CCParallel_CCError_DEFINED
 #define CCResult_CCParallel_CCError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCParallel_CCError_DEFINED
+#define CCResult_CCParallel_CCError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCParallel_CCError, CCParallel, CCError)
+#endif
 CC_DECL_RESULT_SPEC(CCResult_CCParallel_CCError, CCParallel, CCError)
 #endif
 
@@ -61,7 +101,47 @@ static inline CCParallel cc_parallel_empty(void) {
     return h;
 }
 
+/* Construct-only: dest bind. Idle is `empty()`. */
+static inline CCParallel cc_parallel_dest(void) {
+    CCParallel h = {0};
+    cc_atomic_store(&h.planted, 1);
+    return h;
+}
+
+/* Planted and not joined or left. Pause is a flag on a live dest, not a lifetime. */
+static inline bool cc_parallel_live(const CCParallel* h) {
+    if (!h)
+        return false;
+    return cc_atomic_load(&h->planted) != 0 &&
+           cc_atomic_load(&h->joined) == 0 &&
+           cc_atomic_load(&h->left) == 0;
+}
+
 CCResult_void_CCError cc_parallel_wait(CCParallel* h);
+void cc_parallel_attach(CCParallel* h, CCTask t);
+void cc_parallel_admit(CCParallel* h, CCTask t, void* env);
+void cc_parallel_die(const char* msg);
+void cc_parallel_wake_attached(CCParallel* h);
+int cc_parallel_current_cancelled(void);
+void cc_parallel_deny_enter(CCParallel* dest);
+void cc_parallel_note_denied(void);
+void cc_parallel_deny_leave(void);
+void cc_parallel_deny_leave_dest(CCParallel* dest);
+int cc_parallel_denied_here(void);
+void cc_parallel_abort_if_denied_chan(const char* reason);
+CCResult_void_CCError cc_parallel_close(CCParallel* h, CCChanTx tx);
+CCResult_void_CCError cc_parallel_register_leftover(CCParallel* h, void* ctx,
+                                              void (*finish)(void*));
+void cc_parallel_leave1(CCParallel* h);
+CCResult_void_CCError cc_parallel_leave_with(CCParallel* h, void* ctx,
+                                       void (*finish)(void*));
+
+/* UFCS `h.leave()` / `h.leave(ctx, finish)` and the C twin. */
+#define CC__PARALLEL_LEAVE_PICK(_1, _2, _3, NAME, ...) NAME
+#define cc_parallel_leave(...)                                                 \
+    CC__PARALLEL_LEAVE_PICK(__VA_ARGS__, cc_parallel_leave_with,               \
+                            cc__parallel_leave_needs_0_or_2,                   \
+                            cc_parallel_leave1)(__VA_ARGS__)
 
 static inline int cc__parallel_contains(const CCParallel* root,
                                         const CCParallel* needle) {
@@ -82,12 +162,13 @@ static inline int cc__parallel_cancel_one(CCParallel* h) {
     int expected = 0;
     if (!h)
         return 0;
-    if (cc_atomic_load(&h->joined))
+    if (!cc_parallel_live(h))
         return 0;
     if (!cc_atomic_cas(&h->cancelled, &expected, 1))
         return 0;
     if (h->n)
         cc_nursery_cancel_host(h->n);
+    cc_parallel_wake_attached(h);
     return 1;
 }
 
@@ -114,10 +195,10 @@ static inline CCResult_void_CCError cc__parallel_adopt(CCParallel* parent,
         return cc_err_CCResult_void_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "adopt"));
     if (parent == child)
         return cc_err_CCResult_void_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "adopt self"));
-    if (cc_atomic_load(&parent->joined))
-        return cc_err_CCResult_void_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "adopt: parent already joined"));
-    if (cc_atomic_load(&child->joined))
-        return cc_err_CCResult_void_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "adopt: child already joined"));
+    if (!cc_parallel_live(parent))
+        return cc_err_CCResult_void_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "adopt: parent not live"));
+    if (!cc_parallel_live(child))
+        return cc_err_CCResult_void_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "adopt: child not live"));
     if (child->parent)
         return cc_err_CCResult_void_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "adopt: child already adopted"));
     if (cc__parallel_contains(child, parent))
@@ -135,25 +216,42 @@ static inline CCResult_void_CCError cc__parallel_adopt(CCParallel* parent,
                        _Generic((child), CCParallel *: (child), default: &(child)))
 
 static inline CCResult_bool_CCIoError cc_parallel_pause(CCParallel* h) {
+    int expected = 0;
     if (!h)
         return cc_err_CCResult_bool_CCIoError(cc_io_error(CC_IO_INVALID_ARGUMENT));
-    if (cc_atomic_load(&h->joined))
+    if (!cc_parallel_live(h))
         return cc_ok_CCResult_bool_CCIoError(false);
-    if (h->paused)
+    if (!cc_atomic_cas(&h->paused, &expected, 1))
         return cc_ok_CCResult_bool_CCIoError(false);
-    h->paused = 1;
     return cc_ok_CCResult_bool_CCIoError(true);
 }
 
 static inline CCResult_bool_CCIoError cc_parallel_resume(CCParallel* h) {
+    int expected = 1;
     if (!h)
         return cc_err_CCResult_bool_CCIoError(cc_io_error(CC_IO_INVALID_ARGUMENT));
-    if (cc_atomic_load(&h->joined))
+    if (!cc_parallel_live(h))
         return cc_ok_CCResult_bool_CCIoError(false);
-    if (!h->paused)
+    if (!cc_atomic_cas(&h->paused, &expected, 0))
         return cc_ok_CCResult_bool_CCIoError(false);
-    h->paused = 0;
     return cc_ok_CCResult_bool_CCIoError(true);
+}
+
+/* UFCS `h.paused()` — same cell as the `paused` field. */
+static inline bool cc_parallel_paused(const CCParallel* h) {
+    if (!h)
+        return false;
+    return cc_atomic_load(&h->paused) != 0;
+}
+
+/* Construct seam: yield while paused. Cancel or join unsticks.
+ * Cancel does not skip the piece. */
+static inline void cc_parallel_honor(const CCParallel* h) {
+    if (!h)
+        return;
+    while (cc_parallel_live(h) && cc_atomic_load(&h->paused) &&
+           !cc_atomic_load(&h->cancelled))
+        cc_yield();
 }
 
 static inline CCSlice cc_parallel_lower_c(CCSlice recv_type,

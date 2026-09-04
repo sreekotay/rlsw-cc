@@ -139,6 +139,11 @@ typedef struct CCJsError {
 
 #ifndef CCResult_CCJs_CCJsError_DEFINED
 #define CCResult_CCJs_CCJsError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCJs_CCJsError_DEFINED
+#define CCResult_CCJs_CCJsError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCJs_CCJsError, CCJs, CCJsError)
+#endif
 CC_DECL_RESULT_SPEC(CCResult_CCJs_CCJsError, CCJs, CCJsError)
 #endif
 #ifndef CCResult_CCJsVal_CCJsError_DEFINED
@@ -4344,10 +4349,20 @@ typedef struct CCJsDomTaInfo {
 
 #ifndef CCResult_CCJsDom_CCJsError_DEFINED
 #define CCResult_CCJsDom_CCJsError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCJsDom_CCJsError_DEFINED
+#define CCResult_CCJsDom_CCJsError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCJsDom_CCJsError, CCJsDom, CCJsError)
+#endif
 CC_DECL_RESULT_SPEC(CCResult_CCJsDom_CCJsError, CCJsDom, CCJsError)
 #endif
 #ifndef CCResult_CCJsDomVal_CCJsError_DEFINED
 #define CCResult_CCJsDomVal_CCJsError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCJsDomVal_CCJsError_DEFINED
+#define CCResult_CCJsDomVal_CCJsError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCJsDomVal_CCJsError, CCJsDomVal, CCJsError)
+#endif
 CC_DECL_RESULT_SPEC(CCResult_CCJsDomVal_CCJsError, CCJsDomVal, CCJsError)
 #endif
 
@@ -4436,6 +4451,11 @@ static inline CCJsDomVal cc_js_null(CCJsDom *dom) {
 
 #ifndef CCResult_CCJsDomTaInfo_CCJsError_DEFINED
 #define CCResult_CCJsDomTaInfo_CCJsError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCJsDomTaInfo_CCJsError_DEFINED
+#define CCResult_CCJsDomTaInfo_CCJsError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCJsDomTaInfo_CCJsError, CCJsDomTaInfo, CCJsError)
+#endif
 CC_DECL_RESULT_SPEC(CCResult_CCJsDomTaInfo_CCJsError, CCJsDomTaInfo, CCJsError)
 #endif
 

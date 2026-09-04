@@ -190,6 +190,11 @@ CC_DECL_RESULT_SPEC(CCResult_CCPy_CCPyError, CCPy, CCPyError)
 #define CCResult_CCPyptr_CCError_DEFINED 1
 /* Ok type is the interpreter pointer so `py_expose` can hand the receiver
  * back and chain. */
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCPyptr_CCError_DEFINED
+#define CCResult_CCPyptr_CCError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCPyptr_CCError, CCPyptr, CCError)
+#endif
 CC_DECL_RESULT_SPEC(CCResult_CCPyptr_CCError, CCPy*, CCError)
 #endif
 #ifndef CCResult_CCPyObj_CCPyError_DEFINED

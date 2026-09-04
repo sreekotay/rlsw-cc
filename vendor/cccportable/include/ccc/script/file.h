@@ -22,37 +22,45 @@
 CC_DECL_RESULT_SPEC(CCResult_CCSlice_CCError, CCSlice, CCError)
 #endif
 static inline CCResult_CCSlice_CCError cc_file_read_path(CCSlice path, CCArena arena) {
-    CCFile file;
-    CCResult_CCSlice_CCIoError r;
     if (!path.ptr || !cc_arena_is_live(arena)) {
         return cc_err_CCResult_CCSlice_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "cc_file_read_path: bad args"));
     }
-    if (cc_file_open(&file, path, "rb") != 0) {
-        return cc_err_CCResult_CCSlice_CCError(CC_ERROR(CC_ERR_IO, cc_io_error_str(cc_io_from_errno(errno))));
-    }
-    r = cc_file_read_all(&file, arena);
+    CCFile file =({ CCResult_CCFile_CCIoError __cc_pu_x_1 = (cc_file_open(path));
+    if (CCResult_CCFile_CCIoError_is_err(__cc_pu_x_1)) {
+        cc_rt_diag_record_unwrap_site("/Users/airm5/Documents/code/concurrent-c/cc/include/ccc/script/file.cch", "23"); CCIoError __cc_pu_bind_1_e = (__cc_pu_x_1).u.error; 
+        return cc_err_CCResult_CCSlice_CCError(CC_ERROR(CC_ERR_IO, cc_io_error_str(__cc_pu_bind_1_e)));
+     } CCResult_CCFile_CCIoError_unwrap(__cc_pu_x_1); });
+/*CC_LN 26 include/ccc/script/file.cch*/
+    CCSlice data =({ CCResult_CCSlice_CCIoError __cc_pu_x_2 = (cc_file_read_all(&file, arena));
+    if (CCResult_CCSlice_CCIoError_is_err(__cc_pu_x_2)) {
+        cc_rt_diag_record_unwrap_site("/Users/airm5/Documents/code/concurrent-c/cc/include/ccc/script/file.cch", "26"); CCIoError __cc_pu_bind_2_e = (__cc_pu_x_2).u.error; 
+        cc_file_close(&file);
+        return cc_err_CCResult_CCSlice_CCError(CC_ERROR(CC_ERR_IO, cc_io_error_str(__cc_pu_bind_2_e)));
+     } CCResult_CCSlice_CCIoError_unwrap(__cc_pu_x_2); });
+/*CC_LN 30 include/ccc/script/file.cch*/
     cc_file_close(&file);
-    if (cc_is_err(r)) {
-        return cc_err_CCResult_CCSlice_CCError(CC_ERROR(CC_ERR_IO, cc_io_error_str(cc_error(r))));
-    }
-    return cc_ok_CCResult_CCSlice_CCError(cc_value(r));
+    return cc_ok_CCResult_CCSlice_CCError(data);
 }
 
 static inline CCResult_size_t_CCError cc_file_write_path(CCSlice path, CCSlice data) {
-    CCFile file;
-    CCResult_size_t_CCIoError r;
     if (!path.ptr) {
         return cc_err_CCResult_size_t_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "cc_file_write_path: bad path"));
     }
-    if (cc_file_open(&file, path, "wb") != 0) {
-        return cc_err_CCResult_size_t_CCError(CC_ERROR(CC_ERR_IO, cc_io_error_str(cc_io_from_errno(errno))));
-    }
-    r = cc_file_write(&file, data);
+    CCFile file = {0};{ CCResult_void_CCIoError __cc_pu_s_1 = (cc_file_create(&file, path));
+    if (CCResult_void_CCIoError_is_err(__cc_pu_s_1)) {
+        cc_rt_diag_record_unwrap_site("/Users/airm5/Documents/code/concurrent-c/cc/include/ccc/script/file.cch", "39"); CCIoError __cc_pu_bind_1_e = (__cc_pu_s_1).u.error; 
+        return cc_err_CCResult_size_t_CCError(CC_ERROR(CC_ERR_IO, cc_io_error_str(__cc_pu_bind_1_e)));
+     } }
+/*CC_LN 42 include/ccc/script/file.cch*/
+    size_t n =({ CCResult_size_t_CCIoError __cc_pu_x_3 = (cc_file_write(&file, data));
+    if (CCResult_size_t_CCIoError_is_err(__cc_pu_x_3)) {
+        cc_rt_diag_record_unwrap_site("/Users/airm5/Documents/code/concurrent-c/cc/include/ccc/script/file.cch", "42"); CCIoError __cc_pu_bind_3_e = (__cc_pu_x_3).u.error; 
+        cc_file_close(&file);
+        return cc_err_CCResult_size_t_CCError(CC_ERROR(CC_ERR_IO, cc_io_error_str(__cc_pu_bind_3_e)));
+     } CCResult_size_t_CCIoError_unwrap(__cc_pu_x_3); });
+/*CC_LN 46 include/ccc/script/file.cch*/
     cc_file_close(&file);
-    if (cc_is_err(r)) {
-        return cc_err_CCResult_size_t_CCError(CC_ERROR(CC_ERR_IO, cc_io_error_str(cc_error(r))));
-    }
-    return cc_ok_CCResult_size_t_CCError(cc_value(r));
+    return cc_ok_CCResult_size_t_CCError(n);
 }
 
 static inline CCResult_bool_CCError cc_file_copy(CCSlice src, CCSlice dst, CCArena arena) {

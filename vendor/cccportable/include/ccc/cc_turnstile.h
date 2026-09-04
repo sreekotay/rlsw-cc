@@ -174,6 +174,11 @@ static inline void cc_turnstile_destroy(CCTurnstile* t) {
 /* slots[0..n_stages) must be contiguous CCTurnstileStage storage. */
 static inline CCResult_void_CCError cc_turnstile_init(CCTurnstile* t, int cap,
                                                 int n_stages, CCArena arena,
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCExclusive_CCError_DEFINED
+#define CCResult_CCExclusive_CCError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCExclusive_CCError, CCExclusive, CCError)
+#endif
                                                 CCTurnstileStage* slots) {
     int k;
     int tok = 1;

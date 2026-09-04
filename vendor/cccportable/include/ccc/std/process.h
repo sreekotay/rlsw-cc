@@ -67,6 +67,11 @@ CC_DECL_RESULT_SPEC(CCResult_CCProcessStatus_CCIoError, CCProcessStatus, CCIoErr
 
 #ifndef CCResult_int_CCIoError_DEFINED
 #define CCResult_int_CCIoError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_int_CCIoError_DEFINED
+#define CCResult_int_CCIoError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_int_CCIoError, int, CCIoError)
+#endif
 CC_DECL_RESULT_SPEC(CCResult_int_CCIoError, int, CCIoError)
 #endif
 

@@ -296,4 +296,8 @@ CCIpAddr cc_ip_parse(const char* s, size_t len, CCNetError* out_err);
 /* CCSocket / CCListener UFCS dispatch is covered by the global `*`
    registration in cc_arena.cch; no per-type opt-in needed here. */
 
+/* cc_listener_close is idempotent (fd = -1; no-op when already closed),
+ * as a registered destroy hook must be. `.create` is listen. */
+
+
 #endif /* CC_STD_NET_H */

@@ -63,7 +63,6 @@ static inline CCResult_CCTempFile_CCError cc_temp_file(CCArena arena) {
     size_t n;
     CCSlice path;
     CCTempFile tmp;
-    FILE *fp;
     if (!cc_arena_is_live(arena)) {
         return cc_err_CCResult_CCTempFile_CCError(CC_ERROR(CC_ERR_INVALID_ARG, "cc_temp_file: no arena"));
     }
@@ -71,23 +70,17 @@ static inline CCResult_CCTempFile_CCError cc_temp_file(CCArena arena) {
     if (fd < 0) {
         return cc_err_CCResult_CCTempFile_CCError(CC_ERROR(CC_ERR_IO, "cc_temp_file: mkstemp failed"));
     }
-    fp = fdopen(fd, "w+");
-    if (!fp) {
-        close(fd);
-        unlink(tmpl);
-        return cc_err_CCResult_CCTempFile_CCError(CC_ERROR(CC_ERR_IO, "cc_temp_file: fdopen failed"));
-    }
     n = strlen(tmpl);
     path = cc_arena_alloc_slice_bytes(arena, n + 1);
     if (!path.ptr) {
-        fclose(fp);
+        close(fd);
         unlink(tmpl);
         return cc_err_CCResult_CCTempFile_CCError(CC_ERROR(CC_ERR_OUT_OF_MEMORY, "cc_temp_file: alloc"));
     }
     memcpy(path.ptr, tmpl, n + 1);
     path.len = n;
     memset(&tmp, 0, sizeof(tmp));
-    tmp.file.handle = fp;
+    tmp.file.fd = fd;
     tmp.path = path;
     tmp.owns = 1;
     return cc_ok_CCResult_CCTempFile_CCError(tmp);
