@@ -4,7 +4,7 @@
  *
  * `@grammar(rules) Json { ... }` and `@grammar(schema) Tweet { ... }` lower
  * to per-name functions (Json_match, Tweet_parse, TweetReader, ...).
- * `@grammar(cli) Opts { ... }` (include `<ccc/std/cli.h>`) emits
+ * `@grammar(cli) Opts { ... }` (include `<ccc/std/cli.cch>`) emits
  * Opts_parse_args / Opts_prepare / Opts_print_usage. Those names are the
  * LOWERING CONTRACT — deterministic and callable — but the language surface
  * is these operations, uniform across every grammar and schema and greppable
@@ -46,7 +46,7 @@
  *                                           (`${cmd.to_str(&a)}`) and the
  *                                           language's x.to_str(arena) idiom
  *   cc_dom(Json, s, n, reg, arena, &out)    rules: SHAPED DOM -> CCShapeVal.
- *                                           Hidden classes (<ccc/cc_shape.h>):
+ *                                           Hidden classes (<ccc/cc_shape.cch>):
  *                                           instances carry 16 B value slots
  *                                           only; keys live in the caller's
  *                                           persistent CCShapeReg trie. Member-

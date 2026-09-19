@@ -7,7 +7,7 @@
  *   - Non-atomic fallback (last resort — not thread-safe)
  *
  * Usage:
- *   #include <ccc/cc_atomic.h>
+ *   #include <ccc/cc_atomic.cch>
  *
  *   cc_atomic_int counter = 0;
  *   cc_atomic_fetch_add(&counter, 1);
@@ -47,10 +47,28 @@ typedef _Atomic intptr_t cc_atomic_intptr;
 #define cc_atomic_fetch_add(ptr, val) atomic_fetch_add_explicit((ptr), (val), memory_order_seq_cst)
 #define cc_atomic_fetch_sub(ptr, val) atomic_fetch_sub_explicit((ptr), (val), memory_order_seq_cst)
 #define cc_atomic_fetch_xor(ptr, val) atomic_fetch_xor_explicit((ptr), (val), memory_order_seq_cst)
+#define cc_atomic_fetch_and(ptr, val) atomic_fetch_and_explicit((ptr), (val), memory_order_seq_cst)
 #define cc_atomic_load(ptr) atomic_load_explicit((ptr), memory_order_seq_cst)
 #define cc_atomic_store(ptr, val) atomic_store_explicit((ptr), (val), memory_order_seq_cst)
 #define cc_atomic_cas(ptr, expected_ptr, desired) \
     atomic_compare_exchange_strong_explicit((ptr), (expected_ptr), (desired), memory_order_seq_cst, memory_order_seq_cst)
+
+/* Ordered variants. Relaxed is for fields that a lock already serializes
+ * (the lock's acquire / release carry the ordering); acquire / release
+ * are for the lock word itself and for publish / consume pairs. */
+#define cc_atomic_load_relaxed(ptr) atomic_load_explicit((ptr), memory_order_relaxed)
+#define cc_atomic_store_relaxed(ptr, val) atomic_store_explicit((ptr), (val), memory_order_relaxed)
+#define cc_atomic_load_acquire(ptr) atomic_load_explicit((ptr), memory_order_acquire)
+#define cc_atomic_store_release(ptr, val) atomic_store_explicit((ptr), (val), memory_order_release)
+#define cc_atomic_fetch_add_relaxed(ptr, val) atomic_fetch_add_explicit((ptr), (val), memory_order_relaxed)
+#define cc_atomic_fetch_sub_relaxed(ptr, val) atomic_fetch_sub_explicit((ptr), (val), memory_order_relaxed)
+/* Weak: may fail spuriously; use in a retry loop. acquire takes something
+ * (a lock, bytes); acq_rel also publishes what the caller did before (gives
+ * bytes back, hands off state). */
+#define cc_atomic_cas_acquire(ptr, expected_ptr, desired) \
+    atomic_compare_exchange_weak_explicit((ptr), (expected_ptr), (desired), memory_order_acquire, memory_order_relaxed)
+#define cc_atomic_cas_acq_rel(ptr, expected_ptr, desired) \
+    atomic_compare_exchange_weak_explicit((ptr), (expected_ptr), (desired), memory_order_acq_rel, memory_order_relaxed)
 
 #define CC_ATOMIC_HAVE_REAL_ATOMICS 1
 
@@ -69,10 +87,19 @@ typedef volatile intptr_t cc_atomic_intptr;
 #define cc_atomic_fetch_add(ptr, val) ((*(ptr)) += (val), (*(ptr)) - (val))
 #define cc_atomic_fetch_sub(ptr, val) ((*(ptr)) -= (val), (*(ptr)) + (val))
 #define cc_atomic_fetch_xor(ptr, val) ((*(ptr)) ^= (val), (*(ptr)) ^ (val))
+#define cc_atomic_fetch_and(ptr, val) ((*(ptr)) &= (val), (*(ptr)))
 #define cc_atomic_load(ptr) (*(ptr))
 #define cc_atomic_store(ptr, val) ((*(ptr)) = (val))
 #define cc_atomic_cas(ptr, expected_ptr, desired) \
     ((*(ptr) == *(expected_ptr)) ? (*(ptr) = (desired), 1) : (*(expected_ptr) = *(ptr), 0))
+#define cc_atomic_load_relaxed(ptr) cc_atomic_load(ptr)
+#define cc_atomic_store_relaxed(ptr, val) cc_atomic_store((ptr), (val))
+#define cc_atomic_load_acquire(ptr) cc_atomic_load(ptr)
+#define cc_atomic_store_release(ptr, val) cc_atomic_store((ptr), (val))
+#define cc_atomic_fetch_add_relaxed(ptr, val) cc_atomic_fetch_add((ptr), (val))
+#define cc_atomic_fetch_sub_relaxed(ptr, val) cc_atomic_fetch_sub((ptr), (val))
+#define cc_atomic_cas_acquire(ptr, expected_ptr, desired) cc_atomic_cas((ptr), (expected_ptr), (desired))
+#define cc_atomic_cas_acq_rel(ptr, expected_ptr, desired) cc_atomic_cas((ptr), (expected_ptr), (desired))
 
 #define CC_ATOMIC_HAVE_REAL_ATOMICS 0
 
@@ -88,9 +115,22 @@ typedef volatile intptr_t cc_atomic_intptr;
 #define cc_atomic_fetch_add(ptr, val) __sync_fetch_and_add((ptr), (val))
 #define cc_atomic_fetch_sub(ptr, val) __sync_fetch_and_sub((ptr), (val))
 #define cc_atomic_fetch_xor(ptr, val) __sync_fetch_and_xor((ptr), (val))
+#define cc_atomic_fetch_and(ptr, val) __sync_fetch_and_and((ptr), (val))
 #define cc_atomic_load(ptr) __sync_fetch_and_add((ptr), 0)
 #define cc_atomic_store(ptr, val) do { __sync_synchronize(); *(ptr) = (val); __sync_synchronize(); } while(0)
 #define cc_atomic_cas(ptr, expected_ptr, desired) \
+    __sync_bool_compare_and_swap((ptr), *(expected_ptr), (desired))
+/* volatile access is the relaxed form here; __sync_* are full barriers, so
+ * the acquire / release forms lean on those. */
+#define cc_atomic_load_relaxed(ptr) (*(ptr))
+#define cc_atomic_store_relaxed(ptr, val) ((*(ptr)) = (val))
+#define cc_atomic_load_acquire(ptr) __sync_fetch_and_add((ptr), 0)
+#define cc_atomic_store_release(ptr, val) do { __sync_synchronize(); *(ptr) = (val); } while(0)
+#define cc_atomic_fetch_add_relaxed(ptr, val) __sync_fetch_and_add((ptr), (val))
+#define cc_atomic_fetch_sub_relaxed(ptr, val) __sync_fetch_and_sub((ptr), (val))
+#define cc_atomic_cas_acquire(ptr, expected_ptr, desired) \
+    __sync_bool_compare_and_swap((ptr), *(expected_ptr), (desired))
+#define cc_atomic_cas_acq_rel(ptr, expected_ptr, desired) \
     __sync_bool_compare_and_swap((ptr), *(expected_ptr), (desired))
 
 #define CC_ATOMIC_HAVE_REAL_ATOMICS 1
@@ -107,10 +147,19 @@ typedef volatile intptr_t cc_atomic_intptr;
 #define cc_atomic_fetch_add(ptr, val) ((*(ptr)) += (val), (*(ptr)) - (val))
 #define cc_atomic_fetch_sub(ptr, val) ((*(ptr)) -= (val), (*(ptr)) + (val))
 #define cc_atomic_fetch_xor(ptr, val) ((*(ptr)) ^= (val), (*(ptr)) ^ (val))
+#define cc_atomic_fetch_and(ptr, val) ((*(ptr)) &= (val), (*(ptr)))
 #define cc_atomic_load(ptr) (*(ptr))
 #define cc_atomic_store(ptr, val) ((*(ptr)) = (val))
 #define cc_atomic_cas(ptr, expected_ptr, desired) \
     ((*(ptr) == *(expected_ptr)) ? (*(ptr) = (desired), 1) : (*(expected_ptr) = *(ptr), 0))
+#define cc_atomic_load_relaxed(ptr) cc_atomic_load(ptr)
+#define cc_atomic_store_relaxed(ptr, val) cc_atomic_store((ptr), (val))
+#define cc_atomic_load_acquire(ptr) cc_atomic_load(ptr)
+#define cc_atomic_store_release(ptr, val) cc_atomic_store((ptr), (val))
+#define cc_atomic_fetch_add_relaxed(ptr, val) cc_atomic_fetch_add((ptr), (val))
+#define cc_atomic_fetch_sub_relaxed(ptr, val) cc_atomic_fetch_sub((ptr), (val))
+#define cc_atomic_cas_acquire(ptr, expected_ptr, desired) cc_atomic_cas((ptr), (expected_ptr), (desired))
+#define cc_atomic_cas_acq_rel(ptr, expected_ptr, desired) cc_atomic_cas((ptr), (expected_ptr), (desired))
 
 #define CC_ATOMIC_HAVE_REAL_ATOMICS 0
 #warning "Unknown compiler - using non-atomic fallback. Not thread-safe!"
@@ -121,6 +170,94 @@ typedef volatile intptr_t cc_atomic_intptr;
  * `.fetch_xor()` UFCS (that family hook exists only for fetch_add). */
 static inline uint64_t cc_atomic_u64_fetch_xor(cc_atomic_u64* p, uint64_t v) {
     return cc_atomic_fetch_xor(p, v);
+}
+
+/* UFCS surface for the atomic scalars: `x.load()`, `x.store(v)`,
+ * `x.fetch_add(v)`, `x.cas(&expected, desired)`.
+ *
+ * The operations above are function-like macros, and a macro carries no
+ * parameter types: nothing in one says the receiver goes in by address,
+ * and no name composed from the receiver type resolves to one. These
+ * typed wrappers are that declaration -- one `<type>_<method>` per pair,
+ * first parameter a pointer to the atomic. The ordered variants keep the
+ * macro spelling only; they are written as calls, not as methods. */
+
+static inline int cc_atomic_int_load(cc_atomic_int* p) {
+    return cc_atomic_load(p);
+}
+static inline void cc_atomic_int_store(cc_atomic_int* p, int v) {
+    cc_atomic_store(p, v);
+}
+static inline int cc_atomic_int_fetch_add(cc_atomic_int* p, int v) {
+    return cc_atomic_fetch_add(p, v);
+}
+static inline int cc_atomic_int_cas(cc_atomic_int* p, int* expected, int desired) {
+    return cc_atomic_cas(p, expected, desired) ? 1 : 0;
+}
+
+static inline unsigned int cc_atomic_uint_load(cc_atomic_uint* p) {
+    return cc_atomic_load(p);
+}
+static inline void cc_atomic_uint_store(cc_atomic_uint* p, unsigned int v) {
+    cc_atomic_store(p, v);
+}
+static inline unsigned int cc_atomic_uint_fetch_add(cc_atomic_uint* p, unsigned int v) {
+    return cc_atomic_fetch_add(p, v);
+}
+static inline int cc_atomic_uint_cas(cc_atomic_uint* p, unsigned int* expected, unsigned int desired) {
+    return cc_atomic_cas(p, expected, desired) ? 1 : 0;
+}
+
+static inline size_t cc_atomic_size_load(cc_atomic_size* p) {
+    return cc_atomic_load(p);
+}
+static inline void cc_atomic_size_store(cc_atomic_size* p, size_t v) {
+    cc_atomic_store(p, v);
+}
+static inline size_t cc_atomic_size_fetch_add(cc_atomic_size* p, size_t v) {
+    return cc_atomic_fetch_add(p, v);
+}
+static inline int cc_atomic_size_cas(cc_atomic_size* p, size_t* expected, size_t desired) {
+    return cc_atomic_cas(p, expected, desired) ? 1 : 0;
+}
+
+static inline int64_t cc_atomic_i64_load(cc_atomic_i64* p) {
+    return cc_atomic_load(p);
+}
+static inline void cc_atomic_i64_store(cc_atomic_i64* p, int64_t v) {
+    cc_atomic_store(p, v);
+}
+static inline int64_t cc_atomic_i64_fetch_add(cc_atomic_i64* p, int64_t v) {
+    return cc_atomic_fetch_add(p, v);
+}
+static inline int cc_atomic_i64_cas(cc_atomic_i64* p, int64_t* expected, int64_t desired) {
+    return cc_atomic_cas(p, expected, desired) ? 1 : 0;
+}
+
+static inline uint64_t cc_atomic_u64_load(cc_atomic_u64* p) {
+    return cc_atomic_load(p);
+}
+static inline void cc_atomic_u64_store(cc_atomic_u64* p, uint64_t v) {
+    cc_atomic_store(p, v);
+}
+static inline uint64_t cc_atomic_u64_fetch_add(cc_atomic_u64* p, uint64_t v) {
+    return cc_atomic_fetch_add(p, v);
+}
+static inline int cc_atomic_u64_cas(cc_atomic_u64* p, uint64_t* expected, uint64_t desired) {
+    return cc_atomic_cas(p, expected, desired) ? 1 : 0;
+}
+
+static inline intptr_t cc_atomic_intptr_load(cc_atomic_intptr* p) {
+    return cc_atomic_load(p);
+}
+static inline void cc_atomic_intptr_store(cc_atomic_intptr* p, intptr_t v) {
+    cc_atomic_store(p, v);
+}
+static inline intptr_t cc_atomic_intptr_fetch_add(cc_atomic_intptr* p, intptr_t v) {
+    return cc_atomic_fetch_add(p, v);
+}
+static inline int cc_atomic_intptr_cas(cc_atomic_intptr* p, intptr_t* expected, intptr_t desired) {
+    return cc_atomic_cas(p, expected, desired) ? 1 : 0;
 }
 
 #endif /* CC_ATOMIC_CCH */

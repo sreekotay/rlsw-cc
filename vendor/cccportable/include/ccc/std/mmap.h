@@ -11,7 +11,7 @@
 #define CC_STD_MMAP_H
 
 #if defined(_WIN32)
-#error "<ccc/std/mmap.h> is POSIX-only"
+#error "<ccc/std/mmap.cch> is POSIX-only"
 #endif
 
 #include <errno.h>

@@ -1,0 +1,1835 @@
+/*
+ * QuickJS interop: in-process embed (docs/quickjs.md; spec
+ * "QuickJS interop" in spec/concurrent-c-stdlib-spec.md).
+ *
+ *   CCQjs js = cc_qjs_new(a) !> @destroy;
+ *   CCQjsVal Math = js.eval("Math") !> @destroy;
+ *   double v = Math.sqrt(2.0) !>;
+ *
+ * CC ships the binding only. The engine is a project dependency from
+ * upstream (bellard/quickjs or quickjs-ng/quickjs): CC_LIBQJS
+ * (already-built adapter .so) or CC_QUICKJS_SRC / ./quickjs /
+ * ./third_party/quickjs / ./vendor/quickjs. The adapter compiles
+ * JS_NewClassID as two-arg when QJS_VERSION_MAJOR is defined (ng).
+ * Absence is a CCQjsError, not a link dependency. No child process, no
+ * Node-API, no download.
+ *
+ * Memory: the constructor arena holds error text, default extracts, and
+ * own::[T] slots. Release that arena (handle close) is teardown. The JS
+ * object is a binding; its finalizer poisons the opaque and does not
+ * free T. A later language hoist of perf/wstore5.ccs is the per-object
+ * reclaim story — not this header.
+ */
+#ifndef CC_SCRIPT_QUICKJS_H
+#define CC_SCRIPT_QUICKJS_H
+
+#include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <stdarg.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <ccc/cc_arena.h>
+#include <ccc/cc_compat.h>
+#include <ccc/cc_result.h>
+#include <ccc/cc_slice.h>
+#include <ccc/cc_type.h>
+
+#ifndef CC__QJS_MAX_CALL_ARGS
+#define CC__QJS_MAX_CALL_ARGS 16
+#endif
+
+/* Packed JSValue — layout is the adapter's, never this header's. */
+typedef struct CCQjsRaw {
+    unsigned char b[16];
+} CCQjsRaw;
+
+typedef struct CCQjs {
+    int ready;
+    CCArena arena;
+    void *rt;
+    void *ctx;
+} CCQjs;
+
+typedef struct CCQjsVal {
+    CCQjs *home;
+    CCQjsRaw v;
+    int live; /* 1 while this handle still owns a JS reference */
+} CCQjsVal;
+
+typedef struct CCQjsError {
+    CCError base;
+    CCSlice name;
+    CCSlice stack;
+} CCQjsError;
+
+
+
+#ifndef CCResult_CCQjs_CCQjsError_DEFINED
+#define CCResult_CCQjs_CCQjsError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCQjs_CCQjsError_DEFINED
+#define CCResult_CCQjs_CCQjsError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCQjs_CCQjsError, CCQjs, CCQjsError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_CCQjs_CCQjsError, CCQjs, CCQjsError)
+#endif
+#ifndef CCResult_CCQjsVal_CCQjsError_DEFINED
+#define CCResult_CCQjsVal_CCQjsError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCQjsVal_CCQjsError_DEFINED
+#define CCResult_CCQjsVal_CCQjsError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCQjsVal_CCQjsError, CCQjsVal, CCQjsError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_CCQjsVal_CCQjsError, CCQjsVal, CCQjsError)
+#endif
+#ifndef CCResult_void_CCQjsError_DEFINED
+#define CCResult_void_CCQjsError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_void_CCQjsError_DEFINED
+#define CCResult_void_CCQjsError_DEFINED 1
+CC_DECL_RESULT_SPEC_VOID(CCResult_void_CCQjsError, CCQjsError)
+#endif
+CC_DECL_RESULT_SPEC_VOID(CCResult_void_CCQjsError, CCQjsError)
+#endif
+#ifndef CCResult_double_CCQjsError_DEFINED
+#define CCResult_double_CCQjsError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_double_CCQjsError_DEFINED
+#define CCResult_double_CCQjsError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_double_CCQjsError, double, CCQjsError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_double_CCQjsError, double, CCQjsError)
+#endif
+#ifndef CCResult_float_CCQjsError_DEFINED
+#define CCResult_float_CCQjsError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_float_CCQjsError_DEFINED
+#define CCResult_float_CCQjsError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_float_CCQjsError, float, CCQjsError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_float_CCQjsError, float, CCQjsError)
+#endif
+#ifndef CCResult_int_CCQjsError_DEFINED
+#define CCResult_int_CCQjsError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_int_CCQjsError_DEFINED
+#define CCResult_int_CCQjsError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_int_CCQjsError, int, CCQjsError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_int_CCQjsError, int, CCQjsError)
+#endif
+#ifndef CCResult_int64_t_CCQjsError_DEFINED
+#define CCResult_int64_t_CCQjsError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_int64_t_CCQjsError_DEFINED
+#define CCResult_int64_t_CCQjsError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_int64_t_CCQjsError, int64_t, CCQjsError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_int64_t_CCQjsError, int64_t, CCQjsError)
+#endif
+#ifndef CCResult_long_long_CCQjsError_DEFINED
+#define CCResult_long_long_CCQjsError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_long_long_CCQjsError_DEFINED
+#define CCResult_long_long_CCQjsError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_long_long_CCQjsError, long long, CCQjsError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_long_long_CCQjsError, long long, CCQjsError)
+#endif
+#ifndef CCResult_CCSlice_CCQjsError_DEFINED
+#define CCResult_CCSlice_CCQjsError_DEFINED 1
+/* --- CC auto-generated type declaration --- */
+#ifndef CCResult_CCSlice_CCQjsError_DEFINED
+#define CCResult_CCSlice_CCQjsError_DEFINED 1
+CC_DECL_RESULT_SPEC(CCResult_CCSlice_CCQjsError, CCSlice, CCQjsError)
+#endif
+CC_DECL_RESULT_SPEC(CCResult_CCSlice_CCQjsError, CCSlice, CCQjsError)
+#endif
+
+typedef CCQjsRaw (*cc__qjs_cfn)(void *ctx, CCQjsRaw this_v, int argc,
+                                CCQjsRaw *argv);
+
+typedef struct CC__QjsApi {
+    void *(*new_runtime)(void);
+    void (*free_runtime)(void *rt);
+    void *(*new_context)(void *rt);
+    void (*free_context)(void *ctx);
+    CCQjsRaw (*eval)(void *ctx, const char *s, size_t n, const char *fn,
+                     int flags);
+    int (*is_exception)(CCQjsRaw v);
+    CCQjsRaw (*get_exception)(void *ctx);
+    void (*free_value)(void *ctx, CCQjsRaw v);
+    CCQjsRaw (*dup_value)(void *ctx, CCQjsRaw v);
+    CCQjsRaw (*undefined)(void);
+    CCQjsRaw (*get_global)(void *ctx);
+    CCQjsRaw (*get_prop)(void *ctx, CCQjsRaw obj, const char *name);
+    int (*set_prop)(void *ctx, CCQjsRaw obj, const char *name, CCQjsRaw val);
+    CCQjsRaw (*call)(void *ctx, CCQjsRaw fn, CCQjsRaw this_v, int argc,
+                     CCQjsRaw *argv);
+    const char *(*to_cstr)(void *ctx, CCQjsRaw v, size_t *len);
+    void (*free_cstr)(void *ctx, const char *s);
+    int (*to_f64)(void *ctx, CCQjsRaw v, double *out);
+    int (*to_i64)(void *ctx, CCQjsRaw v, int64_t *out);
+    int (*to_bool)(void *ctx, CCQjsRaw v);
+    CCQjsRaw (*new_bool)(void *ctx, int v);
+    CCQjsRaw (*new_i64)(void *ctx, int64_t v);
+    CCQjsRaw (*new_f64)(void *ctx, double v);
+    CCQjsRaw (*new_str)(void *ctx, const char *s, size_t n);
+    CCQjsRaw (*new_array)(void *ctx);
+    int (*set_uint32)(void *ctx, CCQjsRaw obj, uint32_t idx, CCQjsRaw val);
+    int (*is_undefined)(CCQjsRaw v);
+    int (*is_null)(CCQjsRaw v);
+    int (*is_function)(void *ctx, CCQjsRaw v);
+    int (*new_class_id)(void *rt, uint32_t *p);
+    int (*new_class)(void *rt, uint32_t id, const char *name);
+    CCQjsRaw (*new_object_class)(void *ctx, uint32_t id);
+    void (*set_opaque)(CCQjsRaw obj, void *p);
+    void *(*get_opaque)(CCQjsRaw obj, uint32_t id);
+    CCQjsRaw (*new_cfunc)(void *ctx, cc__qjs_cfn fn, const char *name,
+                          int length);
+    CCQjsRaw (*throw_type)(void *ctx, const char *msg);
+    int (*execute_pending_job)(void *rt);
+} CC__QjsApi;
+
+static CC__QjsApi cc__qjs;
+static void *cc__qjs_lib;
+static char cc__qjs_errbuf[768];
+static CCArena cc__qjs_err_arena;
+static int cc__qjs_load_once;
+static int cc__qjs_load_rc = -1;
+
+/* ---- adapter (compiled against the user's QuickJS tree) ---- */
+
+static const char cc__qjs_adapter_text[] =
+    "#include \"quickjs.h\"\n"
+    "#include <stdint.h>\n"
+    "#include <string.h>\n"
+    "#include <stdlib.h>\n"
+    "typedef struct { unsigned char b[16]; } R;\n"
+    "typedef R (*UFn)(void *ctx, R this_v, int argc, R *argv);\n"
+    "static R pack(JSValue v) {\n"
+    "    R r; memset(&r, 0, sizeof(r));\n"
+    "    memcpy(&r, &v, sizeof(v) < sizeof(r) ? sizeof(v) : sizeof(r));\n"
+    "    return r;\n"
+    "}\n"
+    "static JSValue unpack(R r) {\n"
+    "    JSValue v; memset(&v, 0, sizeof(v));\n"
+    "    memcpy(&v, &r, sizeof(v) < sizeof(r) ? sizeof(v) : sizeof(r));\n"
+    "    return v;\n"
+    "}\n"
+    "void *cc__qjs_new_runtime(void) { return JS_NewRuntime(); }\n"
+    "void cc__qjs_free_runtime(void *rt) { if (rt) JS_FreeRuntime(rt); }\n"
+    "void *cc__qjs_new_context(void *rt) { return rt ? JS_NewContext(rt) : 0; }\n"
+    "void cc__qjs_free_context(void *ctx) { if (ctx) JS_FreeContext(ctx); }\n"
+    "R cc__qjs_eval(void *ctx, const char *s, size_t n, const char *fn, int flags) {\n"
+    "    return pack(JS_Eval(ctx, s, n, fn ? fn : \"<eval>\", flags));\n"
+    "}\n"
+    "int cc__qjs_is_exception(R v) { return JS_IsException(unpack(v)); }\n"
+    "R cc__qjs_get_exception(void *ctx) { return pack(JS_GetException(ctx)); }\n"
+    "void cc__qjs_free_value(void *ctx, R v) { JS_FreeValue(ctx, unpack(v)); }\n"
+    "R cc__qjs_dup_value(void *ctx, R v) { return pack(JS_DupValue(ctx, unpack(v))); }\n"
+    "R cc__qjs_undefined(void) { return pack(JS_UNDEFINED); }\n"
+    "R cc__qjs_get_global(void *ctx) { return pack(JS_GetGlobalObject(ctx)); }\n"
+    "R cc__qjs_get_prop(void *ctx, R obj, const char *name) {\n"
+    "    return pack(JS_GetPropertyStr(ctx, unpack(obj), name ? name : \"\"));\n"
+    "}\n"
+    "int cc__qjs_set_prop(void *ctx, R obj, const char *name, R val) {\n"
+    "    return JS_SetPropertyStr(ctx, unpack(obj), name ? name : \"\", unpack(val));\n"
+    "}\n"
+    "R cc__qjs_call(void *ctx, R fn, R this_v, int argc, R *argv) {\n"
+    "    JSValue a[16]; int i;\n"
+    "    if (argc < 0) argc = 0;\n"
+    "    if (argc > 16) argc = 16;\n"
+    "    for (i = 0; i < argc; i++) a[i] = unpack(argv[i]);\n"
+    "    return pack(JS_Call(ctx, unpack(fn), unpack(this_v), argc, a));\n"
+    "}\n"
+    "const char *cc__qjs_to_cstr(void *ctx, R v, size_t *len) {\n"
+    "    return JS_ToCStringLen(ctx, len, unpack(v));\n"
+    "}\n"
+    "void cc__qjs_free_cstr(void *ctx, const char *s) { JS_FreeCString(ctx, s); }\n"
+    "int cc__qjs_to_f64(void *ctx, R v, double *out) { return JS_ToFloat64(ctx, out, unpack(v)); }\n"
+    "int cc__qjs_to_i64(void *ctx, R v, int64_t *out) { return JS_ToInt64(ctx, out, unpack(v)); }\n"
+    "int cc__qjs_to_bool(void *ctx, R v) { return JS_ToBool(ctx, unpack(v)); }\n"
+    "R cc__qjs_new_bool(void *ctx, int v) { return pack(JS_NewBool(ctx, v)); }\n"
+    "R cc__qjs_new_i64(void *ctx, int64_t v) { return pack(JS_NewInt64(ctx, v)); }\n"
+    "R cc__qjs_new_f64(void *ctx, double v) { return pack(JS_NewFloat64(ctx, v)); }\n"
+    "R cc__qjs_new_str(void *ctx, const char *s, size_t n) {\n"
+    "    return pack(JS_NewStringLen(ctx, s ? s : \"\", n));\n"
+    "}\n"
+    "R cc__qjs_new_array(void *ctx) { return pack(JS_NewArray(ctx)); }\n"
+    "int cc__qjs_set_uint32(void *ctx, R obj, uint32_t idx, R val) {\n"
+    "    return JS_SetPropertyUint32(ctx, unpack(obj), idx, unpack(val));\n"
+    "}\n"
+    "int cc__qjs_is_undefined(R v) { return JS_IsUndefined(unpack(v)); }\n"
+    "int cc__qjs_is_null(R v) { return JS_IsNull(unpack(v)); }\n"
+    "int cc__qjs_is_function(void *ctx, R v) { return JS_IsFunction(ctx, unpack(v)); }\n"
+    "int cc__qjs_new_class_id(void *rt, uint32_t *p) {\n"
+    "    JSClassID id = p ? *p : 0;\n"
+    "#ifdef QJS_VERSION_MAJOR\n"
+    "    if (rt) JS_NewClassID((JSRuntime *)rt, &id);\n"
+    "#else\n"
+    "    (void)rt; JS_NewClassID(&id);\n"
+    "#endif\n"
+    "    if (p) *p = id; return 0;\n"
+    "}\n"
+    "static void cc__qjs_fin(JSRuntime *rt, JSValue v) { (void)rt; JS_SetOpaque(v, 0); }\n"
+    "int cc__qjs_new_class(void *rt, uint32_t id, const char *name) {\n"
+    "    JSClassDef d; memset(&d, 0, sizeof(d));\n"
+    "    d.class_name = name ? name : \"cc\";\n"
+    "    d.finalizer = cc__qjs_fin;\n"
+    "    return JS_NewClass(rt, id, &d);\n"
+    "}\n"
+    "R cc__qjs_new_object_class(void *ctx, uint32_t id) {\n"
+    "    return pack(JS_NewObjectClass(ctx, (int)id));\n"
+    "}\n"
+    "void cc__qjs_set_opaque(R obj, void *p) { JS_SetOpaque(unpack(obj), p); }\n"
+    "void *cc__qjs_get_opaque(R obj, uint32_t id) { return JS_GetOpaque(unpack(obj), id); }\n"
+    "static JSValue cc__qjs_gate(JSContext *ctx, JSValueConst this_val, int argc,\n"
+    "        JSValueConst *argv, int magic, JSValue *func_data) {\n"
+    "    size_t n = 0; uint8_t *buf; UFn fn; R this_r, args[16], out; int i;\n"
+    "    (void)magic;\n"
+    "    buf = JS_GetArrayBuffer(ctx, &n, func_data[0]);\n"
+    "    if (!buf || n < sizeof(fn)) return JS_ThrowTypeError(ctx, \"qjs: dead cfunc\");\n"
+    "    memcpy(&fn, buf, sizeof(fn));\n"
+    "    if (argc < 0) argc = 0;\n"
+    "    if (argc > 16) argc = 16;\n"
+    "    this_r = pack(this_val);\n"
+    "    for (i = 0; i < argc; i++) args[i] = pack(argv[i]);\n"
+    "    out = fn(ctx, this_r, argc, args);\n"
+    "    return unpack(out);\n"
+    "}\n"
+    "R cc__qjs_new_cfunc(void *ctx, UFn fn, const char *name, int length) {\n"
+    "    JSValue data, f;\n"
+    "    if (!fn) return pack(JS_ThrowTypeError(ctx, \"qjs: null cfunc\"));\n"
+    "    data = JS_NewArrayBufferCopy(ctx, (const uint8_t *)&fn, sizeof(fn));\n"
+    "    f = JS_NewCFunctionData(ctx, cc__qjs_gate, length, 0, 1, &data);\n"
+    "    JS_FreeValue(ctx, data);\n"
+    "    (void)name;\n"
+    "    return pack(f);\n"
+    "}\n"
+    "R cc__qjs_throw_type(void *ctx, const char *msg) {\n"
+    "    return pack(JS_ThrowTypeError(ctx, \"%s\", msg ? msg : \"qjs: type error\"));\n"
+    "}\n"
+    "int cc__qjs_execute_pending_job(void *rt) {\n"
+    "    JSContext *c = 0;\n"
+    "    if (!rt) return 0;\n"
+    "    return JS_ExecutePendingJob((JSRuntime *)rt, &c);\n"
+    "}\n";
+
+static unsigned long cc__qjs_hash(const char *s) {
+    unsigned long h = 5381;
+    if (!s) return h;
+    while (*s) h = h * 33 + (unsigned char)*s++;
+    return h;
+}
+
+static unsigned long cc__qjs_hash_file(unsigned long h, const char *path) {
+    struct stat st;
+    h = h * 33 + cc__qjs_hash(path);
+    if (path && stat(path, &st) == 0) {
+        h = h * 33 + (unsigned long)st.st_size;
+        h = h * 33 + (unsigned long)st.st_mtime;
+    }
+    return h;
+}
+
+static int cc__qjs_mkdirs(const char *path) {
+    char buf[384];
+    size_t i;
+    snprintf(buf, sizeof(buf), "%.376s", path);
+    for (i = 1; buf[i]; i++) {
+        if (buf[i] != '/') continue;
+        buf[i] = 0;
+        (void)mkdir(buf, 0755);
+        buf[i] = '/';
+    }
+    (void)mkdir(buf, 0755);
+    return 0;
+}
+
+static const char *cc__qjs_arch(void) {
+#if defined(__aarch64__) || defined(__arm64__)
+    return "aarch64";
+#elif defined(__x86_64__) || defined(_M_X64)
+    return "x86_64";
+#elif defined(__i386__) || defined(_M_IX86)
+    return "i386";
+#elif defined(__arm__)
+    return "arm";
+#else
+    return "unknown";
+#endif
+}
+
+/* Content fingerprint — catches in-place checkouts where size/mtime lie. */
+static unsigned long cc__qjs_hash_file_bytes(unsigned long h, const char *path,
+                                            size_t maxn) {
+    FILE *f;
+    unsigned char buf[1024];
+    size_t n, total = 0;
+    if (!path) return h * 33 + 1;
+    f = fopen(path, "rb");
+    if (!f) return h * 33 + 2;
+    while (total < maxn && (n = fread(buf, 1, sizeof(buf), f)) > 0) {
+        size_t i;
+        if (total + n > maxn) n = maxn - total;
+        for (i = 0; i < n; i++) h = h * 33 + buf[i];
+        total += n;
+    }
+    fclose(f);
+    h = h * 33 + (unsigned long)total;
+    return h;
+}
+
+static int cc__qjs_abs_src(const char *src, char *out, size_t cap) {
+    char tmp[PATH_MAX];
+    if (!src || !src[0] || cap < 2) return -1;
+    if (realpath(src, tmp)) {
+        snprintf(out, cap, "%s", tmp);
+        return 0;
+    }
+    snprintf(out, cap, "%s", src);
+    return 0;
+}
+
+/* Resolve .git directory (handles worktree gitdir files). */
+static int cc__qjs_gitdir(const char *src, char *gitdir, size_t cap) {
+    char path[512], line[512];
+    struct stat st;
+    FILE *f;
+    size_t n;
+    snprintf(path, sizeof(path), "%.400s/.git", src);
+    if (stat(path, &st) != 0) return -1;
+    if (S_ISDIR(st.st_mode)) {
+        snprintf(gitdir, cap, "%s", path);
+        return 0;
+    }
+    f = fopen(path, "r");
+    if (!f) return -1;
+    if (!fgets(line, (int)sizeof(line), f)) {
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    n = strlen(line);
+    while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+    if (strncmp(line, "gitdir: ", 8) != 0) return -1;
+    if (line[8] == '/') {
+        snprintf(gitdir, cap, "%s", line + 8);
+        return 0;
+    }
+    snprintf(gitdir, cap, "%.300s/%.180s", src, line + 8);
+    return 0;
+}
+
+/* Write up to 12 hex chars of HEAD into out; return 0 on success. */
+static int cc__qjs_git_head(const char *src, char *out, size_t cap) {
+    char gitdir[512], head_path[560], ref_path[640], line[256];
+    FILE *f;
+    size_t n;
+    if (cap < 9) return -1;
+    if (cc__qjs_gitdir(src, gitdir, sizeof(gitdir)) != 0) return -1;
+    snprintf(head_path, sizeof(head_path), "%.500s/HEAD", gitdir);
+    f = fopen(head_path, "r");
+    if (!f) return -1;
+    if (!fgets(line, (int)sizeof(line), f)) {
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    n = strlen(line);
+    while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+    if (strncmp(line, "ref: ", 5) == 0) {
+        snprintf(ref_path, sizeof(ref_path), "%.500s/%.120s", gitdir, line + 5);
+        f = fopen(ref_path, "r");
+        if (!f) return -1;
+        if (!fgets(line, (int)sizeof(line), f)) {
+            fclose(f);
+            return -1;
+        }
+        fclose(f);
+        n = strlen(line);
+        while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+    }
+    if (n < 8) return -1;
+    if (n > 12) n = 12;
+    if (n >= cap) n = cap - 1;
+    memcpy(out, line, n);
+    out[n] = 0;
+    return 0;
+}
+
+/* Locale id: git HEAD prefix, else abs-path hash. Isolates pin switches. */
+static void cc__qjs_src_id(const char *src, char *out, size_t cap) {
+    char abs[PATH_MAX];
+    if (cap < 10) {
+        if (cap) out[0] = 0;
+        return;
+    }
+    if (cc__qjs_git_head(src, out, cap) == 0) return;
+    if (cc__qjs_abs_src(src, abs, sizeof(abs)) != 0) {
+        snprintf(out, cap, "unknown");
+        return;
+    }
+    snprintf(out, cap, "p%08lx", cc__qjs_hash(abs));
+}
+
+static int cc__qjs_cache_root(char *out, size_t cap) {
+    const char *base = getenv("CC_QJS_CACHE");
+    const char *home;
+    if (base && base[0]) snprintf(out, cap, "%.360s", base);
+    else if ((home = getenv("HOME")) && home[0])
+        snprintf(out, cap, "%.320s/.cache/concurrent-c/qjs", home);
+    else snprintf(out, cap, "/tmp/cc-qjs");
+    return cc__qjs_mkdirs(out);
+}
+
+/* Per-source locale: <root>/<src_id>/ — no manual wipe when switching pins. */
+static int cc__qjs_cache_dir_for_src(const char *src, char *out, size_t cap) {
+    char root[512], id[24];
+    if (cc__qjs_cache_root(root, sizeof(root)) != 0) return -1;
+    cc__qjs_src_id(src, id, sizeof(id));
+    snprintf(out, cap, "%.300s/%.20s", root, id);
+    return cc__qjs_mkdirs(out);
+}
+
+static int cc__qjs_exists(const char *dir, const char *name) {
+    char path[512];
+    struct stat st;
+    if (!dir || !name) return 0;
+    snprintf(path, sizeof(path), "%.400s/%.80s", dir, name);
+    return stat(path, &st) == 0;
+}
+
+static int cc__qjs_is_src(const char *dir) {
+    return cc__qjs_exists(dir, "quickjs.h") && cc__qjs_exists(dir, "quickjs.c");
+}
+
+static const char *cc__qjs_find_src(char *buf, size_t cap) {
+    const char *env = getenv("CC_QUICKJS_SRC");
+    static const char *cands[] = {
+        "./quickjs", "./third_party/quickjs", "./vendor/quickjs", 0};
+    int i;
+    if (env && env[0] && cc__qjs_is_src(env)) {
+        snprintf(buf, cap, "%s", env);
+        return buf;
+    }
+    if (env && env[0]) return NULL;
+    for (i = 0; cands[i]; i++) {
+        if (cc__qjs_is_src(cands[i])) {
+            snprintf(buf, cap, "%s", cands[i]);
+            return buf;
+        }
+    }
+    return NULL;
+}
+
+static int cc__qjs_write(const char *path, const char *text) {
+    char tmp[448];
+    FILE *f;
+    snprintf(tmp, sizeof(tmp), "%.420s.tmp%ld", path, (long)getpid());
+    f = fopen(tmp, "w");
+    if (!f) return -1;
+    if (fputs(text, f) == EOF) { fclose(f); remove(tmp); return -1; }
+    if (fclose(f) != 0) { remove(tmp); return -1; }
+    if (rename(tmp, path) != 0) { remove(tmp); return -1; }
+    return 0;
+}
+
+static void cc__qjs_log_head(const char *log, char *out, size_t cap) {
+    FILE *f = fopen(log, "r");
+    size_t n = 0;
+    int c;
+    out[0] = 0;
+    if (!f) return;
+    while (n + 1 < cap && (c = fgetc(f)) != EOF)
+        out[n++] = (char)(c == '\n' ? ' ' : c);
+    out[n] = 0;
+    fclose(f);
+}
+
+static void cc__qjs_read_ver(const char *src, char *ver, size_t cap) {
+    char path[512];
+    FILE *f;
+    size_t n;
+    snprintf(ver, cap, "cc-embed");
+    snprintf(path, sizeof(path), "%.400s/VERSION", src);
+    f = fopen(path, "r");
+    if (!f) return;
+    if (fgets(ver, (int)cap, f)) {
+        n = strlen(ver);
+        while (n && (ver[n - 1] == '\n' || ver[n - 1] == '\r' ||
+                     ver[n - 1] == ' '))
+            ver[--n] = 0;
+        if (!n) snprintf(ver, cap, "cc-embed");
+    }
+    fclose(f);
+}
+
+static unsigned long cc__qjs_tag(const char *src) {
+    unsigned long h = cc__qjs_hash(cc__qjs_adapter_text);
+    const char *cc = getenv("CC");
+    char abs[PATH_MAX], id[24], p[512];
+    static const char *files[] = {
+        "quickjs.c", "quickjs.h", "libregexp.c", "libunicode.c",
+        "cutils.c", "dtoa.c", "libbf.c", "VERSION", 0};
+    int i;
+    h = h * 33 + cc__qjs_hash(cc__qjs_arch());
+#if defined(__APPLE__)
+    h = h * 33 + cc__qjs_hash("darwin");
+#else
+    h = h * 33 + cc__qjs_hash("unix");
+#endif
+    h = h * 33 + cc__qjs_hash(cc && cc[0] ? cc : "cc");
+    if (cc__qjs_abs_src(src, abs, sizeof(abs)) == 0)
+        h = h * 33 + cc__qjs_hash(abs);
+    else
+        h = cc__qjs_hash_file(h, src);
+    cc__qjs_src_id(src, id, sizeof(id));
+    h = h * 33 + cc__qjs_hash(id);
+    for (i = 0; files[i]; i++) {
+        snprintf(p, sizeof(p), "%.400s/%.80s", src, files[i]);
+        h = cc__qjs_hash_file(h, p);
+    }
+    /* Cheap content check on the two files that always define the engine. */
+    snprintf(p, sizeof(p), "%.400s/VERSION", src);
+    h = cc__qjs_hash_file_bytes(h, p, 256);
+    snprintf(p, sizeof(p), "%.400s/quickjs.h", src);
+    h = cc__qjs_hash_file_bytes(h, p, 4096);
+    return h;
+}
+
+static int cc__qjs_compile(const char *src, const char *so) {
+    char ad[448], log[448], tmp[448], cmd[4096], ver[64], extra[768], head[280];
+    char dir[384];
+    const char *cc = getenv("CC");
+    FILE *probe;
+    int rc;
+    if (!cc || !cc[0]) cc = "cc";
+    if (cc__qjs_cache_dir_for_src(src, dir, sizeof(dir)) != 0) {
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: cache dir is not writable");
+        return -1;
+    }
+    snprintf(ad, sizeof(ad), "%.360s/cc_qjs_adapter.c", dir);
+    snprintf(log, sizeof(log), "%.360s/compile.log", dir);
+    if (cc__qjs_write(ad, cc__qjs_adapter_text) != 0) {
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: cannot write adapter source");
+        return -1;
+    }
+    cc__qjs_read_ver(src, ver, sizeof(ver));
+    extra[0] = 0;
+    {
+        static const char *opt[] = {
+            "libregexp.c", "libunicode.c", "cutils.c", "dtoa.c", 0};
+        int i;
+        for (i = 0; opt[i]; i++) {
+            char p[512];
+            snprintf(p, sizeof(p), "%.400s/%.40s", src, opt[i]);
+            probe = fopen(p, "r");
+            if (!probe) continue;
+            fclose(probe);
+            {
+                size_t n = strlen(extra);
+                snprintf(extra + n, sizeof(extra) - n, " '%.400s'", p);
+            }
+        }
+    }
+    snprintf(tmp, sizeof(tmp), "%.400s.tmp%ld", so, (long)getpid());
+    snprintf(cmd, sizeof(cmd),
+             "%.80s -std=gnu11 -O2 -fPIC -shared -D_GNU_SOURCE "
+             "-DCONFIG_VERSION='\"%.40s\"' -I'%.360s' '%.360s' '%.360s/quickjs.c'%s "
+             "-lm -o '%.360s' 2>'%.360s'",
+             cc, ver, src, ad, src, extra, tmp, log);
+    rc = system(cmd);
+    if (rc != 0) {
+        cc__qjs_log_head(log, head, sizeof(head));
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: engine compile failed (need a C compiler and "
+                 "bellard/quickjs or quickjs-ng sources; log: %.140s): %.270s",
+                 log, head);
+        return -1;
+    }
+    if (rename(tmp, so) != 0) {
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: cannot place engine %.360s", so);
+        remove(tmp);
+        return -1;
+    }
+    return 0;
+}
+
+static int cc__qjs_sym(void *h, const char *name, void **dst) {
+    void *p = dlsym(h, name);
+    if (!p) {
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: missing symbol %s (%s)", name, dlerror() ? dlerror() : "");
+        return -1;
+    }
+    *dst = p;
+    return 0;
+}
+
+static int cc__qjs_bind(void *h) {
+    if (cc__qjs_sym(h, "cc__qjs_new_runtime", (void **)&cc__qjs.new_runtime) ||
+        cc__qjs_sym(h, "cc__qjs_free_runtime", (void **)&cc__qjs.free_runtime) ||
+        cc__qjs_sym(h, "cc__qjs_new_context", (void **)&cc__qjs.new_context) ||
+        cc__qjs_sym(h, "cc__qjs_free_context", (void **)&cc__qjs.free_context) ||
+        cc__qjs_sym(h, "cc__qjs_eval", (void **)&cc__qjs.eval) ||
+        cc__qjs_sym(h, "cc__qjs_is_exception", (void **)&cc__qjs.is_exception) ||
+        cc__qjs_sym(h, "cc__qjs_get_exception", (void **)&cc__qjs.get_exception) ||
+        cc__qjs_sym(h, "cc__qjs_free_value", (void **)&cc__qjs.free_value) ||
+        cc__qjs_sym(h, "cc__qjs_dup_value", (void **)&cc__qjs.dup_value) ||
+        cc__qjs_sym(h, "cc__qjs_undefined", (void **)&cc__qjs.undefined) ||
+        cc__qjs_sym(h, "cc__qjs_get_global", (void **)&cc__qjs.get_global) ||
+        cc__qjs_sym(h, "cc__qjs_get_prop", (void **)&cc__qjs.get_prop) ||
+        cc__qjs_sym(h, "cc__qjs_set_prop", (void **)&cc__qjs.set_prop) ||
+        cc__qjs_sym(h, "cc__qjs_call", (void **)&cc__qjs.call) ||
+        cc__qjs_sym(h, "cc__qjs_to_cstr", (void **)&cc__qjs.to_cstr) ||
+        cc__qjs_sym(h, "cc__qjs_free_cstr", (void **)&cc__qjs.free_cstr) ||
+        cc__qjs_sym(h, "cc__qjs_to_f64", (void **)&cc__qjs.to_f64) ||
+        cc__qjs_sym(h, "cc__qjs_to_i64", (void **)&cc__qjs.to_i64) ||
+        cc__qjs_sym(h, "cc__qjs_to_bool", (void **)&cc__qjs.to_bool) ||
+        cc__qjs_sym(h, "cc__qjs_new_bool", (void **)&cc__qjs.new_bool) ||
+        cc__qjs_sym(h, "cc__qjs_new_i64", (void **)&cc__qjs.new_i64) ||
+        cc__qjs_sym(h, "cc__qjs_new_f64", (void **)&cc__qjs.new_f64) ||
+        cc__qjs_sym(h, "cc__qjs_new_str", (void **)&cc__qjs.new_str) ||
+        cc__qjs_sym(h, "cc__qjs_new_array", (void **)&cc__qjs.new_array) ||
+        cc__qjs_sym(h, "cc__qjs_set_uint32", (void **)&cc__qjs.set_uint32) ||
+        cc__qjs_sym(h, "cc__qjs_is_undefined", (void **)&cc__qjs.is_undefined) ||
+        cc__qjs_sym(h, "cc__qjs_is_null", (void **)&cc__qjs.is_null) ||
+        cc__qjs_sym(h, "cc__qjs_is_function", (void **)&cc__qjs.is_function) ||
+        cc__qjs_sym(h, "cc__qjs_new_class_id", (void **)&cc__qjs.new_class_id) ||
+        cc__qjs_sym(h, "cc__qjs_new_class", (void **)&cc__qjs.new_class) ||
+        cc__qjs_sym(h, "cc__qjs_new_object_class",
+                    (void **)&cc__qjs.new_object_class) ||
+        cc__qjs_sym(h, "cc__qjs_set_opaque", (void **)&cc__qjs.set_opaque) ||
+        cc__qjs_sym(h, "cc__qjs_get_opaque", (void **)&cc__qjs.get_opaque) ||
+        cc__qjs_sym(h, "cc__qjs_new_cfunc", (void **)&cc__qjs.new_cfunc) ||
+        cc__qjs_sym(h, "cc__qjs_throw_type", (void **)&cc__qjs.throw_type) ||
+        cc__qjs_sym(h, "cc__qjs_execute_pending_job",
+                    (void **)&cc__qjs.execute_pending_job))
+        return -1;
+    return 0;
+}
+
+static int cc__qjs_load(void) {
+    const char *lib;
+    char src[384], so[448], dir[384];
+    struct stat st;
+    if (cc__qjs_load_once) return cc__qjs_load_rc;
+    cc__qjs_load_once = 1;
+    cc__qjs_errbuf[0] = 0;
+    lib = getenv("CC_LIBQJS");
+    if (lib && lib[0]) {
+        cc__qjs_lib = dlopen(lib, RTLD_NOW | RTLD_LOCAL);
+        if (!cc__qjs_lib) {
+            snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                     "qjs: CC_LIBQJS=%s failed: %s", lib,
+                     dlerror() ? dlerror() : "dlopen");
+            return cc__qjs_load_rc = -1;
+        }
+        if (cc__qjs_bind(cc__qjs_lib) != 0) return cc__qjs_load_rc = -1;
+        return cc__qjs_load_rc = 0;
+    }
+    if (!cc__qjs_find_src(src, sizeof(src))) {
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: QuickJS not found — attach upstream "
+                 "(git submodule add https://github.com/bellard/quickjs "
+                 "quickjs, or quickjs-ng/quickjs) or set "
+                 "CC_QUICKJS_SRC / CC_LIBQJS");
+        return cc__qjs_load_rc = -1;
+    }
+    if (cc__qjs_cache_dir_for_src(src, dir, sizeof(dir)) != 0) {
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: cache dir is not writable");
+        return cc__qjs_load_rc = -1;
+    }
+    snprintf(so, sizeof(so), "%.360s/libccqjs_%08lx.so", dir, cc__qjs_tag(src));
+    if (stat(so, &st) != 0 && cc__qjs_compile(src, so) != 0)
+        return cc__qjs_load_rc = -1;
+    cc__qjs_lib = dlopen(so, RTLD_NOW | RTLD_LOCAL);
+    if (!cc__qjs_lib) {
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: dlopen %s failed: %s", so,
+                 dlerror() ? dlerror() : "dlopen");
+        return cc__qjs_load_rc = -1;
+    }
+    if (cc__qjs_bind(cc__qjs_lib) != 0) return cc__qjs_load_rc = -1;
+    return cc__qjs_load_rc = 0;
+}
+
+static inline bool cc_qjs_available(void) { return cc__qjs_load() == 0; }
+
+static void cc__qjs_bind_err_arena(CCArena a) { cc__qjs_err_arena = a; }
+static void cc__qjs_bind_err_js(CCQjs *js) {
+    cc__qjs_err_arena = js && js->ready ? js->arena : cc_arena_handle(NULL);
+}
+
+static CCSlice cc__qjs_text_into_err(const char *s, size_t n) {
+    char *dst;
+    if (!s || !cc_arena_is_live(cc__qjs_err_arena)) return cc_slice_empty();
+    dst = (char *)cc_arena_alloc(cc__qjs_err_arena, n + 1, 1);
+    if (!dst) return cc_slice_empty();
+    memcpy(dst, s, n);
+    dst[n] = 0;
+    return cc_slice_from_buffer(dst, n);
+}
+
+static CCQjsError cc__qjs_err(CCQjs *js, const char *ctx) {
+    CCQjsError e;
+    const char *msg_src;
+    int from_js = 0;
+    memset(&e, 0, sizeof(e));
+    if (js && js->ready && js->ctx && cc__qjs.is_exception) {
+        /* Exception already captured into errbuf by the caller, or pending. */
+    }
+    (void)from_js;
+    if (!cc__qjs_errbuf[0])
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf), "qjs: %s failed",
+                 ctx ? ctx : "?");
+    msg_src = cc__qjs_errbuf;
+    if (cc_arena_is_live(cc__qjs_err_arena)) {
+        size_t n = strlen(msg_src);
+        char *dst = (char *)cc_arena_alloc(cc__qjs_err_arena, n + 1, 1);
+        if (dst) {
+            memcpy(dst, msg_src, n + 1);
+            e.base = CC_ERROR(CC_ERR_USER, dst);
+            return e;
+        }
+    }
+    e.base = CC_ERROR(CC_ERR_USER, msg_src);
+    return e;
+}
+
+static CCQjsError cc__qjs_err_exc(CCQjs *js, const char *ctx, CCQjsRaw exc) {
+    CCQjsError e;
+    size_t n = 0;
+    const char *s;
+    const char *nm = NULL;
+    size_t nn = 0;
+    CCQjsRaw namev, stackv;
+    memset(&e, 0, sizeof(e));
+    cc__qjs_bind_err_js(js);
+    s = cc__qjs.to_cstr(js->ctx, exc, &n);
+    if (s) {
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf), "qjs: %s: %.*s",
+                 ctx ? ctx : "js", (int)n, s);
+        cc__qjs.free_cstr(js->ctx, s);
+    } else {
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf), "qjs: %s: exception",
+                 ctx ? ctx : "js");
+    }
+    namev = cc__qjs.get_prop(js->ctx, exc, "name");
+    if (!cc__qjs.is_exception(namev)) {
+        nm = cc__qjs.to_cstr(js->ctx, namev, &nn);
+        if (nm) {
+            e.name = cc__qjs_text_into_err(nm, nn);
+            cc__qjs.free_cstr(js->ctx, nm);
+        }
+    }
+    cc__qjs.free_value(js->ctx, namev);
+    stackv = cc__qjs.get_prop(js->ctx, exc, "stack");
+    if (!cc__qjs.is_exception(stackv)) {
+        size_t sn = 0;
+        const char *ss = cc__qjs.to_cstr(js->ctx, stackv, &sn);
+        if (ss) {
+            e.stack = cc__qjs_text_into_err(ss, sn);
+            cc__qjs.free_cstr(js->ctx, ss);
+        }
+    }
+    cc__qjs.free_value(js->ctx, stackv);
+    {
+        const char *msg_src = cc__qjs_errbuf;
+        if (cc_arena_is_live(cc__qjs_err_arena)) {
+            size_t m = strlen(msg_src);
+            char *dst = (char *)cc_arena_alloc(cc__qjs_err_arena, m + 1, 1);
+            if (dst) {
+                memcpy(dst, msg_src, m + 1);
+                e.base = CC_ERROR(CC_ERR_USER, dst);
+                return e;
+            }
+        }
+        e.base = CC_ERROR(CC_ERR_USER, msg_src);
+    }
+    return e;
+}
+
+static CCQjsVal cc__qjs_val(CCQjs *js, CCQjsRaw v) {
+    CCQjsVal o;
+    memset(&o, 0, sizeof(o));
+    o.home = js;
+    o.v = v;
+    o.live = 1;
+    return o;
+}
+
+static int cc__qjs_take_exc(CCQjs *js, CCQjsRaw v, const char *ctx,
+                            CCQjsError *out) {
+    CCQjsRaw exc;
+    if (!cc__qjs.is_exception(v)) return 0;
+    exc = cc__qjs.get_exception(js->ctx);
+    *out = cc__qjs_err_exc(js, ctx, exc);
+    cc__qjs.free_value(js->ctx, exc);
+    return 1;
+}
+
+static const char *cc__qjs_cstr(CCQjs *js, CCSlice s) {
+    char *d;
+    if (!js || !cc_arena_is_live(js->arena)) return NULL;
+    d = (char *)cc_arena_alloc(js->arena, s.len + 1, 1);
+    if (!d) return NULL;
+    if (s.ptr && s.len) memcpy(d, s.ptr, s.len);
+    d[s.len] = 0;
+    return d;
+}
+
+static inline CCResult_CCQjs_CCQjsError cc_qjs_new(CCArena arena) {
+    CCQjs js;
+    memset(&js, 0, sizeof(js));
+    cc__qjs_errbuf[0] = 0;
+    cc__qjs_bind_err_arena(arena);
+    if (!cc_arena_is_live(arena)) {
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: cc_qjs_new requires arena");
+        return cc_err_CCResult_CCQjs_CCQjsError(cc__qjs_err(NULL, "cc_qjs_new"));
+    }
+    if (cc__qjs_load() != 0) return cc_err_CCResult_CCQjs_CCQjsError(cc__qjs_err(NULL, "cc_qjs_new"));
+    js.rt = cc__qjs.new_runtime();
+    if (!js.rt) {
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: JS_NewRuntime failed");
+        return cc_err_CCResult_CCQjs_CCQjsError(cc__qjs_err(NULL, "cc_qjs_new"));
+    }
+    js.ctx = cc__qjs.new_context(js.rt);
+    if (!js.ctx) {
+        cc__qjs.free_runtime(js.rt);
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: JS_NewContext failed");
+        return cc_err_CCResult_CCQjs_CCQjsError(cc__qjs_err(NULL, "cc_qjs_new"));
+    }
+    js.ready = 1;
+    js.arena = arena;
+    return cc_ok_CCResult_CCQjs_CCQjsError(js);
+}
+
+static inline void cc__qjs_close_impl(CCQjs *js) {
+    if (!js || !js->ready) return;
+    js->ready = 0;
+    if (js->ctx) cc__qjs.free_context(js->ctx);
+    if (js->rt) cc__qjs.free_runtime(js->rt);
+    js->ctx = NULL;
+    js->rt = NULL;
+}
+
+/* The arena in the handle is the caller's, kept by value. The value-field
+ * chain that runs after this hook (spec 3.1) would free it as if it were
+ * owned, so the hook disowns it: the chain then finds a nulled handle,
+ * which destroy treats as already done. */
+static inline void cc_qjs_close(CCQjs *js) {
+    cc__qjs_close_impl(js);
+    if (js) { js->arena = cc_arena_handle(NULL); }
+}
+
+static inline void cc_qjs_val_release(CCQjsVal *o) {
+    if (!o || !o->live) return;
+    o->live = 0;
+    if (o->home && o->home->ready && o->home->ctx)
+        cc__qjs.free_value(o->home->ctx, o->v);
+}
+
+static inline CCSlice cc__qjs_src_slice(CCSlice s) { return s; }
+static inline CCSlice cc__qjs_src_cstr(const char *s) {
+    CCSlice v;
+    v.ptr = (void *)(uintptr_t)s;
+    v.len = s ? strlen(s) : 0;
+    return v;
+}
+#define cc__qjs_src(x)                                                         \
+    _Generic((x), char *: cc__qjs_src_cstr, const char *: cc__qjs_src_cstr,    \
+             CCSlice: cc__qjs_src_slice)(x)
+
+static inline CCResult_CCQjsVal_CCQjsError cc__qjs_eval(CCQjs *js, CCSlice src) {
+    const char *s;
+    CCQjsRaw v;
+    CCQjsError e;
+    cc__qjs_bind_err_js(js);
+    if (!js || !js->ready) {
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: eval: handle not ready");
+        return cc_err_CCResult_CCQjsVal_CCQjsError(cc__qjs_err(js, "eval"));
+    }
+    s = cc__qjs_cstr(js, src);
+    if (!s) {
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: eval: arena exhausted");
+        return cc_err_CCResult_CCQjsVal_CCQjsError(cc__qjs_err(js, "eval"));
+    }
+    v = cc__qjs.eval(js->ctx, s, src.len, "<eval>", 0);
+    if (cc__qjs_take_exc(js, v, "eval", &e)) return cc_err_CCResult_CCQjsVal_CCQjsError(e);
+    return cc_ok_CCResult_CCQjsVal_CCQjsError(cc__qjs_val(js, v));
+}
+
+static inline CCResult_void_CCQjsError cc_qjs_exec(CCQjs *js, CCSlice src) {
+    CCResult_CCQjsVal_CCQjsError r = cc__qjs_eval(js, src);
+    if (!r.ok) return cc_err_CCResult_void_CCQjsError(r.u.error);
+    cc_qjs_val_release(&r.u.value);
+    return cc_ok_CCResult_void_CCQjsError();
+}
+#define cc_qjs_exec(js, src) cc_qjs_exec((js), cc__qjs_src(src))
+
+/* Drain one QuickJS job (Promises / async). Returns 1 if a job ran, 0 if
+ * idle, <0 if a job threw. Event-loop hosts call this until 0 between
+ * uv_run iterations. */
+static inline int cc_qjs_execute_pending_job(CCQjs *js) {
+    if (!js || !js->ready || !js->rt || !cc__qjs.execute_pending_job) return 0;
+    return cc__qjs.execute_pending_job(js->rt);
+}
+
+static inline CCResult_CCQjsVal_CCQjsError cc_qjs_global(CCQjs *js) {
+    CCQjsRaw g;
+    CCQjsError e;
+    cc__qjs_bind_err_js(js);
+    if (!js || !js->ready) {
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: global: handle not ready");
+        return cc_err_CCResult_CCQjsVal_CCQjsError(cc__qjs_err(js, "global"));
+    }
+    g = cc__qjs.get_global(js->ctx);
+    if (cc__qjs_take_exc(js, g, "global", &e)) return cc_err_CCResult_CCQjsVal_CCQjsError(e);
+    return cc_ok_CCResult_CCQjsVal_CCQjsError(cc__qjs_val(js, g));
+}
+
+static inline CCResult_void_CCQjsError cc_qjs_set(CCQjs *js, const char *name,
+                                             CCQjsVal val) {
+    CCQjsRaw g, dup;
+    int rc;
+    CCQjsError e;
+    cc__qjs_bind_err_js(js);
+    if (!js || !js->ready) {
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: set: handle not ready");
+        return cc_err_CCResult_void_CCQjsError(cc__qjs_err(js, "set"));
+    }
+    if (!val.live || !val.home || val.home != js) {
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: set: value from a different runtime (same home required)");
+        return cc_err_CCResult_void_CCQjsError(cc__qjs_err(js, "set"));
+    }
+    g = cc__qjs.get_global(js->ctx);
+    if (cc__qjs_take_exc(js, g, "set", &e)) return cc_err_CCResult_void_CCQjsError(e);
+    dup = cc__qjs.dup_value(js->ctx, val.v);
+    rc = cc__qjs.set_prop(js->ctx, g, name ? name : "", dup);
+    cc__qjs.free_value(js->ctx, g);
+    if (rc < 0) {
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: set: cannot define %s", name ? name : "");
+        return cc_err_CCResult_void_CCQjsError(cc__qjs_err(js, "set"));
+    }
+    return cc_ok_CCResult_void_CCQjsError();
+}
+
+static inline CCResult_CCQjsVal_CCQjsError cc_qjs_val_get(CCQjsVal *obj,
+                                                      const char *name) {
+    CCQjsRaw v;
+    CCQjsError e;
+    CCQjs *js;
+    if (!obj || !obj->live || !obj->home || !obj->home->ready) {
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: get: value is not live");
+        return cc_err_CCResult_CCQjsVal_CCQjsError(cc__qjs_err(obj ? obj->home : NULL, "get"));
+    }
+    js = obj->home;
+    cc__qjs_bind_err_js(js);
+    v = cc__qjs.get_prop(js->ctx, obj->v, name ? name : "");
+    if (cc__qjs_take_exc(js, v, name ? name : "get", &e)) return cc_err_CCResult_CCQjsVal_CCQjsError(e);
+    return cc_ok_CCResult_CCQjsVal_CCQjsError(cc__qjs_val(js, v));
+}
+
+static inline CCResult_double_CCQjsError cc_qjs_val_as_f64(CCQjsVal *obj) {
+    double d = 0;
+    CCQjs *js;
+    if (!obj || !obj->live || !obj->home || !obj->home->ready) {
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: as_f64: value is not live");
+        return cc_err_CCResult_double_CCQjsError(cc__qjs_err(obj ? obj->home : NULL, "as_f64"));
+    }
+    js = obj->home;
+    cc__qjs_bind_err_js(js);
+    if (cc__qjs.to_f64(js->ctx, obj->v, &d) != 0) {
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: as_f64: value is not a number");
+        return cc_err_CCResult_double_CCQjsError(cc__qjs_err(js, "as_f64"));
+    }
+    return cc_ok_CCResult_double_CCQjsError(d);
+}
+
+static inline CCResult_int64_t_CCQjsError cc_qjs_val_as_i64(CCQjsVal *obj) {
+    int64_t n = 0;
+    CCQjs *js;
+    if (!obj || !obj->live || !obj->home || !obj->home->ready) {
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: as_i64: value is not live");
+        return cc_err_CCResult_int64_t_CCQjsError(cc__qjs_err(obj ? obj->home : NULL, "as_i64"));
+    }
+    js = obj->home;
+    cc__qjs_bind_err_js(js);
+    if (cc__qjs.to_i64(js->ctx, obj->v, &n) != 0) {
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: as_i64: value is not an integer");
+        return cc_err_CCResult_int64_t_CCQjsError(cc__qjs_err(js, "as_i64"));
+    }
+    return cc_ok_CCResult_int64_t_CCQjsError(n);
+}
+
+static inline CCResult_CCSlice_CCQjsError cc_qjs_val_as_slice_into(CCQjsVal *obj,
+                                                              CCArena arena) {
+    size_t n = 0;
+    const char *s;
+    char *dst;
+    CCQjs *js;
+    if (!obj || !obj->live || !obj->home || !obj->home->ready) {
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: as_slice: value is not live");
+        return cc_err_CCResult_CCSlice_CCQjsError(cc__qjs_err(obj ? obj->home : NULL, "as_slice"));
+    }
+    js = obj->home;
+    cc__qjs_bind_err_js(js);
+    if (!cc_arena_is_live(arena)) arena = js->arena;
+    s = cc__qjs.to_cstr(js->ctx, obj->v, &n);
+    if (!s) {
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: as_slice: value is not a string");
+        return cc_err_CCResult_CCSlice_CCQjsError(cc__qjs_err(js, "as_slice"));
+    }
+    dst = (char *)cc_arena_alloc(arena, n + 1, 1);
+    if (!dst) {
+        cc__qjs.free_cstr(js->ctx, s);
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: as_slice: arena exhausted");
+        return cc_err_CCResult_CCSlice_CCQjsError(cc__qjs_err(js, "as_slice"));
+    }
+    memcpy(dst, s, n);
+    dst[n] = 0;
+    cc__qjs.free_cstr(js->ctx, s);
+    return cc_ok_CCResult_CCSlice_CCQjsError(cc_slice_from_buffer(dst, n));
+}
+
+static inline CCResult_CCSlice_CCQjsError cc_qjs_val_as_slice(CCQjsVal *obj) {
+    CCArena arena =
+        (obj && obj->home) ? obj->home->arena : cc_arena_handle(NULL);
+    return cc_qjs_val_as_slice_into(obj, arena);
+}
+
+/* ---- dynamic sink ---- */
+
+typedef struct CCQjsArg {
+    int kind; /* 0=i64 1=f64 2=cstr 3=slice 4=val 5=bool 6=typed-slice */
+    long long i;
+    double f;
+    const void *p;
+    size_t n;
+    CCQjs *home;
+    CCQjsRaw v;
+    int live;
+    int esz;
+} CCQjsArg;
+
+static inline CCQjsArg cc__qjs_arg_i(long long v) {
+    CCQjsArg a;
+    memset(&a, 0, sizeof(a));
+    a.i = v;
+    return a;
+}
+static inline CCQjsArg cc__qjs_arg_f(double v) {
+    CCQjsArg a;
+    memset(&a, 0, sizeof(a));
+    a.kind = 1;
+    a.f = v;
+    return a;
+}
+static inline CCQjsArg cc__qjs_arg_cstr(const char *s) {
+    CCQjsArg a;
+    memset(&a, 0, sizeof(a));
+    a.kind = 2;
+    a.p = s;
+    a.n = s ? strlen(s) : 0;
+    return a;
+}
+static inline CCQjsArg cc__qjs_arg_slice(CCSlice s) {
+    CCQjsArg a;
+    memset(&a, 0, sizeof(a));
+    a.kind = 3;
+    a.p = s.ptr;
+    a.n = s.len;
+    return a;
+}
+static inline CCQjsArg cc__qjs_arg_val(CCQjsVal o) {
+    CCQjsArg a;
+    memset(&a, 0, sizeof(a));
+    a.kind = 4;
+    a.home = o.home;
+    a.v = o.v;
+    a.live = o.live;
+    return a;
+}
+static inline CCQjsArg cc__qjs_arg_bool(int v) {
+    CCQjsArg a;
+    memset(&a, 0, sizeof(a));
+    a.kind = 5;
+    a.i = v ? 1 : 0;
+    return a;
+}
+static inline CCQjsArg cc__qjs_arg_pass(CCQjsArg a) { return a; }
+
+#define CC_QJS_ARG(x)                                                          \
+    _Generic((x),                                                              \
+        double: cc__qjs_arg_f,                                                 \
+        float: cc__qjs_arg_f,                                                  \
+        int: cc__qjs_arg_i,                                                    \
+        long: cc__qjs_arg_i,                                                   \
+        long long: cc__qjs_arg_i,                                              \
+        unsigned int: cc__qjs_arg_i,                                           \
+        unsigned long: cc__qjs_arg_i,                                          \
+        unsigned long long: cc__qjs_arg_i,                                     \
+        char *: cc__qjs_arg_cstr,                                              \
+        const char *: cc__qjs_arg_cstr,                                        \
+        CCSlice: cc__qjs_arg_slice,                                            \
+        CCQjsVal: cc__qjs_arg_val,                                             \
+        CCQjsArg: cc__qjs_arg_pass,                                            \
+        _Bool: cc__qjs_arg_bool)(x)
+
+static CCQjsRaw cc__qjs_lift(CCQjs *js, const CCQjsArg *a, const char *method,
+                             CCQjsError *err) {
+    memset(err, 0, sizeof(*err));
+    switch (a->kind) {
+    case 0:
+        return cc__qjs.new_i64(js->ctx, a->i);
+    case 1:
+        return cc__qjs.new_f64(js->ctx, a->f);
+    case 2:
+    case 3:
+        return cc__qjs.new_str(js->ctx, (const char *)a->p, a->n);
+    case 5:
+        return cc__qjs.new_bool(js->ctx, a->i ? 1 : 0);
+    case 4:
+        if (!a->live || !a->home || a->home != js) {
+            snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                     "qjs: %s: value argument from a different runtime "
+                     "(same home required)",
+                     method ? method : "call");
+            *err = cc__qjs_err(js, method);
+            return cc__qjs.undefined();
+        }
+        return cc__qjs.dup_value(js->ctx, a->v);
+    case 6: {
+        CCQjsRaw arr = cc__qjs.new_array(js->ctx);
+        size_t i;
+        const char *p = (const char *)a->p;
+        if (cc__qjs.is_exception(arr)) return arr;
+        for (i = 0; i < a->n; i++) {
+            CCQjsRaw el;
+            if (a->esz == (int)sizeof(double)) {
+                double d;
+                memcpy(&d, p + i * (size_t)a->esz, sizeof(d));
+                el = cc__qjs.new_f64(js->ctx, d);
+            } else if (a->esz == (int)sizeof(float)) {
+                float f;
+                memcpy(&f, p + i * (size_t)a->esz, sizeof(f));
+                el = cc__qjs.new_f64(js->ctx, (double)f);
+            } else {
+                long long n = 0;
+                if (a->esz == (int)sizeof(int)) {
+                    int v;
+                    memcpy(&v, p + i * (size_t)a->esz, sizeof(v));
+                    n = v;
+                } else if (a->esz == (int)sizeof(int64_t)) {
+                    int64_t v;
+                    memcpy(&v, p + i * (size_t)a->esz, sizeof(v));
+                    n = (long long)v;
+                } else {
+                    memcpy(&n, p + i * (size_t)a->esz, sizeof(n));
+                }
+                el = cc__qjs.new_i64(js->ctx, n);
+            }
+            if (cc__qjs.set_uint32(js->ctx, arr, (uint32_t)i, el) < 0) {
+                cc__qjs.free_value(js->ctx, arr);
+                snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                         "qjs: %s: cannot fill array argument",
+                         method ? method : "call");
+                *err = cc__qjs_err(js, method);
+                return cc__qjs.undefined();
+            }
+        }
+        return arr;
+    }
+    default:
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: %s: unsupported argument kind",
+                 method ? method : "call");
+        *err = cc__qjs_err(js, method);
+        return cc__qjs.undefined();
+    }
+}
+
+static CCResult_CCQjsVal_CCQjsError cc__qjs_obj_callm_n(CCQjsVal *obj,
+                                                    const char *method, int argc,
+                                                    const CCQjsArg *argv) {
+    CCQjs *js;
+    CCQjsRaw fn, this_dup, args[CC__QJS_MAX_CALL_ARGS], out;
+    CCQjsError e;
+    int i, n;
+    memset(&e, 0, sizeof(e));
+    if (!obj || !obj->live || !obj->home || !obj->home->ready) {
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: %s: value is not live", method ? method : "call");
+        return cc_err_CCResult_CCQjsVal_CCQjsError(cc__qjs_err(obj ? obj->home : NULL, method));
+    }
+    js = obj->home;
+    cc__qjs_bind_err_js(js);
+    if (method && strcmp(method, "invoke") == 0) {
+        fn = cc__qjs.dup_value(js->ctx, obj->v);
+    } else {
+        fn = cc__qjs.get_prop(js->ctx, obj->v, method ? method : "");
+        if (cc__qjs_take_exc(js, fn, method, &e)) return cc_err_CCResult_CCQjsVal_CCQjsError(e);
+    }
+    if (!cc__qjs.is_function(js->ctx, fn)) {
+        cc__qjs.free_value(js->ctx, fn);
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: %s is not a function", method ? method : "?");
+        return cc_err_CCResult_CCQjsVal_CCQjsError(cc__qjs_err(js, method));
+    }
+    if (argc < 0) argc = 0;
+    n = argc > CC__QJS_MAX_CALL_ARGS ? CC__QJS_MAX_CALL_ARGS : argc;
+    for (i = 0; i < n; i++) {
+        args[i] = cc__qjs_lift(js, &argv[i], method, &e);
+        if (e.base.message) {
+            int j;
+            for (j = 0; j < i; j++) cc__qjs.free_value(js->ctx, args[j]);
+            cc__qjs.free_value(js->ctx, fn);
+            return cc_err_CCResult_CCQjsVal_CCQjsError(e);
+        }
+    }
+    this_dup = cc__qjs.dup_value(js->ctx, obj->v);
+    out = cc__qjs.call(js->ctx, fn, this_dup, n, args);
+    for (i = 0; i < n; i++) cc__qjs.free_value(js->ctx, args[i]);
+    cc__qjs.free_value(js->ctx, this_dup);
+    cc__qjs.free_value(js->ctx, fn);
+    if (cc__qjs_take_exc(js, out, method, &e)) return cc_err_CCResult_CCQjsVal_CCQjsError(e);
+    return cc_ok_CCResult_CCQjsVal_CCQjsError(cc__qjs_val(js, out));
+}
+
+static inline CCResult_CCQjsVal_CCQjsError cc_qjs_val_callm(CCQjsVal *obj,
+                                                        const char *method,
+                                                        int argc, ...) {
+    CCQjsArg tmp[CC__QJS_MAX_CALL_ARGS];
+    int i;
+    va_list ap;
+    if (argc < 0) argc = 0;
+    if (argc > CC__QJS_MAX_CALL_ARGS) argc = CC__QJS_MAX_CALL_ARGS;
+    va_start(ap, argc);
+    for (i = 0; i < argc; i++) tmp[i] = va_arg(ap, CCQjsArg);
+    va_end(ap);
+    return cc__qjs_obj_callm_n(obj, method, argc, tmp);
+}
+
+static inline CCResult_double_CCQjsError cc_qjs_val_callm_double(CCQjsVal *obj,
+                                                             const char *method,
+                                                             int argc, ...) {
+    CCQjsArg tmp[CC__QJS_MAX_CALL_ARGS];
+    int i;
+    CCResult_CCQjsVal_CCQjsError r;
+    CCResult_double_CCQjsError out;
+    va_list ap;
+    if (argc < 0) argc = 0;
+    if (argc > CC__QJS_MAX_CALL_ARGS) argc = CC__QJS_MAX_CALL_ARGS;
+    va_start(ap, argc);
+    for (i = 0; i < argc; i++) tmp[i] = va_arg(ap, CCQjsArg);
+    va_end(ap);
+    r = cc__qjs_obj_callm_n(obj, method, argc, tmp);
+    if (!r.ok) return cc_err_CCResult_double_CCQjsError(r.u.error);
+    out = cc_qjs_val_as_f64(&r.u.value);
+    cc_qjs_val_release(&r.u.value);
+    return out;
+}
+
+static inline CCResult_float_CCQjsError cc_qjs_val_callm_float(CCQjsVal *obj,
+                                                           const char *method,
+                                                           int argc, ...) {
+    CCResult_double_CCQjsError d;
+    CCQjsArg tmp[CC__QJS_MAX_CALL_ARGS];
+    int i;
+    CCResult_CCQjsVal_CCQjsError r;
+    va_list ap;
+    if (argc < 0) argc = 0;
+    if (argc > CC__QJS_MAX_CALL_ARGS) argc = CC__QJS_MAX_CALL_ARGS;
+    va_start(ap, argc);
+    for (i = 0; i < argc; i++) tmp[i] = va_arg(ap, CCQjsArg);
+    va_end(ap);
+    r = cc__qjs_obj_callm_n(obj, method, argc, tmp);
+    if (!r.ok) return cc_err_CCResult_float_CCQjsError(r.u.error);
+    d = cc_qjs_val_as_f64(&r.u.value);
+    cc_qjs_val_release(&r.u.value);
+    if (!d.ok) return cc_err_CCResult_float_CCQjsError(d.u.error);
+    return cc_ok_CCResult_float_CCQjsError((float)d.u.value);
+}
+
+static CCResult_int64_t_CCQjsError cc__qjs_take_i64(CCQjsVal *o, const char *method) {
+    CCResult_int64_t_CCQjsError v = cc_qjs_val_as_i64(o);
+    if (v.ok) return v;
+    {
+        CCResult_double_CCQjsError d = cc_qjs_val_as_f64(o);
+        if (!d.ok) return v;
+        if (d.u.value >= -9223372036854775808.0 &&
+            d.u.value < 9223372036854775808.0)
+            return cc_ok_CCResult_int64_t_CCQjsError((int64_t)d.u.value);
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: %s: result out of range for integer destination",
+                 method ? method : "call");
+        return cc_err_CCResult_int64_t_CCQjsError(cc__qjs_err(o ? o->home : NULL, method));
+    }
+}
+
+static inline CCResult_int64_t_CCQjsError cc_qjs_val_callm_int64_t(
+        CCQjsVal *obj, const char *method, int argc, ...) {
+    CCQjsArg tmp[CC__QJS_MAX_CALL_ARGS];
+    int i;
+    CCResult_CCQjsVal_CCQjsError r;
+    CCResult_int64_t_CCQjsError out;
+    va_list ap;
+    if (argc < 0) argc = 0;
+    if (argc > CC__QJS_MAX_CALL_ARGS) argc = CC__QJS_MAX_CALL_ARGS;
+    va_start(ap, argc);
+    for (i = 0; i < argc; i++) tmp[i] = va_arg(ap, CCQjsArg);
+    va_end(ap);
+    r = cc__qjs_obj_callm_n(obj, method, argc, tmp);
+    if (!r.ok) return cc_err_CCResult_int64_t_CCQjsError(r.u.error);
+    out = cc__qjs_take_i64(&r.u.value, method);
+    cc_qjs_val_release(&r.u.value);
+    return out;
+}
+
+static inline CCResult_long_long_CCQjsError cc_qjs_val_callm_long_long(
+        CCQjsVal *obj, const char *method, int argc, ...) {
+    CCResult_int64_t_CCQjsError v;
+    CCQjsArg tmp[CC__QJS_MAX_CALL_ARGS];
+    int i;
+    CCResult_CCQjsVal_CCQjsError r;
+    va_list ap;
+    if (argc < 0) argc = 0;
+    if (argc > CC__QJS_MAX_CALL_ARGS) argc = CC__QJS_MAX_CALL_ARGS;
+    va_start(ap, argc);
+    for (i = 0; i < argc; i++) tmp[i] = va_arg(ap, CCQjsArg);
+    va_end(ap);
+    r = cc__qjs_obj_callm_n(obj, method, argc, tmp);
+    if (!r.ok) return cc_err_CCResult_long_long_CCQjsError(r.u.error);
+    v = cc__qjs_take_i64(&r.u.value, method);
+    cc_qjs_val_release(&r.u.value);
+    if (!v.ok) return cc_err_CCResult_long_long_CCQjsError(v.u.error);
+    return cc_ok_CCResult_long_long_CCQjsError((long long)v.u.value);
+}
+
+static inline CCResult_int_CCQjsError cc_qjs_val_callm_int(CCQjsVal *obj,
+                                                       const char *method,
+                                                       int argc, ...) {
+    CCResult_int64_t_CCQjsError v;
+    CCQjsArg tmp[CC__QJS_MAX_CALL_ARGS];
+    int i;
+    CCResult_CCQjsVal_CCQjsError r;
+    va_list ap;
+    if (argc < 0) argc = 0;
+    if (argc > CC__QJS_MAX_CALL_ARGS) argc = CC__QJS_MAX_CALL_ARGS;
+    va_start(ap, argc);
+    for (i = 0; i < argc; i++) tmp[i] = va_arg(ap, CCQjsArg);
+    va_end(ap);
+    r = cc__qjs_obj_callm_n(obj, method, argc, tmp);
+    if (!r.ok) return cc_err_CCResult_int_CCQjsError(r.u.error);
+    v = cc__qjs_take_i64(&r.u.value, method);
+    cc_qjs_val_release(&r.u.value);
+    if (!v.ok) return cc_err_CCResult_int_CCQjsError(v.u.error);
+    if (v.u.value < (int64_t)INT_MIN || v.u.value > (int64_t)INT_MAX) {
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: %s: result out of range for int destination",
+                 method ? method : "call");
+        return cc_err_CCResult_int_CCQjsError(cc__qjs_err(obj ? obj->home : NULL, method));
+    }
+    return cc_ok_CCResult_int_CCQjsError((int)v.u.value);
+}
+
+static CCResult_CCQjsVal_CCQjsError cc__qjs_host_callm_n(CCQjs *js,
+                                                     const char *method,
+                                                     int argc,
+                                                     const CCQjsArg *argv) {
+    cc__qjs_bind_err_js(js);
+    if (!js || !js->ready) {
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: %s: handle not ready", method ? method : "?");
+        return cc_err_CCResult_CCQjsVal_CCQjsError(cc__qjs_err(js, method));
+    }
+    if (method && argc == 1 && (argv[0].kind == 2 || argv[0].kind == 3) &&
+        strcmp(method, "eval") == 0) {
+        CCSlice src;
+        src.ptr = (void *)(uintptr_t)argv[0].p;
+        src.len = argv[0].n;
+        return cc__qjs_eval(js, src);
+    }
+    snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+             "qjs: CCQjs has no dynamic method '%s' (dynamic members: eval(src))",
+             method ? method : "?");
+    return cc_err_CCResult_CCQjsVal_CCQjsError(cc__qjs_err(js, method));
+}
+
+static inline CCResult_CCQjsVal_CCQjsError cc_qjs_callm(CCQjs *js, const char *method,
+                                                    int argc, ...) {
+    CCQjsArg tmp[CC__QJS_MAX_CALL_ARGS];
+    int i;
+    va_list ap;
+    if (argc < 0) argc = 0;
+    if (argc > CC__QJS_MAX_CALL_ARGS) argc = CC__QJS_MAX_CALL_ARGS;
+    va_start(ap, argc);
+    for (i = 0; i < argc; i++) tmp[i] = va_arg(ap, CCQjsArg);
+    va_end(ap);
+    return cc__qjs_host_callm_n(js, method, argc, tmp);
+}
+
+static inline CCResult_double_CCQjsError cc_qjs_callm_double(CCQjs *js,
+                                                         const char *method,
+                                                         int argc, ...) {
+    CCQjsArg tmp[CC__QJS_MAX_CALL_ARGS];
+    int i;
+    CCResult_CCQjsVal_CCQjsError r;
+    CCResult_double_CCQjsError out;
+    va_list ap;
+    if (argc < 0) argc = 0;
+    if (argc > CC__QJS_MAX_CALL_ARGS) argc = CC__QJS_MAX_CALL_ARGS;
+    va_start(ap, argc);
+    for (i = 0; i < argc; i++) tmp[i] = va_arg(ap, CCQjsArg);
+    va_end(ap);
+    r = cc__qjs_host_callm_n(js, method, argc, tmp);
+    if (!r.ok) return cc_err_CCResult_double_CCQjsError(r.u.error);
+    out = cc_qjs_val_as_f64(&r.u.value);
+    cc_qjs_val_release(&r.u.value);
+    return out;
+}
+
+static inline CCResult_float_CCQjsError cc_qjs_callm_float(CCQjs *js,
+                                                       const char *method,
+                                                       int argc, ...) {
+    CCResult_double_CCQjsError d;
+    CCQjsArg tmp[CC__QJS_MAX_CALL_ARGS];
+    int i;
+    CCResult_CCQjsVal_CCQjsError r;
+    va_list ap;
+    if (argc < 0) argc = 0;
+    if (argc > CC__QJS_MAX_CALL_ARGS) argc = CC__QJS_MAX_CALL_ARGS;
+    va_start(ap, argc);
+    for (i = 0; i < argc; i++) tmp[i] = va_arg(ap, CCQjsArg);
+    va_end(ap);
+    r = cc__qjs_host_callm_n(js, method, argc, tmp);
+    if (!r.ok) return cc_err_CCResult_float_CCQjsError(r.u.error);
+    d = cc_qjs_val_as_f64(&r.u.value);
+    cc_qjs_val_release(&r.u.value);
+    if (!d.ok) return cc_err_CCResult_float_CCQjsError(d.u.error);
+    return cc_ok_CCResult_float_CCQjsError((float)d.u.value);
+}
+
+static inline CCResult_int64_t_CCQjsError cc_qjs_callm_int64_t(CCQjs *js,
+                                                           const char *method,
+                                                           int argc, ...) {
+    CCQjsArg tmp[CC__QJS_MAX_CALL_ARGS];
+    int i;
+    CCResult_CCQjsVal_CCQjsError r;
+    CCResult_int64_t_CCQjsError out;
+    va_list ap;
+    if (argc < 0) argc = 0;
+    if (argc > CC__QJS_MAX_CALL_ARGS) argc = CC__QJS_MAX_CALL_ARGS;
+    va_start(ap, argc);
+    for (i = 0; i < argc; i++) tmp[i] = va_arg(ap, CCQjsArg);
+    va_end(ap);
+    r = cc__qjs_host_callm_n(js, method, argc, tmp);
+    if (!r.ok) return cc_err_CCResult_int64_t_CCQjsError(r.u.error);
+    out = cc__qjs_take_i64(&r.u.value, method);
+    cc_qjs_val_release(&r.u.value);
+    return out;
+}
+
+static inline CCResult_long_long_CCQjsError cc_qjs_callm_long_long(CCQjs *js,
+                                                               const char *method,
+                                                               int argc, ...) {
+    CCResult_int64_t_CCQjsError v;
+    CCQjsArg tmp[CC__QJS_MAX_CALL_ARGS];
+    int i;
+    CCResult_CCQjsVal_CCQjsError r;
+    va_list ap;
+    if (argc < 0) argc = 0;
+    if (argc > CC__QJS_MAX_CALL_ARGS) argc = CC__QJS_MAX_CALL_ARGS;
+    va_start(ap, argc);
+    for (i = 0; i < argc; i++) tmp[i] = va_arg(ap, CCQjsArg);
+    va_end(ap);
+    r = cc__qjs_host_callm_n(js, method, argc, tmp);
+    if (!r.ok) return cc_err_CCResult_long_long_CCQjsError(r.u.error);
+    v = cc__qjs_take_i64(&r.u.value, method);
+    cc_qjs_val_release(&r.u.value);
+    if (!v.ok) return cc_err_CCResult_long_long_CCQjsError(v.u.error);
+    return cc_ok_CCResult_long_long_CCQjsError((long long)v.u.value);
+}
+
+static inline CCResult_int_CCQjsError cc_qjs_callm_int(CCQjs *js, const char *method,
+                                                   int argc, ...) {
+    CCResult_int64_t_CCQjsError v;
+    CCQjsArg tmp[CC__QJS_MAX_CALL_ARGS];
+    int i;
+    CCResult_CCQjsVal_CCQjsError r;
+    va_list ap;
+    if (argc < 0) argc = 0;
+    if (argc > CC__QJS_MAX_CALL_ARGS) argc = CC__QJS_MAX_CALL_ARGS;
+    va_start(ap, argc);
+    for (i = 0; i < argc; i++) tmp[i] = va_arg(ap, CCQjsArg);
+    va_end(ap);
+    r = cc__qjs_host_callm_n(js, method, argc, tmp);
+    if (!r.ok) return cc_err_CCResult_int_CCQjsError(r.u.error);
+    v = cc__qjs_take_i64(&r.u.value, method);
+    cc_qjs_val_release(&r.u.value);
+    if (!v.ok) return cc_err_CCResult_int_CCQjsError(v.u.error);
+    if (v.u.value < (int64_t)INT_MIN || v.u.value > (int64_t)INT_MAX) {
+        snprintf(cc__qjs_errbuf, sizeof(cc__qjs_errbuf),
+                 "qjs: %s: result out of range for int destination",
+                 method ? method : "call");
+        return cc_err_CCResult_int_CCQjsError(cc__qjs_err(js, method));
+    }
+    return cc_ok_CCResult_int_CCQjsError((int)v.u.value);
+}
+
+/* ---- js.own::[T]: JS binds a CC object; bytes live in the handle arena.
+ * Family is `qjs_own` so `CCQjs.own` matches snake(Qjs)_own, same as
+ * `CCPy.expose` → `py_expose`. */ 
+
+                                
+                                                                       
+                                           
+                                                                                                                                                                                                                                                                                                                                                                                            
+                                 
+                
+                         
+                                                                       
+                                      
+                 
+                                   
+                
+                                                                          
+                                                                   
+                                
+     
+                                    
+                                                 
+                                              
+                  
+                                 
+                                                         
+                         
+                         
+                                                     
+                                                       
+                                   
+                                                       
+                                                    
+                                                    
+                            
+                                        
+                                 
+                                      
+               
+                                  
+                          
+                                                           
+                                                  
+         
+                          
+                                                                       
+                                                                          
+                                                                           
+                                                                       
+                     
+                                                                      
+                                                                              
+                                                 
+                                    
+         
+                                        
+                                    
+                                                                      
+                                           
+                                                                     
+                                              
+                      
+                                                                                  
+                  
+                                  
+                                    
+                             
+                   
+                                                           
+                       
+                                                              
+                                      
+                                       
+                        
+                                                
+                                   
+                               
+                                                                     
+                                                                             
+             
+                  
+                             
+                                                
+                                
+                                                                           
+                  
+                
+                                                
+                                    
+                               
+                                                                     
+                                                                              
+             
+                  
+         
+                   
+                                            
+                                        
+                        
+                                            
+                                                       
+                        
+                                            
+                                                    
+            
+                                            
+                                                        
+                                  
+                          
+                                                           
+                                                                             
+         
+                   
+                                              
+                                       
+         
+                  
+                        
+                                              
+                                                   
+         
+                  
+                        
+                                              
+                                                    
+         
+                  
+            
+                                              
+                                                   
+         
+                  
+               
+     
+                   
+                                                                              
+                                                                        
+                                
+     
+                                    
+                                                                             
+                            
+                           
+                                    
+                                                                
+                                                       
+                                                      
+             
+                                    
+                                                                            
+                                                                    
+                        
+                                                                
+                                                      
+                                                      
+             
+                        
+                                          
+                                                                        
+                                                     
+                                                                         
+                                                     
+                                                  
+             
+                                                                            
+                                          
+                             
+                                                                         
+             
+                                        
+                  
+                                 
+                                                         
+               
+                                                     
+                                                       
+                                   
+                                                       
+                                                    
+                                                    
+                            
+                                               
+                                        
+         
+                          
+                                      
+                              
+                                                               
+                                                      
+             
+                              
+         
+                                        
+                                                                        
+                                              
+                                           
+                             
+                                               
+                                                                          
+             
+                                                                
+                                               
+                                                                
+                                                          
+                                                      
+             
+                  
+     
+                                    
+                                             
+         
+                  
+                                  
+                       
+ 
+
+
+
+
+#define cc_qjs_new(a) (cc_qjs_new)(CC__ARENA_HANDLE(a))
+#define cc_qjs_val_as_slice_into(o, a) \
+    (cc_qjs_val_as_slice_into)((o), CC__ARENA_HANDLE(a))
+
+#endif /* CC_SCRIPT_QUICKJS_H */

@@ -37,6 +37,10 @@ fiber_v2* sched_v2_spawn(void* (*fn)(void*), void* arg);
 fiber_v2* sched_v2_spawn_in_nursery(void* (*fn)(void*), void* arg, CCNurseryHost* nursery);
 int    sched_v2_join(fiber_v2* f, void** out_result);
 void   sched_v2_signal(fiber_v2* f);
+/* Enqueue a parked fiber without waking a peer worker. The current
+ * worker drains it on the next park. Unbuffered rendezvous uses this
+ * so 1P1C stays on one OS thread. Off-fiber still wakes. */
+void   sched_v2_signal_local(fiber_v2* f);
 void   sched_v2_park(void);
 void   sched_v2_yield(void);
 void   sched_v2_set_park_reason(const char* reason);
@@ -44,9 +48,13 @@ int    sched_v2_in_context(void);
 fiber_v2* sched_v2_current_fiber(void);
 CCNurseryHost* sched_v2_current_nursery(void);
 void*  sched_v2_current_deadline_scope(void);
+void*  sched_v2_fiber_deadline_scope(fiber_v2* f);
 void*  sched_v2_deadline_scope_push(void* d);
 void   sched_v2_deadline_scope_pop(void* prev);
 int    sched_v2_current_worker_id(void); /* -1 if not on a V2 worker thread */
+int    sched_v2_live_workers(void);      /* current pool size (ratchet) */
+int    sched_v2_max_workers(void);       /* worker cap */
+int    sched_v2_idle_workers(void);      /* workers parked with is_idle set */
 void   sched_v2_shutdown(void);
 
 /* Ready-queue depth (relaxed). The spawn gate denies CHURN sites and
@@ -96,6 +104,8 @@ void   sched_v2_fiber_set_park_deadline(fiber_v2* f, const struct timespec* d);
 void   sched_v2_fiber_clear_park_deadline(fiber_v2* f);
 void   sched_v2_fiber_set_par_gate(fiber_v2* f, void* gate);
 void*  sched_v2_fiber_par_gate(fiber_v2* f);
+void   sched_v2_fiber_set_par_slot(fiber_v2* f, int slot);
+int    sched_v2_fiber_par_slot(fiber_v2* f);
 
 /* Deadlock-detector check.
  *
@@ -112,5 +122,12 @@ void   sched_v2_check_deadlock(void);
 /* Wait-ticket support (for kqueue / multi-wait integration) */
 uint64_t sched_v2_fiber_publish_wait_ticket(fiber_v2* f);
 int sched_v2_fiber_wait_ticket_matches(fiber_v2* f, uint64_t ticket);
+
+/* Worklets: short non-parking fn(arg) on a worker C stack (no fiber).
+ * Used by `@parallel noblock`. Join mirrors sched_v2_join (fiber park vs
+ * wake_primitive). NULL spawn = OOM. Capacity Cut is the caller's job. */
+typedef struct cc_worklet cc_worklet;
+cc_worklet* sched_v2_worklet_spawn(void* (*fn)(void*), void* arg);
+void        sched_v2_worklet_join(cc_worklet* w);
 
 #endif /* CC_SCHED_V2_H */

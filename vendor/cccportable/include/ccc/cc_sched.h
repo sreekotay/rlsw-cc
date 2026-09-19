@@ -48,6 +48,7 @@ typedef int CCTaskIntptrKind;
 #define CC_TASK_KIND_FIBER   4
 #define CC_TASK_KIND_POOL    5
 #define CC_TASK_KIND_FIBER_V2 6
+#define CC_TASK_KIND_WORKLET 7
 #define CC_TASK_INTPTR_KIND_INVALID 0
 #define CC_TASK_INTPTR_KIND_FUTURE  2
 #define CC_TASK_INTPTR_KIND_POLL    3
@@ -61,6 +62,7 @@ typedef enum {
     CC_TASK_KIND_FIBER = 4,   /* M:N fiber (from cc_fiber_spawn_task) */
     CC_TASK_KIND_POOL  = 5,   /* M:N pool task (transparent runtime pooling) */
     CC_TASK_KIND_FIBER_V2 = 6, /* V2 hybrid scheduler fiber */
+    CC_TASK_KIND_WORKLET = 7, /* C-stack worklet (`@parallel noblock`) */
 } CCTaskKind;
 
 /* Opaque CCTask struct - the actual layout is implementation detail.
@@ -150,46 +152,127 @@ void cc_thread_task_free(struct CCSpawnTask* task);
 // Snapshot scheduler stats; returns 0 on success.
 int cc_scheduler_stats(CCSchedulerStats* out);
 
-/* @parallel spawn/join. Spawn refuses (INVALID) when in-flight @parallel
- * fibers reach 256 * online processors. n.spawn is uncapped. */
+/* @parallel spawn/join. `cc_parallel_spawn` may refuse (INVALID) when
+ * the adaptive gate denies; the lowering inlines that arm. Meeting
+ * admit (`@parallel spawn`, dest-live, dest-attach) uses
+ * `cc_parallel_spawn_admit`: no adapt deny. Remaining INVALID is
+ * real spawn failure — the lowering dies; it does not inline.
+ * `@parallel noblock` uses `cc_parallel_spawn_noblock`: the arms are
+ * equal work. A child that still forks is a fiber; the last wave is a
+ * worklet; otherwise Cut (INVALID → inline). No adapt.
+ * `n.spawn` is uncapped. */
 CCTask cc_parallel_spawn(void* (*fn)(void*), void* arg);
+CCTask cc_parallel_spawn_admit(void* (*fn)(void*), void* arg);
+CCTask cc_parallel_spawn_noblock(void* (*fn)(void*), void* arg);
 void cc_parallel_join(CCTask t);
+
+/* Wait-for @parallel join handle: kind + fiber, not a 128-byte CCTask.
+ * The lowering keeps this off the CHURN path; admit stores one across
+ * the first arm and joins it. Dest-live / `spawn` still use CCTask. */
+#if defined(CC_PARSER_MODE)
+typedef int CCParJoin;
+#else
+typedef struct CCParJoin {
+    int kind;
+    void* fiber;
+} CCParJoin;
+#endif
+
+CCParJoin cc_parallel_spawn_arm(void* (*fn)(void*), void* arg);
+CCParJoin cc_parallel_spawn_arm_noblock(void* (*fn)(void*), void* arg);
+void cc_parallel_join_arm(CCParJoin j);
+
+/* Worker-pool cells for `@parallel noblock` (set at sched init; boots
+ * Cut-safe). Fork while the piece is larger than one share, and one
+ * split past that when it shortens the longest worker. That last wave
+ * is worklets; a child that still forks is a fiber. */
+extern volatile int* __cc_par_idle_addr;
+extern volatile size_t* __cc_par_depth_addr;
+extern volatile size_t* __cc_par_worklet_addr;
+extern volatile int* __cc_par_nworkers_addr;
+
+/* Bring up the worker pool before the first admit read. Without this,
+ * boot idle=0 Cuts forever and never reaches worklet_spawn's ensure_init
+ * (storm_tile runs on main; pow2 already inits via fiber spawn). */
+void cc_parallel_noblock_prepare(void);
+
+/* `narms` is this site's arm count. Divides the current piece into that
+ * many equal shares and records whether those arms Fork. */
+void cc_parallel_noblock_enter(int narms);
+void cc_parallel_noblock_leave(void);
+int __cc_par_noblock_split(void);
+
+/* Always-on noblock admit/cut tallies. Dump with CC_V2_STATS=1. */
+void __cc_par_noblock_note_fork(void);
+void __cc_par_noblock_note_cut_idle(void);
+void __cc_par_noblock_note_cut_ready(void);
+void __cc_par_noblock_note_cut_cap(void);
+void __cc_par_noblock_note_cut_nested(void);
+int __cc_par_in_worklet(void);
+int __cc_par_noblock_depth(void);
+
+static inline int cc_parallel_noblock_admit(void) {
+    int nworkers;
+    cc_parallel_noblock_prepare();
+    /* Enter already divided this piece by the arm count. Split is set
+     * when the arms are a fiber or a worklet, not once the piece is
+     * already one share. */
+    if (!__cc_par_noblock_split()) {
+        __cc_par_noblock_note_cut_nested();
+        return 0;
+    }
+    nworkers = *__cc_par_nworkers_addr;
+    if (nworkers <= 1) {
+        __cc_par_noblock_note_cut_idle();
+        return 0;
+    }
+    __cc_par_noblock_note_fork();
+    return 1;
+}
+
+static inline int cc_parallel_noblock_cut(void) {
+    return !cc_parallel_noblock_admit();
+}
 
 /* ----------------------------------------------------------------------------
  * Inline deny gate for lowered @parallel spawns.
  *
  * cc_parallel_spawn's adaptive gate (scheduler.c) classifies each
  * @parallel call site by its clean leaf-arm CPU time; churn sites are
- * denied when the ready queue is busy and the lowering runs the denied
- * arm inline. Once a site is classified churn, the deny verdict is the
- * common case by orders of magnitude (millions of denials per admit in a
- * spawn storm), so paying a cross-TU call returning a 128-byte CCTask
- * per denial dominates the construct's cost. This gate lets the lowering
- * take the deny decision inline: one cached-pointer load, one state
- * load, one depth load.
+ * denied and the lowering runs the denied arm inline. Once a site is
+ * classified churn, the deny verdict is the common case by orders of
+ * magnitude (millions of denials per admit in a spawn storm), so paying
+ * a cross-TU call returning a 128-byte CCTask per denial dominates the
+ * construct's cost. This gate lets the lowering take the deny decision
+ * inline: one cached-pointer load, one state load.
  *
  * The lowering emits, per @parallel construct:
  *
  *     static void* __cc_par_site_N;                 // file scope
  *     ...
- *     if (cc_parallel_deny_fast(&__cc_par_site_N, __cc_par_thunk_N))
- *         __cc_par_t_N = cc__task_invalid();        // join runs arm inline
+ *     CCParTls* __cc_pt = cc__par_tls();            // one TLS lookup
+ *     cc_parallel_deny_enter(__cc_pt, dest);
+ *     if (cc_parallel_deny_fast(__cc_pt, &__cc_par_site_N, __cc_par_thunk_N))
+ *         denied = 1;                             // join spells the arm
  *     else
- *         __cc_par_t_N = cc_parallel_spawn(__cc_par_thunk_N, &__cc_par_e_N);
+ *         __cc_par_t_N = cc_parallel_spawn_arm(__cc_par_thunk_N, &__cc_par_e_N);
+ *     ...
+ *     cc_parallel_deny_leave(__cc_pt);
  *
  * Layout contract with the runtime: CCParSiteGate is the leading prefix
  * of scheduler.c's cc_par_site (whose fields are C11 _Atomic; same size
  * and alignment as the plain ints here, read via volatile — relaxed
  * loads). Both sides live in this repo and version together.
  *
- * A 1-in-1024 fall-through reaches cc_parallel_spawn as a resample.
+ * A 1-in-2^20 fall-through reaches cc_parallel_spawn as a resample.
  * Inlined arms are counted at the run (CC_PAR_NOTE_INLINE_ARM).
  */
 #define CC_PAR_GATE_CHURN 1
 
 typedef struct CCParSiteGate {
     int state;      /* CC_PAR_GATE_CHURN or not; other values private */
-    int deny_depth; /* ready-queue depth at which churn spawns deny */
+    int deny_depth; /* written; unused on the CHURN fast path */
+    uint32_t tick;  /* CHURN resample; racy increment, 1-in-2^20 */
 } CCParSiteGate;
 
 /* Resolve the gate record for a thunk. Never NULL: when the adaptive
@@ -201,19 +284,69 @@ const CCParSiteGate* cc_parallel_site_gate(void* (*fn)(void*));
  * static zero so pre-init reads are safe). */
 extern volatile size_t* __cc_par_depth_addr;
 
+/* All per-thread gate state in one block. On Darwin every distinct
+ * thread-local variable access is a `_tlv_get_addr` call, so the
+ * lowering fetches `cc__par_tls()` once per @parallel construct and
+ * hands the pointer to every helper below.
+ *
+ *   deny_n / deny_dest / deny_flag — denied-sibling stack: a construct
+ *       pushes its dest on enter, marks the top when it denies a
+ *       spawn, pops on leave. `cc_parallel_denied_here` reads the top
+ *       flag so a denied arm that parks on a channel dies loud.
+ *   denials     — inlined arms, counted at the run
+ *                 (CC_PAR_NOTE_INLINE_ARM). The sampler rejects a timed
+ *                 arm if this moved: the arm absorbed a child.
+ *   tick        — CHURN resample trickle (inline gate).
+ *   spawn_calls / real_tick — cc_parallel_spawn's own counters.
+ *
+ * The block is per thread, not per fiber. A fiber that migrates across
+ * a join still holds its entry thread's pointer; the stack is a
+ * diagnostic and every index is bounds-checked, so a late touch cannot
+ * write outside the block. */
+#define CC_PAR_DENY_STACK 16
+
+struct CCParallel;
+typedef struct CCParTls {
+    int deny_n;
+    uint32_t tick;
+    uint64_t denials;
+    uint64_t spawn_calls;
+    uint32_t real_tick;
+    struct CCParallel* deny_dest[CC_PAR_DENY_STACK];
+    unsigned char deny_flag[CC_PAR_DENY_STACK];
+    /* Set for the whole run of a noblock worklet. Descendants are a
+     * smaller share and cannot fork; the site is the inline arms. */
+    int nb_sealed;
+} CCParTls;
+
 #if defined(CC_PARSER_MODE) || defined(__TINYC__)
-/* Parse-only: host TCC has no _Thread_local; these never execute. */
-extern uint64_t __cc_par_denials;
-static inline int cc_parallel_deny_fast(void** slot, void* (*fn)(void*)) {
+/* Host TCC has no _Thread_local: the block lives in the runtime's
+ * pthread-keyed bundle (cc_pthread_tls.h). NULL when that bundle could
+ * not be allocated; every helper tolerates NULL. The inline gate is a
+ * no-op here: every spawn goes through cc_parallel_spawn. */
+CCParTls* cc__par_tls(void);
+static inline int cc__par_deny_fast(CCParTls* pt, void** slot,
+                                    void* (*fn)(void*)) {
+    (void)pt;
     (void)slot;
     (void)fn;
     return 0;
 }
-#define CC_PAR_NOTE_INLINE_ARM() ((void)0)
+static inline int cc_parallel_churn_skip(void** slot, void* (*fn)(void*)) {
+    (void)slot;
+    (void)fn;
+    return 0;
+}
+static inline void cc__par_note_inline_arm(CCParTls* pt) { (void)pt; }
 #else
-extern _Thread_local uint64_t __cc_par_denials;
+extern _Thread_local CCParTls __cc_par_tls;
 
-static inline int cc_parallel_deny_fast(void** slot, void* (*fn)(void*)) {
+static inline CCParTls* cc__par_tls(void) {
+    return &__cc_par_tls;
+}
+
+static inline int cc__par_deny_fast(CCParTls* pt, void** slot,
+                                    void* (*fn)(void*)) {
     const CCParSiteGate* s = (const CCParSiteGate*)*slot;
     if (!s) {
         s = cc_parallel_site_gate(fn);
@@ -221,20 +354,107 @@ static inline int cc_parallel_deny_fast(void** slot, void* (*fn)(void*)) {
     }
     if (*(volatile const int*)&s->state != CC_PAR_GATE_CHURN)
         return 0; /* virgin/real: full runtime path */
-    {
-        static _Thread_local uint32_t __cc_par_tick;
-        if (((++__cc_par_tick) & 1023u) == 0)
-            return 0; /* resample trickle: go measured through the runtime */
-    }
-    if (*__cc_par_depth_addr < (size_t)*(volatile const int*)&s->deny_depth)
-        return 0; /* queue shallow: admit */
+    if (!pt) pt = cc__par_tls();
+    /* 1-in-2^20: unstick a wrong CHURN without a spawn storm. */
+    if (((++pt->tick) & 0xfffffu) == 0)
+        return 0;
+    return 1;
+}
+
+/* Wait-for CHURN: one static load, no TLS. Nested nodes of a classified
+ * site run as sequential. Does not resolve the gate — deny_fast / spawn
+ * fill `*slot` during learning, so virgin sampling is unchanged.
+ * 1-in-2^20 falls through so a wrong CHURN can still resample. */
+static inline int cc_parallel_churn_skip(void** slot, void* (*fn)(void*)) {
+    CCParSiteGate* s;
+    (void)fn;
+    if (!slot)
+        return 0;
+    s = (CCParSiteGate*)*slot;
+    if (!s || *(volatile const int*)&s->state != CC_PAR_GATE_CHURN)
+        return 0;
+    if ((++*(volatile uint32_t*)&s->tick & 0xfffffu) == 0)
+        return 0;
     return 1;
 }
 
 /* Count at the run, not the decide. Sampler rejects a timed arm if
  * this moved — the arm absorbed an inlined child. */
-#define CC_PAR_NOTE_INLINE_ARM() ((void)__cc_par_denials++)
+static inline void cc__par_note_inline_arm(CCParTls* pt) {
+    if (!pt) pt = cc__par_tls();
+    pt->denials++;
+}
 #endif
+
+/* One load. A noblock worklet has already been cut to one share, so every
+ * site under it is the arms in order. Native hosts read the TLS cell;
+ * TCC goes through the pthread bundle. */
+#if defined(CC_PARSER_MODE) || defined(__TINYC__)
+static inline int cc_parallel_noblock_sealed(void) {
+    CCParTls* pt = cc__par_tls();
+    return pt && pt->nb_sealed;
+}
+#else
+static inline int cc_parallel_noblock_sealed(void) {
+    return __cc_par_tls.nb_sealed;
+}
+#endif
+
+/* Denied-sibling stack, inline: one pointer, no TLS lookup. `pt` is the
+ * block the construct fetched once; NULL means "fetch it here" (the
+ * `!pt` test folds away on native hosts once the caller's fetch inlines,
+ * since `&__cc_par_tls` is never NULL). */
+static inline void cc__par_deny_enter(CCParTls* pt,
+                                      struct CCParallel* dest) {
+    if (!pt) pt = cc__par_tls();
+    if (!pt || (unsigned)pt->deny_n >= CC_PAR_DENY_STACK)
+        return;
+    pt->deny_dest[pt->deny_n] = dest;
+    pt->deny_flag[pt->deny_n] = 0;
+    pt->deny_n++;
+}
+
+static inline void cc__par_note_denied(CCParTls* pt) {
+    if (!pt) pt = cc__par_tls();
+    if (!pt || (unsigned)(pt->deny_n - 1) >= CC_PAR_DENY_STACK)
+        return;
+    pt->deny_flag[pt->deny_n - 1] = 1;
+}
+
+/* Pop the top entry when it is the anonymous (dest-less) construct
+ * leaving. A dest construct pops itself via cc_parallel_deny_leave_dest
+ * when the handle is joined. */
+static inline void cc__par_deny_leave(CCParTls* pt) {
+    if (!pt) pt = cc__par_tls();
+    if (!pt || (unsigned)(pt->deny_n - 1) >= CC_PAR_DENY_STACK)
+        return;
+    if (pt->deny_dest[pt->deny_n - 1] == NULL)
+        pt->deny_n--;
+}
+
+void cc__par_deny_leave_dest(CCParTls* pt, struct CCParallel* dest);
+
+/* Two call shapes share each name. The lowering passes the block it
+ * fetched once per construct (`cc_parallel_deny_enter(__cc_pt, dest)`);
+ * code emitted by a bootstrap lowerer that predates the block passes
+ * none (`cc_parallel_deny_enter(dest)`) and fetches inside. Arity picks
+ * the shape; `(CCParTls*)(__VA_ARGS__ + 0)` reads an absent block as
+ * NULL. */
+#define CC__PAR_ARG2(_1, _2, NAME, ...) NAME
+#define CC__PAR_ARG3(_1, _2, _3, NAME, ...) NAME
+#define cc__par_deny_enter1(dest) cc__par_deny_enter(NULL, dest)
+#define cc__par_deny_fast2(slot, fn) cc__par_deny_fast(NULL, slot, fn)
+#define cc__par_deny_leave_dest1(dest) cc__par_deny_leave_dest(NULL, dest)
+#define cc_parallel_deny_enter(...) \
+    CC__PAR_ARG2(__VA_ARGS__, cc__par_deny_enter, cc__par_deny_enter1, )(__VA_ARGS__)
+#define cc_parallel_deny_fast(...) \
+    CC__PAR_ARG3(__VA_ARGS__, cc__par_deny_fast, cc__par_deny_fast2, )(__VA_ARGS__)
+#define cc_parallel_deny_leave_dest(...) \
+    CC__PAR_ARG2(__VA_ARGS__, cc__par_deny_leave_dest, cc__par_deny_leave_dest1, )(__VA_ARGS__)
+#define CC__PAR_PT0(...) ((CCParTls*)(__VA_ARGS__ + 0))
+#define cc_parallel_note_denied(...) cc__par_note_denied(CC__PAR_PT0(__VA_ARGS__))
+#define cc_parallel_deny_leave(...) cc__par_deny_leave(CC__PAR_PT0(__VA_ARGS__))
+#define CC_PAR_NOTE_INLINE_ARM(...) cc__par_note_inline_arm(CC__PAR_PT0(__VA_ARGS__))
 
 /* Zeroed CCTask (kind == CC_TASK_KIND_INVALID). */
 static inline CCTask cc__task_invalid(void) {

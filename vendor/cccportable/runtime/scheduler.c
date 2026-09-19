@@ -7,6 +7,10 @@
 #include <ccc/std/task.h>
 #include "fiber_internal.h"
 
+typedef struct fiber_v2 fiber_v2;
+fiber_v2* cc_task_fiber_v2(CCTask t);
+void cc_task_bind_fiber_v2(CCTask* t, void* fiber);
+
 #include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -311,9 +315,8 @@ void* cc_thread_task_get_result(struct CCSpawnTask* task) {
 }
 
 int cc_sleep_ms(unsigned int ms) {
-    /* Fiber-aware: park the fiber on the sleep queue with a deadline.
-     * Sysmon drains expired sleepers every ~250µs and re-enqueues them.
-     * This avoids O(N) queue churn when many fibers sleep concurrently. */
+    /* Fiber: park this fiber; the worker runs someone else. Sysmon
+     * signals when the deadline is due. Thread: nanosleep. */
     if (cc__fiber_in_context()) {
         cc__fiber_sleep_park(ms);
         return 0;
@@ -364,14 +367,60 @@ const struct timespec* cc_deadline_as_timespec(const CCDeadline* d, struct times
 }
 
 size_t sched_v2_ready_depth(void);
+int    sched_v2_idle_workers(void);
 uint32_t sched_v2_current_fiber_suspends(void);
+extern volatile int* __cc_par_idle_addr;
+extern volatile size_t* __cc_par_depth_addr;
+extern volatile size_t* __cc_par_worklet_addr;
+extern volatile int* __cc_par_nworkers_addr;
+
+void __cc_par_noblock_note_fork(void);
+void __cc_par_noblock_note_cut_idle(void);
+void __cc_par_noblock_note_cut_ready(void);
+void __cc_par_noblock_note_cut_cap(void);
+void __cc_par_noblock_note_cut_nested(void);
+void cc_parallel_noblock_prepare(void);
+void cc_parallel_noblock_enter(int narms);
+void cc_parallel_noblock_leave(void);
+int __cc_par_noblock_split(void);
+int __cc_par_in_worklet(void);
+int __cc_par_noblock_depth(void);
+
+typedef struct cc_worklet cc_worklet;
+cc_worklet* sched_v2_worklet_spawn(void* (*fn)(void*), void* arg);
+void        sched_v2_worklet_join(cc_worklet* w);
+fiber_v2*   sched_v2_spawn_noblock(void* (*fn)(void*), void* arg);
+int         __cc_par_noblock_as_fiber(void);
+
+/* Same predicate as cc_parallel_noblock_admit in cc_sched.cch. */
+static int cc_par_noblock_admit(void) {
+    int nworkers;
+    cc_parallel_noblock_prepare();
+    if (!__cc_par_noblock_split()) {
+        __cc_par_noblock_note_cut_nested();
+        return 0;
+    }
+    nworkers = *__cc_par_nworkers_addr;
+    if (nworkers <= 1) {
+        __cc_par_noblock_note_cut_idle();
+        return 0;
+    }
+    __cc_par_noblock_note_fork();
+    return 1;
+}
 
 /* ============================================================================
  * Adaptive spawn gate (CC_PAR_ADAPT, default on).
  *
- * If this site's leaf arms are cheaper than a spawn, do not spawn when
- * the ready queue is already busy; otherwise spawn. Denied arms run
- * inline at the join, so nothing strands.
+ * If this site's leaf arms are cheaper than a spawn, do not spawn.
+ * Denied arms run inline at the join, so nothing strands. A shallow
+ * ready queue is not a reason to admit: a recursive cheap tree keeps
+ * the queue empty and would otherwise become a spawn/wake storm.
+ * A wrapped virgin arm that nested-spawns the same thunk is that storm:
+ * the first clean leaf sample is at the bottom of the tree, and workers
+ * drain the queue fast enough that FLOOD_DEPTH never trips. Commit
+ * CHURN at the inner spawn so the rest of the tree skips instead of
+ * mmaping a 2 MB stack per node.
  *
  * A site is a @parallel thunk pointer. Clean leaf-arm CPU time below
  * CC_PAR_CHURN_NS (default 8us) is cheap; at or above is heavy. Heavy
@@ -380,8 +429,9 @@ uint32_t sched_v2_current_fiber_suspends(void);
  * evidence commits CHURN from virgin on the first sample (a storm is
  * all cheap); demoting REAL to CHURN takes CC_PAR_CHEAP_STREAK
  * consecutive cheap resamples, so one freak-cheap sample cannot
- * serialize a real site. A 1-in-1024 resample keeps a wrong verdict
- * from sticking. CC_PAR_ADAPT=0 always spawns.
+ * serialize a real site. A 1-in-2^20 CHURN resample (inline gate) and
+ * a 1-in-1024 REAL wrap keep a wrong verdict from sticking.
+ * CC_PAR_ADAPT=0 always spawns.
  *
  * Table: fixed open-addressed, insert-only. Overflow stays virgin and
  * always spawns. */
@@ -393,6 +443,7 @@ enum {
     CC_PAR_SITE_REAL = 2,
 };
 #define CC_PAR_RESAMPLE_MASK 1023u
+#define CC_PAR_CHURN_RESAMPLE_MASK 0xfffffu /* 1-in-2^20; see deny_fast */
 #define CC_PAR_CHEAP_STREAK 3u /* REAL→CHURN; toward-deny is the starving direction */
 #define CC_PAR_FLOOD_DEPTH 512u /* virgin/TCC wrap cap: above any coarse fan-out */
 
@@ -400,6 +451,7 @@ typedef struct {
     /* Prefix is CCParSiteGate (cc_sched.cch). Keep first, keep in order. */
     _Atomic int      state;
     _Atomic int      deny_depth; /* adapt_backlog, written before CHURN */
+    uint32_t         tick;       /* CCParSiteGate.tick; CHURN resample */
     _Atomic(void*)   fn;
     _Atomic uint32_t cheap_streak; /* consecutive cheap while REAL */
     /* Set when any wrapped arm suspends (join or channel). The virgin
@@ -415,6 +467,7 @@ typedef struct {
 _Static_assert(offsetof(cc_par_site, state) == offsetof(CCParSiteGate, state) &&
                offsetof(cc_par_site, deny_depth) ==
                    offsetof(CCParSiteGate, deny_depth) &&
+               offsetof(cc_par_site, tick) == offsetof(CCParSiteGate, tick) &&
                sizeof(int) == sizeof(_Atomic int),
                "cc_par_site prefix must match public CCParSiteGate");
 
@@ -477,16 +530,16 @@ static int cc_parallel_adapt_backlog(void) {
  * accepted sample never suspended, so it never migrated. Lowering
  * notes inlined arms via CC_PAR_NOTE_INLINE_ARM. */
 #if defined(__TINYC__)
-#define __cc_par_denials (cc_rt_tls_get()->par_denials)
-#define tls_par_denials __cc_par_denials
-#define tls_par_spawn_calls (cc_rt_tls_get()->par_spawn_calls)
-#define tls_par_tick (cc_rt_tls_get()->par_tick)
+CCParTls* cc__par_tls(void) {
+    cc_rt_tls* t = cc_rt_tls_get();
+    return t ? &t->par : NULL;
+}
 #else
-__thread uint64_t __cc_par_denials = 0;
-#define tls_par_denials __cc_par_denials
-static __thread uint64_t tls_par_spawn_calls = 0;
-static __thread uint32_t tls_par_tick = 0; /* REAL resample */
+_Thread_local CCParTls __cc_par_tls;
 #endif
+#define tls_par_denials (cc__par_tls()->denials)
+#define tls_par_spawn_calls (cc__par_tls()->spawn_calls)
+#define tls_par_tick (cc__par_tls()->real_tick) /* REAL resample */
 
 /* CC_PAR_ADAPT_DEBUG=1: dump the site table at exit. */
 static void cc_par_adapt_dump(void) {
@@ -520,10 +573,19 @@ static void cc_par_adapt_dump(void) {
 #if defined(__TINYC__)
 #define tls_par_site_fn (cc_rt_tls_get()->par_site_fn)
 #define tls_par_site (*(cc_par_site**)&(cc_rt_tls_get()->par_site))
+#define tls_par_sampling (*(cc_par_site**)&(cc_rt_tls_get()->par_sampling))
 #else
 static __thread void* tls_par_site_fn = NULL;
 static __thread cc_par_site* tls_par_site = NULL;
+static __thread cc_par_site* tls_par_sampling = NULL;
 #endif
+
+static void cc_par_site_commit_churn(cc_par_site* s) {
+    /* deny_depth before state: inline gate reads state first. */
+    atomic_store_explicit(&s->deny_depth, cc_parallel_adapt_backlog(),
+                          memory_order_relaxed);
+    atomic_store_explicit(&s->state, CC_PAR_SITE_CHURN, memory_order_release);
+}
 
 static cc_par_site* cc_par_site_get_slow(void* (*fn)(void*)) {
     uintptr_t h = (uintptr_t)fn;
@@ -585,12 +647,16 @@ typedef struct {
 
 static void* cc_par_timed_run(void* p) {
     cc_par_timed w = *(cc_par_timed*)p;
+    cc_par_site* prev;
     free(p);
     uint32_t s0 = sched_v2_current_fiber_suspends();
     uint64_t d0 = tls_par_denials;
     uint64_t c0 = tls_par_spawn_calls;
     uint64_t t0 = cc_par_cpu_ns();
+    prev = tls_par_sampling;
+    tls_par_sampling = w.site;
     void* r = w.fn(w.arg);
+    tls_par_sampling = prev;
     uint64_t dt = cc_par_cpu_ns() - t0;
     /* Leaf only: suspend, nested spawn, or absorbed denial means the
      * duration is a subtree, not a body. Sites that never sample clean
@@ -628,12 +694,7 @@ static void* cc_par_timed_run(void* p) {
             if (st == CC_PAR_SITE_VIRGIN || k >= CC_PAR_CHEAP_STREAK) {
                 atomic_store_explicit(&s->cheap_streak, 0,
                                       memory_order_relaxed);
-                /* deny_depth before state: inline gate reads state first. */
-                atomic_store_explicit(&s->deny_depth,
-                                      cc_parallel_adapt_backlog(),
-                                      memory_order_relaxed);
-                atomic_store_explicit(&s->state, CC_PAR_SITE_CHURN,
-                                      memory_order_release);
+                cc_par_site_commit_churn(s);
             }
         }
     }
@@ -650,17 +711,30 @@ CCTask cc_parallel_spawn(void* (*fn)(void*), void* arg) {
     cc_par_site* site = NULL;
     if (cc_parallel_adapt_on() && (site = cc_par_site_get(fn)) != NULL) {
         int st = atomic_load_explicit(&site->state, memory_order_relaxed);
+        /* Same thunk nested inside a wrapped arm: a recursive tree, not a
+         * leaf. Commit CHURN now — waiting for a clean leaf sample lets
+         * workers drain the queue and mmap a stack per node. REAL is
+         * not demoted; a later heavy leaf still promotes. */
+        if (tls_par_sampling == site && st == CC_PAR_SITE_VIRGIN) {
+            cc_par_site_commit_churn(site);
+            st = CC_PAR_SITE_CHURN;
+        }
         if (st == CC_PAR_SITE_CHURN) {
-            /* Shallow: spawn unwrapped. Deep: this call is the inline
-             * gate's resample — wrap it. Depth 512 caps wrapped admits
-             * when there is no inline gate (TCC / direct API). */
-            size_t depth = sched_v2_ready_depth();
-            if (depth < (size_t)cc_parallel_adapt_backlog())
-                site = NULL;
-            else if (depth >= CC_PAR_FLOOD_DEPTH) {
+            /* Native: deny_fast already denied except a 1-in-2^20
+             * resample, which lands here to wrap and re-measure. TCC
+             * has no inline gate — deny here except that same trickle.
+             * Cheap work is not admitted just because the queue is
+             * shallow. */
+            if (sched_v2_ready_depth() >= CC_PAR_FLOOD_DEPTH) {
                 tls_par_denials++;
                 return invalid;
             }
+#if defined(__TINYC__)
+            if ((++tls_par_tick & CC_PAR_CHURN_RESAMPLE_MASK) != 0) {
+                tls_par_denials++;
+                return invalid;
+            }
+#endif
         } else if (st == CC_PAR_SITE_REAL) {
             /* Never denied. Rare wrap so a wrong REAL can recover. */
             if ((++tls_par_tick & CC_PAR_RESAMPLE_MASK) != 0)
@@ -706,7 +780,115 @@ CCTask cc_parallel_spawn(void* (*fn)(void*), void* arg) {
     return t;
 }
 
+CCTask cc_parallel_spawn_admit(void* (*fn)(void*), void* arg) {
+    CCTask invalid;
+    memset(&invalid, 0, sizeof(invalid));
+    if (!fn)
+        return invalid;
+    tls_par_spawn_calls++;
+    return cc_fiber_spawn_task(fn, arg);
+}
+
+/* `@parallel noblock`: the arms are equal. A child that still forks is a
+ * fiber (it publishes the next split and parks). The last wave is a
+ * worklet. Otherwise Cut (INVALID) and the lowering runs the arm inline. */
+CCTask cc_parallel_spawn_noblock(void* (*fn)(void*), void* arg) {
+    CCTask invalid;
+    memset(&invalid, 0, sizeof(invalid));
+    if (!fn)
+        return invalid;
+    tls_par_spawn_calls++;
+    if (!cc_par_noblock_admit()) {
+        tls_par_denials++;
+        return invalid;
+    }
+    if (__cc_par_noblock_as_fiber()) {
+        fiber_v2* f = sched_v2_spawn_noblock(fn, arg);
+        if (!f) {
+            tls_par_denials++;
+            return invalid;
+        }
+        cc_task_bind_fiber_v2(&invalid, f);
+        return invalid;
+    }
+    {
+        cc_worklet* w = sched_v2_worklet_spawn(fn, arg);
+        if (!w) {
+            tls_par_denials++;
+            return invalid;
+        }
+        /* Compact wait-for uses spawn_arm_noblock; this CCTask path is
+         * only for non-compact. Pack the worklet pointer like a fiber. */
+        invalid.kind = CC_TASK_KIND_WORKLET;
+        memcpy(invalid._data, &w, sizeof(w));
+        return invalid;
+    }
+}
+
 void cc_parallel_join(CCTask t) {
+    if (t.kind == CC_TASK_KIND_WORKLET) {
+        cc_worklet* w = NULL;
+        memcpy(&w, t._data, sizeof(w));
+        sched_v2_worklet_join(w);
+        return;
+    }
+    (void)cc_block_on_intptr(t);
+}
+
+CCParJoin cc_parallel_spawn_arm(void* (*fn)(void*), void* arg) {
+    CCTask t = cc_parallel_spawn(fn, arg);
+    CCParJoin j;
+    j.kind = (int)t.kind;
+    j.fiber = (t.kind == CC_TASK_KIND_FIBER_V2) ? (void*)cc_task_fiber_v2(t) : NULL;
+    return j;
+}
+
+CCParJoin cc_parallel_spawn_arm_noblock(void* (*fn)(void*), void* arg) {
+    CCParJoin j;
+    j.kind = (int)CC_TASK_KIND_INVALID;
+    j.fiber = NULL;
+    if (!fn) {
+        tls_par_denials++;
+        return j;
+    }
+    tls_par_spawn_calls++;
+    if (!cc_par_noblock_admit()) {
+        tls_par_denials++;
+        return j;
+    }
+    if (__cc_par_noblock_as_fiber()) {
+        fiber_v2* f = sched_v2_spawn_noblock(fn, arg);
+        if (!f) {
+            tls_par_denials++;
+            return j;
+        }
+        j.kind = (int)CC_TASK_KIND_FIBER_V2;
+        j.fiber = (void*)f;
+        return j;
+    }
+    {
+        cc_worklet* w = sched_v2_worklet_spawn(fn, arg);
+        if (!w) {
+            tls_par_denials++;
+            return j;
+        }
+        j.kind = (int)CC_TASK_KIND_WORKLET;
+        j.fiber = (void*)w;
+        return j;
+    }
+}
+
+void cc_parallel_join_arm(CCParJoin j) {
+    CCTask t;
+    if (j.kind == (int)CC_TASK_KIND_INVALID)
+        return;
+    if (j.kind == (int)CC_TASK_KIND_WORKLET) {
+        sched_v2_worklet_join((cc_worklet*)j.fiber);
+        return;
+    }
+    cc_task_bind_fiber_v2(&t, j.fiber);
+    if (j.kind != (int)CC_TASK_KIND_FIBER_V2)
+        t.kind = (CCTaskKind)j.kind;
     (void)cc_block_on_intptr(t);
 }
 

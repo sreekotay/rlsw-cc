@@ -1,6 +1,6 @@
 /*
  * Concurrent-C HTTP Client
- * <std/http.h>
+ * <std/http.cch>
  *
  * HTTP client built on libcurl.
  * All responses are arena-allocated.

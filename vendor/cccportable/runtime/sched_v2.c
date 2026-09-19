@@ -21,6 +21,7 @@
 #include "fiber_internal.h"
 #include "minicoro.h"
 
+#include <stdint.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,6 +44,50 @@
  * repoints it at the real queue counter. */
 static volatile size_t g_par_depth_boot = 0;
 volatile size_t* __cc_par_depth_addr = &g_par_depth_boot;
+
+/* Idle-worker cell for `@parallel noblock` Cut. Boots at zero (Cut) so
+ * pre-init reads do not Fork; init repoints at g_v2.idle_workers. */
+static volatile int g_par_idle_boot = 0;
+volatile int* __cc_par_idle_addr = &g_par_idle_boot;
+
+/* Live worklets (queued + running) and worker-pool size for capacity Cut. */
+static _Atomic size_t g_v2_worklets_live = 0;
+static volatile size_t g_par_worklet_boot = 0;
+volatile size_t* __cc_par_worklet_addr = &g_par_worklet_boot;
+static volatile int g_par_nworkers_boot = 0;
+volatile int* __cc_par_nworkers_addr = &g_par_nworkers_boot;
+
+/* `@parallel noblock` admit/cut reasons (always on; dump under CC_V2_STATS). */
+static _Atomic uint64_t g_par_noblock_fork = 0;
+static _Atomic uint64_t g_par_noblock_cut_idle = 0;
+static _Atomic uint64_t g_par_noblock_cut_ready = 0;
+static _Atomic uint64_t g_par_noblock_cut_cap = 0;
+static _Atomic uint64_t g_par_noblock_cut_nested = 0;
+static _Atomic uint64_t g_v2_worklet_spawn = 0;
+static _Atomic uint64_t g_v2_noblock_fiber_spawn = 0;
+static _Atomic uint64_t g_v2_worklet_run = 0;
+static _Atomic uint64_t g_v2_worklet_join_fast = 0;
+static _Atomic uint64_t g_v2_worklet_join_spin = 0;
+static _Atomic uint64_t g_v2_worklet_join_park = 0;
+static _Atomic uint64_t g_v2_worklet_join_help = 0;
+
+void __cc_par_noblock_note_fork(void) {
+    atomic_fetch_add_explicit(&g_par_noblock_fork, 1, memory_order_relaxed);
+}
+void __cc_par_noblock_note_cut_idle(void) {
+    atomic_fetch_add_explicit(&g_par_noblock_cut_idle, 1, memory_order_relaxed);
+}
+void __cc_par_noblock_note_cut_ready(void) {
+    atomic_fetch_add_explicit(&g_par_noblock_cut_ready, 1, memory_order_relaxed);
+}
+void __cc_par_noblock_note_cut_cap(void) {
+    atomic_fetch_add_explicit(&g_par_noblock_cut_cap, 1, memory_order_relaxed);
+}
+void __cc_par_noblock_note_cut_nested(void) {
+    atomic_fetch_add_explicit(&g_par_noblock_cut_nested, 1, memory_order_relaxed);
+}
+
+/* cc_parallel_noblock_prepare is defined after sched_v2_try_expand_pool. */
 
 /* ============================================================================
  * v2_slock: short-critical-section lock
@@ -226,6 +271,7 @@ struct fiber_v2 {
     CCNurseryHost* saved_nursery;
     CCNurseryHost* admission_nursery;
     void* par_gate; /* CCParallel*; cancel wakes parks on this fiber */
+    int   par_slot; /* dest live-index slot; -1 if not listed */
 
     /* R1 — user-facing async backtrace metadata.
      *
@@ -241,6 +287,16 @@ struct fiber_v2 {
     const char* diag_user_name;
     const char* diag_file;
     int         diag_line;
+
+    /* Noblock share captured at spawn. Swapped onto the worker for the
+     * mco_resume only, so a park keeps this fiber's frames and the next
+     * fiber on the worker does not see them. nb_live is 0 until the first
+     * resume has installed num/den; a later resume must not reset. */
+    int        nb_inherit;
+    int        nb_live;
+    uint64_t   nb_num;
+    uint64_t   nb_den;
+    void*      nb_stack;
 
     /* Intrusive linked list for free list */
     fiber_v2*  next;
@@ -276,6 +332,61 @@ static void v2_queue_init(v2_queue* q) {
     q->tail = NULL;
     atomic_store_explicit(&q->count, 0, memory_order_relaxed);
     atomic_store_explicit(&q->pops, 0, memory_order_relaxed);
+}
+
+/* Worklet queue: same lock shape as the fiber ready queue, but nodes are
+ * heap records (not intrusive on a fiber). Drained on the worker C stack. */
+struct cc_worklet {
+    void* (*fn)(void*);
+    void* arg;
+    _Atomic int done;
+    wake_primitive done_wake;
+    cc__fiber* _Atomic join_waiter_fiber;
+    struct cc_worklet* next;
+    /* Share of the root this arm carries (num/den). A fresh stack would
+     * treat the arm as the whole job and split it again. */
+    uint64_t share_num;
+    uint64_t share_den;
+};
+
+typedef struct {
+    v2_slock mu;
+    cc_worklet* head;
+    cc_worklet* tail;
+    _Atomic size_t count;
+} worklet_queue;
+
+static void worklet_queue_init(worklet_queue* q) {
+    v2_slock_init(&q->mu);
+    q->head = NULL;
+    q->tail = NULL;
+    atomic_store_explicit(&q->count, 0, memory_order_relaxed);
+}
+
+static void worklet_queue_push(worklet_queue* q, cc_worklet* w) {
+    w->next = NULL;
+    v2_slock_lock(&q->mu);
+    if (q->tail)
+        q->tail->next = w;
+    else
+        q->head = w;
+    q->tail = w;
+    atomic_fetch_add_explicit(&q->count, 1, memory_order_relaxed);
+    v2_slock_unlock(&q->mu);
+}
+
+static cc_worklet* worklet_queue_pop(worklet_queue* q) {
+    v2_slock_lock(&q->mu);
+    cc_worklet* w = q->head;
+    if (w) {
+        q->head = w->next;
+        if (!q->head)
+            q->tail = NULL;
+        atomic_fetch_sub_explicit(&q->count, 1, memory_order_relaxed);
+        w->next = NULL;
+    }
+    v2_slock_unlock(&q->mu);
+    return w;
 }
 
 /* Returns the pre-push count (i.e. queue depth before this push).
@@ -342,7 +453,14 @@ typedef struct {
      * is the identity channel between sysmon and the worker — no separate
      * "detached" flag is needed. */
     _Atomic uint64_t generation;
+    /* Parks executed while this slot was running a fiber. Per-slot so
+     * the park path is an uncontended relaxed increment; sysmon sums
+     * the live prefix when a grow episode is armed. */
+    _Atomic uint64_t parks;
     wake_primitive wake;
+    /* Sysmon sets this to retire an idle worker above the eager cap.
+     * The worker exits the loop cleanly and clears alive. */
+    _Atomic int  retiring;
 } thread_v2;
 
 /* ============================================================================
@@ -360,6 +478,11 @@ struct sched_v2_state {
 
     /* Single global ready queue */
     v2_queue ready_queue;
+
+    /* Noblock worklets: drained on worker C stacks, no fiber. */
+    worklet_queue worklets;
+    v2_slock worklet_free_mu;
+    cc_worklet* worklet_free;
 
     /* Fiber free list.
      *
@@ -408,6 +531,8 @@ extern void cc__fiber_dump_unpark_reason_stats(void);
 extern void cc_sched_wait_many_dump_diag(void);
 extern void cc__socket_wait_dump_diag(void);
 extern _Atomic size_t g_external_wait_threads;
+/* Dest completer: take f off dest's live index. 1 = this path frees. */
+int cc_parallel_claim_child(void* dest, fiber_v2* f);
 
 /* Diagnostic counters */
 static _Atomic uint64_t g_v2_fibers_alive = 0;
@@ -447,6 +572,11 @@ static _Atomic uint64_t g_v2_wake_scan_miss = 0;
  * parking-worker Dekker recheck catches the push->park transition race,
  * and sysmon issues an unconditional safety-net wake every tick. */
 static _Atomic uint64_t g_v2_wake_skipped_deep = 0;
+/* Unbuffered in-fiber enqueue: skip sched_v2_wake(-1). This worker
+ * self-drains after the current fiber parks. */
+static _Atomic uint64_t g_v2_wake_skipped_local = 0;
+/* CC_V2_WAKE_LOCAL=0 restores peer-wake on every unbuffered handoff. */
+static int g_v2_wake_local = 1;
 static _Atomic uint64_t g_v2_worker_self_drain = 0;
 /* Spin-before-park outcomes (self-drain path, tid==worker_hint).
  *   worker_spin_hit:   queue became non-empty during the spin budget — we
@@ -729,26 +859,46 @@ static _Atomic int g_v2_running_workers = 0;
  * window length unreliable and a healthy pool lands too few pops per
  * window for the rate test to separate signal from jitter.
  *
- * Per recheck, sysmon samples (ready_queue.pops, v2_now_ns) against the
- * previous sample and computes the drain rate. With depth =
+ * Per recheck, sysmon samples (ready_queue.pops, slot park sums,
+ * v2_now_ns) against the episode baseline. With depth =
  * ready_queue.count and n = num_threads, grow one worker iff:
- *   - the pool's aggregate drain rate is below one pop per worker per
- *     g_v2_grow_rate_us (workers blocked or barely moving), OR
- *   - depth >= 2*n (real backlog relative to pool size).
- * Otherwise hold: a shallow, briskly-draining queue is the signature of
- * churn (e.g. contended-lock wake cycles) where extra workers only add
- * cache-line traffic. Both triggers scale with pool size, and the rate
- * is normalized by measured elapsed time, so the decision is stable
- * against kernel timeout jitter in the recheck sleep itself.
+ *   - depth > 0 and the pool's aggregate drain rate is below one pop
+ *     per worker per g_v2_grow_rate_us (workers blocked or running long
+ *     CPU arms with more work waiting), OR
+ *   - depth >= 2*n (backlog relative to pool size), sustained across
+ *     g_v2_grow_depth_dwell consecutive rechecks,
+ * AND the episode is not run-to-park: parks since baseline do not
+ * exceed half the pops. A high park fraction is recv/accept or lock
+ * wait multiplexing — extra workers add traffic. A low park fraction
+ * with a slow drain and a non-empty queue is CPU-bound work still
+ * occupying workers while more fibers sit ready. An empty queue with
+ * nobody idle is the whole remaining set already running — extra
+ * workers cannot help until something is waiting.
+ * Otherwise hold: a shallow, briskly-draining queue is park/wake
+ * churn; a deep, high-park queue is a nursery accept/request wave.
+ * Both rate and depth scale with pool size; the rate is normalized
+ * by measured elapsed time, so the decision is stable against kernel
+ * timeout jitter in the recheck sleep itself.
+ *
+ * An episode ends on a full pool, an admission gate, or true slack:
+ * every worker idle and the ready queue empty, or one spare worker
+ * plus an empty queue persisting for SCHED_V2_GROW_SLACK_NS (a single
+ * park between CPU-bound arms is not slack). depth==0 with nobody idle
+ * is saturation, not slack: keep the episode armed so a later queued
+ * fiber can still hit the rate trigger. Do not grow on that empty
+ * queue. Idle workers above the eager cap are released once slack
+ * holds — the pool settles to the work that is actually there.
+ * The env knobs below are test overrides; defaults settle from
+ * the workload.
  *
  * An optional slow-tick escalation (CC_V2_GROW_ESCALATE_TICKS, default
  * off) can additionally grow on sustained backlog regardless of rate;
  * see g_v2_grow_escalate_ticks.
- *
- * The pool remains a ratchet: workers are never culled. Set
- * CC_V2_EAGER_THREADS to the core count to restore legacy fully-inline
- * growth. */
+ */
 static int g_v2_eager_threads = 2;
+/* Set by cc_parallel_noblock_prepare after filling the pool; sysmon must
+ * not settle back to eager while noblock is in use. */
+static _Atomic int g_v2_noblock_pool_pinned = 0;
 static int g_v2_grow_recheck_us = 25;
 /* Hold threshold, in "microseconds per pop per worker": the pool is
  * considered healthy while each worker averages at least one pop per
@@ -762,6 +912,19 @@ static int g_v2_grow_rate_us = 100;
  * pool size even if the drain rate is healthy. 0 disables the depth
  * trigger (rate-only growth). CC_V2_GROW_DEPTH_X. */
 static int g_v2_grow_depth_mult = 2;
+/* Depth dwell: the depth trigger must hold on this many consecutive
+ * rechecks before it grows. A single recheck cannot tell backlog from
+ * a completion wave: on the first sample of an episode dp is a few pops
+ * and dpark is 0 only because nothing has had time to park, so
+ * run_to_park cannot yet say "recv churn"; and a kqueue wave for many
+ * clients is depth >= 2n that drains in tens of us. Both recruited a
+ * worker that then stayed for the life of the process, and on an
+ * I/O-bound pool each extra live worker is global-queue contention and
+ * park/wake churn without extra work (redis at 50 pipelined clients: 2
+ * workers 2.9M GET/s, 4 workers 2.6M). Three rechecks is ~75us of
+ * sustained depth; a producer that outpaces the pool holds it easily.
+ * The rate trigger (CPU-bound arms) is not dwelled. CC_V2_GROW_DEPTH_DWELL. */
+static int g_v2_grow_depth_dwell = 3;
 /* Slow-tick escalation dwell: grow one worker per slow tick once the
  * ready queue has stayed non-empty (with nobody idle) for this many
  * consecutive slow ticks, regardless of the rate test.
@@ -770,18 +933,24 @@ static int g_v2_grow_depth_mult = 2;
  * Default 0 (disabled): measured across the perf suite, the rate/depth
  * triggers alone recruit correctly for every workload shape — CPU-bound
  * fibers don't park, so they produce a near-zero pop rate and grow via
- * the stall trigger; a high pop rate only comes from park/wake churn,
- * where holding is right. Escalation's only observed steady-state effect
- * was converting held contention regimes back to a full (over-recruited)
- * pool. Kept as opt-in insurance for a workload that pops briskly AND
- * scales with workers, should one appear. */
+ * the stall trigger while the ready queue is non-empty; a high pop
+ * rate only comes from park/wake churn, where holding is right.
+ * Escalation's only observed steady-state effect was converting held
+ * contention regimes back to a full (over-recruited) pool. Kept as
+ * opt-in insurance for a workload that pops briskly AND scales with
+ * workers, should one appear. */
 static int g_v2_grow_escalate_ticks = 0;
+/* Dwell before a spare worker + empty queue counts as slack. One
+ * recheck of idle is a park between long arms, not spare capacity. */
+#define SCHED_V2_GROW_SLACK_NS 200000ull
 static _Atomic int g_v2_grow_pending = 0;
 static _Atomic uint64_t g_v2_grow_requests = 0;   /* producer defers      */
 static _Atomic uint64_t g_v2_grow_stall = 0;      /* recheck: pops slow   */
 static _Atomic uint64_t g_v2_grow_backlog = 0;    /* recheck: deep queue  */
 static _Atomic uint64_t g_v2_grow_escalate = 0;   /* slow-tick escalation */
 static _Atomic uint64_t g_v2_grow_held = 0;       /* recheck decided hold */
+static _Atomic uint64_t g_v2_grow_parked = 0;     /* hold: run-to-park     */
+static _Atomic uint64_t g_v2_grow_shrink = 0;     /* idle workers released  */
 
 /* Coro-pool high-water cap (tunable via CC_V2_CORO_POOL_MAX).
  *
@@ -857,6 +1026,7 @@ static void sched_v2_diag_scan_fibers(uint64_t state_counts[FIBER_V2_STATE_COUNT
                                       uint64_t* parked_internal,
                                       uint64_t* parked_external_wait,
                                       uint64_t* parked_deadlock_suppressed,
+                                      uint64_t* running_external_wait,
                                       park_reason_bucket reason_buckets[V2_DIAG_REASON_BUCKETS],
                                       size_t* reason_bucket_count) {
     for (int i = 0; i < FIBER_V2_STATE_COUNT; ++i) {
@@ -869,6 +1039,7 @@ static void sched_v2_diag_scan_fibers(uint64_t state_counts[FIBER_V2_STATE_COUNT
     *parked_internal = 0;
     *parked_external_wait = 0;
     *parked_deadlock_suppressed = 0;
+    if (running_external_wait) *running_external_wait = 0;
     if (reason_buckets) {
         for (size_t i = 0; i < V2_DIAG_REASON_BUCKETS; ++i) {
             reason_buckets[i].reason = NULL;
@@ -882,6 +1053,10 @@ static void sched_v2_diag_scan_fibers(uint64_t state_counts[FIBER_V2_STATE_COUNT
         int state = fiber_v2_state_base(atomic_load_explicit(&f->state, memory_order_acquire));
         if (state >= 0 && state < FIBER_V2_STATE_COUNT) {
             state_counts[state]++;
+            if (state == FIBER_V2_RUNNING && running_external_wait &&
+                atomic_load_explicit(&f->external_wait_depth, memory_order_acquire) > 0) {
+                (*running_external_wait)++;
+            }
             if (state == FIBER_V2_PARKED) {
                 const char* r = f->park_reason;
                 if (atomic_load_explicit(&f->external_wait_depth, memory_order_acquire) > 0) {
@@ -924,12 +1099,35 @@ static void sched_v2_diag_scan_fibers(uint64_t state_counts[FIBER_V2_STATE_COUNT
     pthread_mutex_unlock(&g_v2.all_fibers_mu);
 }
 
+/* Share of the root a noblock piece still owns, as num/den. Enter pushes
+ * the parent and divides den by that site's arm count. 64 frames is the
+ * enter/leave nest, not a grain: past it the site Cuts. */
+#define CC_NB_NEST 64
+typedef struct cc_nb_frame {
+    uint64_t num;
+    uint64_t den;
+    int split;
+    int as_fiber; /* child still forks: arms are fibers, so the join can park */
+} cc_nb_frame;
+typedef struct cc_nb_stack {
+    uint64_t num;
+    uint64_t den;
+    int split;
+    int as_fiber;
+    int sp;
+    int overflow;
+    cc_nb_frame stk[CC_NB_NEST];
+} cc_nb_stack;
+
 /* Per-thread state */
 #if defined(__TINYC__)
 #define tls_v2_thread_id (cc_rt_tls_get()->v2_thread_id)
 #define tls_v2_my_generation (cc_rt_tls_get()->v2_my_generation)
 #define tls_v2_current_fiber (*(fiber_v2**)&(cc_rt_tls_get()->v2_current_fiber))
 #define tls_v2_dispatch_seq (cc_rt_tls_get()->v2_dispatch_seq)
+#define tls_v2_in_worklet (cc_rt_tls_get()->v2_in_worklet)
+#define tls_v2_noblock_depth (cc_rt_tls_get()->v2_noblock_depth)
+#define tls_nb_slot (*(cc_nb_stack**)&(cc_rt_tls_get()->v2_nb))
 #else
 static __thread int tls_v2_thread_id = -1;
 static __thread uint64_t tls_v2_my_generation = 0;
@@ -939,7 +1137,166 @@ static __thread fiber_v2* tls_v2_current_fiber = NULL;
  * still running after one tick" without any wall-clock read on the hot
  * path. Starts at 1 so that 0 unambiguously means "no fiber running". */
 static __thread uint64_t tls_v2_dispatch_seq = 0;
+/* Nesting depth while draining a noblock worklet on this C stack. Help-join
+ * may run a child worklet inline; depth must nest, not clobber. */
+static __thread int tls_v2_in_worklet = 0;
+/* Nesting depth of `@parallel noblock` sites on this stack. The Fork
+ * decision is the share, not this depth. */
+static __thread int tls_v2_noblock_depth = 0;
+static __thread cc_nb_stack* tls_nb_slot = NULL;
+static __thread cc_worklet* tls_worklet_free = NULL;
+static __thread int tls_worklet_free_n = 0;
 #endif
+
+int __cc_par_in_worklet(void) {
+    return tls_v2_in_worklet;
+}
+
+static cc_nb_stack* nb_get(void) {
+    if (!tls_nb_slot) {
+        cc_nb_stack* nb = (cc_nb_stack*)calloc(1, sizeof(*nb));
+        if (!nb)
+            return NULL;
+        nb->num = 1;
+        nb->den = 1;
+        tls_nb_slot = nb;
+    }
+    return tls_nb_slot;
+}
+
+/* num/den is this piece of the root. True when it is still larger than
+ * one share of the workers. */
+static int nb_over_share(uint64_t num, uint64_t den, int nworkers) {
+    uint64_t w;
+    if (nworkers <= 1 || num == 0 || den == 0)
+        return 0;
+    w = (uint64_t)nworkers;
+    if (num > UINT64_MAX / w)
+        return 1;
+    return num * w > den;
+}
+
+/* The one split just under a share. Take it only when it shortens the
+ * longest worker: ceil(P/W)/P against ceil(P*narms/W)/(P*narms). A pack
+ * that already divides evenly does not. */
+static int nb_extra_wave(uint64_t num, uint64_t den, int nworkers, int narms) {
+    uint64_t w, scale, pieces, next, ca, cb;
+    if (nworkers <= 1 || narms < 2 || num == 0 || den < num)
+        return 0;
+    if (nb_over_share(num, den, nworkers))
+        return 0;
+    w = (uint64_t)nworkers;
+    if (w > UINT64_MAX / (uint64_t)narms)
+        return 0;
+    scale = w * (uint64_t)narms;
+    if (num > UINT64_MAX / scale || num * scale <= den)
+        return 0;
+    pieces = den / num;
+    if (pieces == 0 || pieces > UINT64_MAX / (uint64_t)narms)
+        return 0;
+    next = pieces * (uint64_t)narms;
+    ca = (pieces + w - 1) / w;
+    cb = (next + w - 1) / w;
+    if (next != 0 && ca > UINT64_MAX / next)
+        return 0;
+    if (pieces != 0 && cb > UINT64_MAX / pieces)
+        return 0;
+    return ca * next > cb * pieces;
+}
+
+void cc_parallel_noblock_enter(int narms) {
+    cc_nb_stack* nb;
+    int nworkers;
+    uint64_t num, den;
+    cc_parallel_noblock_prepare();
+    tls_v2_noblock_depth++;
+    nb = nb_get();
+    if (!nb)
+        return;
+    if (nb->sp >= CC_NB_NEST) {
+        nb->overflow++;
+        nb->split = 0;
+        nb->as_fiber = 0;
+        return;
+    }
+    nb->stk[nb->sp].num = nb->num;
+    nb->stk[nb->sp].den = nb->den;
+    nb->stk[nb->sp].split = nb->split;
+    nb->stk[nb->sp].as_fiber = nb->as_fiber;
+    nb->sp++;
+    nworkers = *__cc_par_nworkers_addr;
+    num = nb->num ? nb->num : 1;
+    den = nb->den ? nb->den : 1;
+    /* Arms are equal. Fork while this piece is larger than one share.
+     * One split past that still forks when it shortens the longest
+     * worker; the child of that wave is a worklet and stays sealed.
+     * A child that itself still forks is a fiber, so the join can park. */
+    {
+        uint64_t child_den = den;
+        int too_big = 0;
+        int child_too_big = 0;
+        if (narms >= 2) {
+            if (den > UINT64_MAX / (uint64_t)narms)
+                child_den = UINT64_MAX;
+            else
+                child_den = den * (uint64_t)narms;
+        }
+        if (narms >= 2 && nworkers > 1 &&
+            (nb_over_share(num, den, nworkers) ||
+             nb_extra_wave(num, den, nworkers, narms)))
+            too_big = 1;
+        if (narms >= 2 && nworkers > 1 &&
+            (nb_over_share(num, child_den, nworkers) ||
+             nb_extra_wave(num, child_den, nworkers, narms)))
+            child_too_big = 1;
+        if (too_big && child_too_big) {
+            nb->split = 1;
+            nb->as_fiber = 1;
+        } else if (too_big) {
+            nb->split = 1;
+            nb->as_fiber = 0;
+        } else {
+            nb->split = 0;
+            nb->as_fiber = 0;
+        }
+        if (narms >= 2) {
+            nb->den = child_den;
+            nb->num = num;
+        }
+    }
+}
+
+void cc_parallel_noblock_leave(void) {
+    cc_nb_stack* nb;
+    if (tls_v2_noblock_depth > 0)
+        tls_v2_noblock_depth--;
+    nb = tls_nb_slot;
+    if (!nb)
+        return;
+    if (nb->overflow > 0) {
+        nb->overflow--;
+        return;
+    }
+    if (nb->sp <= 0)
+        return;
+    nb->sp--;
+    nb->num = nb->stk[nb->sp].num;
+    nb->den = nb->stk[nb->sp].den;
+    nb->split = nb->stk[nb->sp].split;
+    nb->as_fiber = nb->stk[nb->sp].as_fiber;
+}
+
+int __cc_par_noblock_split(void) {
+    return tls_nb_slot && tls_nb_slot->split;
+}
+
+int __cc_par_noblock_as_fiber(void) {
+    return tls_nb_slot && tls_nb_slot->as_fiber;
+}
+
+int __cc_par_noblock_depth(void) {
+    return tls_v2_noblock_depth;
+}
 bool cc_nursery_is_cancelled_host(const CCNurseryHost* n);
 void cc_nursery_notify_child_done(CCNurseryHost* n);
 
@@ -1016,6 +1373,9 @@ static fiber_v2* fiber_v2_alloc(void) {
             f->saved_nursery = NULL;
             f->admission_nursery = NULL;
             f->par_gate = NULL;
+            f->par_slot = -1;
+            f->nb_inherit = 0;
+            f->nb_live = 0;
             atomic_store_explicit(&f->done, 0, memory_order_relaxed);
             atomic_store_explicit(&f->wait_ticket, 0, memory_order_relaxed);
             atomic_store_explicit(&f->join_waiter_fiber, NULL, memory_order_relaxed);
@@ -1043,6 +1403,7 @@ static fiber_v2* fiber_v2_alloc(void) {
     f->saved_nursery = NULL;
     f->admission_nursery = NULL;
     f->par_gate = NULL;
+    f->par_slot = -1;
     atomic_store_explicit(&f->join_waiter_fiber, NULL, memory_order_relaxed);
     wake_primitive_init(&f->done_wake);
 
@@ -1065,6 +1426,9 @@ static void fiber_v2_free(fiber_v2* f) {
     f->saved_nursery = NULL;
     f->admission_nursery = NULL;
     f->par_gate = NULL;
+    f->par_slot = -1;
+    f->nb_inherit = 0;
+    f->nb_live = 0;
     /* Clear detector metadata so the next spawn starts clean and the
      * detector never observes stale park_obj/suppress/external-wait state
      * on a pooled fiber. */
@@ -1127,7 +1491,54 @@ static void sched_v2_init_worker_slot(int id) {
      * stays at 0 and the mismatch triggers exit. */
     atomic_store_explicit(&g_v2.threads[id].generation, 0,
                           memory_order_release);
+    atomic_store_explicit(&g_v2.threads[id].parks, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_v2.threads[id].retiring, 0, memory_order_relaxed);
     wake_primitive_init(&g_v2.threads[id].wake);
+}
+
+/* Release the last worker if it is idle and above the eager cap. */
+static int sched_v2_try_retire_last_idle(void) {
+    int n;
+    int i;
+    int exp = 1;
+    pthread_mutex_lock(&g_v2.start_mu);
+    n = atomic_load_explicit(&g_v2.num_threads, memory_order_acquire);
+    if (n <= g_v2_eager_threads) {
+        pthread_mutex_unlock(&g_v2.start_mu);
+        return 0;
+    }
+    i = n - 1;
+    if (!atomic_compare_exchange_strong_explicit(&g_v2.threads[i].is_idle, &exp, 0,
+            memory_order_acq_rel, memory_order_relaxed)) {
+        pthread_mutex_unlock(&g_v2.start_mu);
+        return 0;
+    }
+    atomic_fetch_sub_explicit(&g_v2.idle_workers, 1, memory_order_acq_rel);
+    atomic_store_explicit(&g_v2.threads[i].retiring, 1, memory_order_release);
+    pthread_detach(g_v2.threads[i].handle);
+    wake_primitive_wake_one(&g_v2.threads[i].wake);
+    while (atomic_load_explicit(&g_v2.threads[i].alive, memory_order_acquire))
+        sched_yield();
+    atomic_store_explicit(&g_v2.num_threads, n - 1, memory_order_release);
+    atomic_store_explicit(&g_v2.threads[i].retiring, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_v2.threads[i].dispatch_epoch, 0, memory_order_relaxed);
+    wake_primitive_init(&g_v2.threads[i].wake);
+    V2_STAT_INC(g_v2_grow_shrink);
+    pthread_mutex_unlock(&g_v2.start_mu);
+    return 1;
+}
+
+static void sched_v2_settle_pool(void) {
+    for (;;) {
+        size_t depth = atomic_load_explicit(&g_v2.ready_queue.count,
+                                           memory_order_relaxed);
+        int n = atomic_load_explicit(&g_v2.num_threads, memory_order_acquire);
+        int idle = atomic_load_explicit(&g_v2.idle_workers, memory_order_acquire);
+        if (depth != 0 || n <= g_v2_eager_threads || idle <= 0)
+            return;
+        if (!sched_v2_try_retire_last_idle())
+            return;
+    }
 }
 
 static inline int sched_v2_finish_join(fiber_v2* f, void** out_result) {
@@ -1185,6 +1596,24 @@ static int sched_v2_try_expand_pool(void) {
     return 1;
 }
 
+void cc_parallel_noblock_prepare(void) {
+    /* First noblock site: bring the pool up. Sysmon grow keys off queue
+     * depth, but worklets leave the queue while running, so deferred grow
+     * sees false slack. Pin the pool afterward so settle does not shrink
+     * it between frames. */
+    static _Atomic int filled = 0;
+    sched_v2_ensure_init();
+    if (atomic_load_explicit(&filled, memory_order_relaxed))
+        return;
+    while (atomic_load_explicit(&g_v2.num_threads, memory_order_acquire)
+           < g_v2.max_threads) {
+        if (!sched_v2_try_expand_pool())
+            break;
+    }
+    atomic_store_explicit(&g_v2_noblock_pool_pinned, 1, memory_order_relaxed);
+    atomic_store_explicit(&filled, 1, memory_order_relaxed);
+}
+
 /* Ask sysmon to consider growing the pool. First requester per episode
  * pays one wake syscall; everyone else sees the flag already set. */
 static void sched_v2_request_grow(void) {
@@ -1206,8 +1635,8 @@ static int sched_v2_grow_or_defer(void) {
     return 0;
 }
 
-/* No idle worker while the ready queue is non-empty. Still grow when
- * we are under the eager cap (inline thread #2) or the queue is deeper
+/* No idle worker while ready or worklet queues are non-empty. Still grow
+ * when under the eager cap (inline thread #2) or either queue is deeper
  * than the live pool. Skip otherwise: SPSC rendezvous and 2-arm join
  * ping-pong have ready<=n and must not CAS grow_pending / poke sysmon
  * on every handshake. Sysmon's tick is the safety net. */
@@ -1215,7 +1644,9 @@ static void sched_v2_grow_if_backlogged(void) {
     int n = atomic_load_explicit(&g_v2.num_threads, memory_order_acquire);
     size_t ready = atomic_load_explicit(&g_v2.ready_queue.count,
                                         memory_order_relaxed);
-    if (n < g_v2_eager_threads || ready > (size_t)n) {
+    size_t worklets = atomic_load_explicit(&g_v2.worklets.count,
+                                           memory_order_relaxed);
+    if (n < g_v2_eager_threads || ready > (size_t)n || worklets > (size_t)n) {
         (void)sched_v2_grow_or_defer();
         return;
     }
@@ -1224,7 +1655,36 @@ static void sched_v2_grow_if_backlogged(void) {
 
 static void thread_v2_run_fiber(int tid, fiber_v2* f);
 
-static void sched_v2_enqueue_runnable(fiber_v2* f) {
+/* Install this fiber's noblock share for the resume. Returns 1 if the
+ * caller's slot was swapped out and must be restored. First resume
+ * resets the stack to the share captured at spawn; a resume after park
+ * keeps the frames enter already pushed. */
+static int nb_resume_install(fiber_v2* f, cc_nb_stack** prev_out) {
+    cc_nb_stack* nb;
+    if (!f || !f->nb_inherit)
+        return 0;
+    nb = (cc_nb_stack*)f->nb_stack;
+    if (!nb) {
+        nb = (cc_nb_stack*)calloc(1, sizeof(*nb));
+        if (!nb)
+            return 0;
+        f->nb_stack = nb;
+        f->nb_live = 0;
+    }
+    if (!f->nb_live) {
+        memset(nb, 0, sizeof(*nb));
+        nb->num = f->nb_num ? f->nb_num : 1;
+        nb->den = f->nb_den ? f->nb_den : 1;
+        f->nb_live = 1;
+    }
+    *prev_out = tls_nb_slot;
+    tls_nb_slot = nb;
+    return 1;
+}
+
+static void thread_v2_run_worklet(cc_worklet* w);
+
+static void sched_v2_enqueue_runnable_ex(fiber_v2* f, int prefer_local) {
     int prev = v2_queue_push(&g_v2.ready_queue, f);
     /* If the queue was already deep, a drainer is on it (or a previous
      * push just woke one) and will self-drain to our item. Skip the
@@ -1240,7 +1700,21 @@ static void sched_v2_enqueue_runnable(fiber_v2* f) {
         V2_STAT_INC(g_v2_wake_skipped_deep);
         return;
     }
+    /* Unbuffered handoff from a running fiber: do not ulock_wake a peer.
+     * thread_v2_main self-drains after this fiber parks, so the pair
+     * converges on one worker. A long compute without park is covered by
+     * sysmon's ready&&idle tick (~20ms). Buffered / off-fiber still wake.
+     * CC_V2_WAKE_LOCAL=0 restores peer-wake. */
+    if (prefer_local && g_v2_wake_local &&
+        tls_v2_current_fiber != NULL && tls_v2_thread_id >= 0) {
+        V2_STAT_INC(g_v2_wake_skipped_local);
+        return;
+    }
     sched_v2_wake(-1);
+}
+
+static void sched_v2_enqueue_runnable(fiber_v2* f) {
+    sched_v2_enqueue_runnable_ex(f, 0);
 }
 
 /*
@@ -1257,6 +1731,17 @@ static void sched_v2_enqueue_runnable(fiber_v2* f) {
 static void sched_v2_wake(int worker_hint) {
     if (worker_hint >= 0 && worker_hint == tls_v2_thread_id) {
         while (atomic_load_explicit(&g_v2.running, memory_order_acquire)) {
+            cc_worklet* w = worklet_queue_pop(&g_v2.worklets);
+            if (w) {
+                V2_STAT_INC(g_v2_worker_self_drain);
+                thread_v2_run_worklet(w);
+                if (atomic_load_explicit(&g_v2.threads[worker_hint].generation,
+                                         memory_order_acquire)
+                    != tls_v2_my_generation) {
+                    return;
+                }
+                continue;
+            }
             fiber_v2* f = v2_queue_pop(&g_v2.ready_queue);
             if (!f) {
                 /* Spin-before-park: rather than immediately return and
@@ -1282,12 +1767,28 @@ static void sched_v2_wake(int worker_hint) {
 #else
                     __asm__ volatile("" ::: "memory");
 #endif
+                    if (atomic_load_explicit(&g_v2.worklets.count,
+                                             memory_order_acquire) > 0) {
+                        w = worklet_queue_pop(&g_v2.worklets);
+                        if (w) break;
+                    }
                     if (atomic_load_explicit(&g_v2.ready_queue.count,
                                              memory_order_acquire) > 0) {
                         f = v2_queue_pop(&g_v2.ready_queue);
                         if (f) break;
                         /* Lost the race to another drainer; keep spinning. */
                     }
+                }
+                if (w) {
+                    V2_STAT_INC(g_v2_worker_spin_hit);
+                    V2_STAT_INC(g_v2_worker_self_drain);
+                    thread_v2_run_worklet(w);
+                    if (atomic_load_explicit(&g_v2.threads[worker_hint].generation,
+                                             memory_order_acquire)
+                        != tls_v2_my_generation) {
+                        return;
+                    }
+                    continue;
                 }
                 if (!f) {
                     V2_STAT_INC(g_v2_worker_spin_miss);
@@ -1339,7 +1840,8 @@ static void sched_v2_wake(int worker_hint) {
      * here before the idle_workers check so the pairing is airtight. */
     atomic_thread_fence(memory_order_seq_cst);
 
-    while (atomic_load_explicit(&g_v2.ready_queue.count, memory_order_relaxed) > 0) {
+    while (atomic_load_explicit(&g_v2.ready_queue.count, memory_order_relaxed) > 0 ||
+           atomic_load_explicit(&g_v2.worklets.count, memory_order_relaxed) > 0) {
         /* Producer-side admission gate: if we're already at the active
          * target, issuing another wake just produces a ulock_wake syscall
          * whose only effect is to make an extra worker cycle through
@@ -1368,6 +1870,183 @@ static void sched_v2_wake(int worker_hint) {
 /* ============================================================================
  * Run fiber + post-yield commit
  * ============================================================================ */
+
+static cc_worklet* worklet_alloc(void) {
+    cc_worklet* w = NULL;
+#if !defined(__TINYC__)
+    if (tls_worklet_free) {
+        w = tls_worklet_free;
+        tls_worklet_free = w->next;
+        tls_worklet_free_n--;
+    }
+#endif
+    if (!w) {
+        v2_slock_lock(&g_v2.worklet_free_mu);
+        w = g_v2.worklet_free;
+        if (w)
+            g_v2.worklet_free = w->next;
+        v2_slock_unlock(&g_v2.worklet_free_mu);
+    }
+    if (!w) {
+        w = (cc_worklet*)malloc(sizeof(*w));
+        if (!w)
+            return NULL;
+        wake_primitive_init(&w->done_wake);
+    }
+    w->fn = NULL;
+    w->arg = NULL;
+    w->next = NULL;
+    w->share_num = 1;
+    w->share_den = 1;
+    atomic_store_explicit(&w->done, 0, memory_order_relaxed);
+    atomic_store_explicit(&w->join_waiter_fiber, NULL, memory_order_relaxed);
+    return w;
+}
+
+static void worklet_release(cc_worklet* w) {
+    if (!w)
+        return;
+    w->fn = NULL;
+    w->arg = NULL;
+#if !defined(__TINYC__)
+    if (tls_worklet_free_n < 64) {
+        w->next = tls_worklet_free;
+        tls_worklet_free = w;
+        tls_worklet_free_n++;
+        return;
+    }
+#endif
+    v2_slock_lock(&g_v2.worklet_free_mu);
+    w->next = g_v2.worklet_free;
+    g_v2.worklet_free = w;
+    v2_slock_unlock(&g_v2.worklet_free_mu);
+}
+
+static void thread_v2_run_worklet(cc_worklet* w) {
+    void* (*fn)(void*) = w->fn;
+    void* arg = w->arg;
+    cc_nb_stack* nb = nb_get();
+    cc_nb_stack saved;
+    int have_nb = nb != NULL;
+    CCParTls* pt = cc__par_tls();
+    int saved_seal = pt ? pt->nb_sealed : 0;
+    atomic_fetch_add_explicit(&g_v2_worklet_run, 1, memory_order_relaxed);
+    if (pt)
+        pt->nb_sealed = 1;
+    if (have_nb) {
+        saved = *nb;
+        nb->num = w->share_num ? w->share_num : 1;
+        nb->den = w->share_den ? w->share_den : 1;
+        nb->split = 0;
+        nb->sp = 0;
+        nb->overflow = 0;
+    }
+    tls_v2_in_worklet++;
+    if (fn)
+        (void)fn(arg);
+    tls_v2_in_worklet--;
+    if (pt)
+        pt->nb_sealed = saved_seal;
+    if (have_nb)
+        *nb = saved;
+    atomic_fetch_sub_explicit(&g_v2_worklets_live, 1, memory_order_relaxed);
+    atomic_store_explicit(&w->done, 1, memory_order_release);
+    atomic_thread_fence(memory_order_seq_cst);
+    {
+        cc__fiber* waiter =
+            atomic_exchange_explicit(&w->join_waiter_fiber, NULL, memory_order_acq_rel);
+        if (waiter)
+            cc__fiber_unpark_tagged(waiter, CC_FIBER_UNPARK_REASON_TASK_DONE);
+    }
+    wake_primitive_wake_all(&w->done_wake);
+}
+
+cc_worklet* sched_v2_worklet_spawn(void* (*fn)(void*), void* arg) {
+    cc_worklet* w;
+    if (!fn)
+        return NULL;
+    sched_v2_ensure_init();
+    w = worklet_alloc();
+    if (!w)
+        return NULL;
+    w->fn = fn;
+    w->arg = arg;
+    {
+        cc_nb_stack* nb = nb_get();
+        w->share_num = nb ? nb->num : 1;
+        w->share_den = nb ? nb->den : 1;
+    }
+    atomic_fetch_add_explicit(&g_v2_worklets_live, 1, memory_order_relaxed);
+    worklet_queue_push(&g_v2.worklets, w);
+    atomic_fetch_add_explicit(&g_v2_worklet_spawn, 1, memory_order_relaxed);
+    sched_v2_wake(-1);
+    return w;
+}
+
+void sched_v2_worklet_join(cc_worklet* w) {
+    if (!w)
+        return;
+    if (atomic_load_explicit(&w->done, memory_order_acquire)) {
+        atomic_fetch_add_explicit(&g_v2_worklet_join_fast, 1, memory_order_relaxed);
+        worklet_release(w);
+        return;
+    }
+    /* A fiber published these arms and has to stay live for the result
+     * slots, but it must not keep the worker. Park. The pool runs the
+     * worklets. A free worker takes the head otherwise. Do not unlink
+     * this arm to run it here while one is idle. */
+    while (!atomic_load_explicit(&w->done, memory_order_acquire)) {
+        int idle;
+        size_t queued;
+        cc_worklet* other;
+        if (cc__fiber_in_context()) {
+            atomic_store_explicit(&w->join_waiter_fiber,
+                                  (cc__fiber*)cc__fiber_current(),
+                                  memory_order_release);
+            atomic_thread_fence(memory_order_seq_cst);
+            if (atomic_load_explicit(&w->done, memory_order_acquire))
+                break;
+            cc__fiber_clear_pending_unpark();
+            CC_FIBER_PARK_IF(&w->done, 0, "sched_v2_worklet_join");
+            continue;
+        }
+        idle = *__cc_par_idle_addr;
+        queued = atomic_load_explicit(&g_v2.worklets.count, memory_order_acquire);
+        if (idle > 0 && queued > 0 && sched_v2_try_wake_one()) {
+            sched_yield();
+            continue;
+        }
+        other = worklet_queue_pop(&g_v2.worklets);
+        if (other) {
+            if (other == w) {
+                atomic_fetch_add_explicit(&g_v2_worklet_join_fast, 1, memory_order_relaxed);
+                thread_v2_run_worklet(w);
+                worklet_release(w);
+                return;
+            }
+            atomic_fetch_add_explicit(&g_v2_worklet_join_help, 1, memory_order_relaxed);
+            thread_v2_run_worklet(other);
+            continue;
+        }
+        if (atomic_load_explicit(&w->done, memory_order_acquire))
+            break;
+        if (tls_v2_in_worklet) {
+            sched_yield();
+            continue;
+        }
+        {
+            uint32_t wait_val =
+                atomic_load_explicit(&w->done_wake.value, memory_order_acquire);
+            if (atomic_load_explicit(&w->done, memory_order_acquire))
+                break;
+            wake_primitive_wait(&w->done_wake, wait_val);
+        }
+    }
+    atomic_fetch_add_explicit(&g_v2_worklet_join_park, 1, memory_order_relaxed);
+    if (cc__fiber_in_context())
+        atomic_store_explicit(&w->join_waiter_fiber, NULL, memory_order_relaxed);
+    worklet_release(w);
+}
 
 static void thread_v2_run_fiber(int tid, fiber_v2* f) {
     int raw = atomic_load_explicit(&f->state, memory_order_acquire);
@@ -1431,7 +2110,12 @@ static void thread_v2_run_fiber(int tid, fiber_v2* f) {
         }
     }
 
-    mco_result res = mco_resume(f->coro);
+    mco_result res;
+    cc_nb_stack* prev_nb = NULL;
+    int nb_on = nb_resume_install(f, &prev_nb);
+    res = mco_resume(f->coro);
+    if (nb_on)
+        tls_nb_slot = prev_nb;
 
     tls_v2_current_fiber = NULL;
     atomic_fetch_add_explicit(&g_v2_sysmon_stall_detect, 1, memory_order_relaxed);
@@ -1440,9 +2124,8 @@ static void thread_v2_run_fiber(int tid, fiber_v2* f) {
         fprintf(stderr, "[sched_v2] mco_resume failed rc=%d\n", (int)res);
         abort();
     }
-
     if (mco_status(f->coro) == MCO_DEAD) {
-        /* Snapshot ownership metadata BEFORE publishing done=1.
+        /* Snapshot dest/nursery ownership BEFORE publishing done=1.
          *
          * The moment done=1 lands, a joiner (cc_block_on / sched_v2_join)
          * may return, call sched_v2_fiber_release, and push this fiber_v2
@@ -1459,9 +2142,19 @@ static void thread_v2_run_fiber(int tid, fiber_v2* f) {
          * cc_nursery_notify_child_done fires early for a child that never
          * ran.  Reproduced by tests/hybrid_run_to_completion_smoke.ccs
          * under parallel suite load (block_on releases t1/t2 into the
-         * pool right before three nursery spawns reuse them). */
+         * pool right before three nursery spawns reuse them).
+         *
+         * A dest child claims itself off the live index here, while f
+         * cannot yet have been recycled: done is still 0, so no joiner
+         * has released it. Claim is exclusive with wait / leave /
+         * admit-reap. Dest-attached fibers are not nursery worker-frees
+         * — if claim loses, the joiner that took the slot frees. */
+        void* gate = f->par_gate;
+        int claimed = 0;
+        if (gate)
+            claimed = cc_parallel_claim_child(gate, f);
         int worker_frees = cc_v2_worker_frees_mode();
-        CCNurseryHost* adm = worker_frees ? f->saved_nursery : NULL;
+        CCNurseryHost* adm = (worker_frees && !gate) ? f->saved_nursery : NULL;
         atomic_store_explicit(&f->state, FIBER_V2_DEAD, memory_order_release);
         atomic_store_explicit(&f->done, 1, memory_order_release);
         /* Dekker pair with sched_v2_join waiter: completer stores done then
@@ -1495,7 +2188,9 @@ static void thread_v2_run_fiber(int tid, fiber_v2* f) {
          * through entry and is the correct handle to identify a
          * nursery-owned fiber at completion.  adm was snapshotted
          * above, before done=1 could hand the fiber to a joiner. */
-        if (worker_frees && adm) {
+        if (claimed) {
+            fiber_v2_free(f);
+        } else if (worker_frees && adm) {
             fiber_v2_free(f);
             cc_nursery_notify_child_done(adm);
         }
@@ -1567,7 +2262,7 @@ static void thread_v2_run_fiber(int tid, fiber_v2* f) {
  * carries it into RUNNING and the park-commit converts it to a requeue, so
  * the fiber always re-checks after the wake.  IDLE/DEAD drop (validated).
  */
-void sched_v2_signal(fiber_v2* f) {
+static void sched_v2_signal_ex(fiber_v2* f, int prefer_local) {
     int expected = atomic_load_explicit(&f->state, memory_order_acquire);
     for (;;) {
         int base_state = fiber_v2_state_base(expected);
@@ -1583,7 +2278,7 @@ void sched_v2_signal(fiber_v2* f) {
                 memory_order_acq_rel, memory_order_acquire)) {
             if (base_state == FIBER_V2_PARKED) {
                 V2_STAT_INC(g_v2_signal_ok);
-                sched_v2_enqueue_runnable(f);
+                sched_v2_enqueue_runnable_ex(f, prefer_local);
             } else if (base_state == FIBER_V2_QUEUED || base_state == FIBER_V2_RUNNING) {
                 if (fiber_v2_state_has_signal_pending(expected)) {
                     V2_STAT_INC(g_v2_signal_running_pending_already_set);
@@ -1601,6 +2296,14 @@ void sched_v2_signal(fiber_v2* f) {
         }
         /* CAS failure refreshed `expected`; retry against the live value. */
     }
+}
+
+void sched_v2_signal(fiber_v2* f) {
+    sched_v2_signal_ex(f, 0);
+}
+
+void sched_v2_signal_local(fiber_v2* f) {
+    sched_v2_signal_ex(f, 1);
 }
 
 /* ============================================================================
@@ -1677,6 +2380,13 @@ void sched_v2_park(void) {
     if (!f) return;
 
     V2_STAT_INC(g_v2_parks);
+    {
+        int tid = tls_v2_thread_id;
+        if (tid >= 0 && tid < V2_MAX_THREADS) {
+            atomic_fetch_add_explicit(&g_v2.threads[tid].parks, 1,
+                                      memory_order_relaxed);
+        }
+    }
     f->yield_kind = V2_YIELD_PARK;
     mco_result res = mco_yield(co);
     if (res != MCO_SUCCESS) {
@@ -1769,15 +2479,22 @@ void* sched_v2_fiber_par_gate(fiber_v2* f) {
     return f ? f->par_gate : NULL;
 }
 
+void sched_v2_fiber_set_par_slot(fiber_v2* f, int slot) {
+    if (f) f->par_slot = slot;
+}
+
+int sched_v2_fiber_par_slot(fiber_v2* f) {
+    return f ? f->par_slot : -1;
+}
+
 /* Walk the all_fibers list and signal any parked fiber whose deadline
  * has passed.  Cheap when no deadlines are in flight: the global counter
  * short-circuits the walk on the first load.
  *
  * Called once per sysmon tick (see sched_v2_sysmon_main).  The resolution
  * is V2_SYSMON_INTERVAL_MS (20 ms today) — a 10 ms deadline will fire
- * 10–30 ms after being posted, which is fine for the only current caller
- * (@with_deadline wrapping blocking channel ops): tests only care about
- * seeing ETIMEDOUT, not latency. */
+ * 10–30 ms after being posted. Callers are @with_deadline on a blocking
+ * op and cc_sleep_ms (fiber timer park). */
 static void sched_v2_wake_expired_parkers(void) {
     if (atomic_load_explicit(&g_v2_park_deadlines, memory_order_relaxed) == 0) {
         return;
@@ -1877,16 +2594,17 @@ int sched_v2_fiber_external_wait_active(fiber_v2* f) {
  * ============================================================================ */
 
 int sched_v2_in_context(void) {
-    return mco_running() != NULL || tls_v2_current_fiber != NULL;
+    /* mco_running() only. tls_v2_current_fiber can be a stale fiber
+     * from another worker (macOS arm64 + opt). Park already ignores it;
+     * exclusive lock used the TLS fallback and SIGBUS'd on a dead entry. */
+    return mco_running() != NULL;
 }
 
 fiber_v2* sched_v2_current_fiber(void) {
     mco_coro* co = mco_running();
-    if (co) {
-        fiber_v2* f = (fiber_v2*)mco_get_user_data(co);
-        if (f) return f;
-    }
-    return tls_v2_current_fiber;
+    if (!co)
+        return NULL;
+    return (fiber_v2*)mco_get_user_data(co);
 }
 
 CCNurseryHost* sched_v2_current_nursery(void) {
@@ -1896,6 +2614,10 @@ CCNurseryHost* sched_v2_current_nursery(void) {
 
 void* sched_v2_current_deadline_scope(void) {
     fiber_v2* f = sched_v2_current_fiber();
+    return f ? f->current_deadline_scope : NULL;
+}
+
+void* sched_v2_fiber_deadline_scope(fiber_v2* f) {
     return f ? f->current_deadline_scope : NULL;
 }
 
@@ -1938,12 +2660,14 @@ static void* thread_v2_main(void* arg) {
      * They are admitted on demand by sched_v2_wake(-1) when the primary
      * cannot drain fast enough. */
     if (g_v2_park_extras_at_startup && tid != 0) {
+        /* Read the wake ticket BEFORE publishing is_idle (see the main
+         * park below for why). */
+        uint32_t val = atomic_load_explicit(&g_v2.threads[tid].wake.value,
+                                            memory_order_acquire);
         atomic_store_explicit(&g_v2.threads[tid].is_idle, 1, memory_order_release);
         atomic_fetch_add_explicit(&g_v2.idle_workers, 1, memory_order_acq_rel);
         V2_STAT_INC(g_v2_worker_idle_entries);
         atomic_thread_fence(memory_order_seq_cst);
-        uint32_t val = atomic_load_explicit(&g_v2.threads[tid].wake.value,
-                                            memory_order_acquire);
         /* Queue is empty at startup so no Dekker recheck needed. */
         wake_primitive_wait(&g_v2.threads[tid].wake, val);
         if (atomic_exchange_explicit(&g_v2.threads[tid].is_idle, 0,
@@ -1954,6 +2678,9 @@ static void* thread_v2_main(void* arg) {
     }
 
     while (atomic_load_explicit(&g_v2.running, memory_order_acquire)) {
+        if (atomic_load_explicit(&g_v2.threads[tid].retiring,
+                                  memory_order_acquire))
+            break;
         /* Admission gate: try to register as one of the (up to)
          * g_v2_target_active running workers. If target is disabled
          * (0), try_admit_running always succeeds. If target is saturated,
@@ -1961,14 +2688,14 @@ static void* thread_v2_main(void* arg) {
          * that got woken by sched_v2_wake(-1)'s producer-side loop
          * bow out without burning cycles. */
         if (!try_admit_running()) {
+            uint32_t val = atomic_load_explicit(&g_v2.threads[tid].wake.value,
+                                                memory_order_acquire);
             atomic_store_explicit(&g_v2.threads[tid].is_idle, 1,
                                   memory_order_release);
             atomic_fetch_add_explicit(&g_v2.idle_workers, 1,
                                       memory_order_acq_rel);
             V2_STAT_INC(g_v2_worker_idle_entries);
             atomic_thread_fence(memory_order_seq_cst);
-            uint32_t val = atomic_load_explicit(&g_v2.threads[tid].wake.value,
-                                                memory_order_acquire);
             /* No Dekker recheck here: we're parked because target is
              * saturated, not because the queue was empty. Pure wait. */
             wake_primitive_wait(&g_v2.threads[tid].wake, val);
@@ -2012,16 +2739,25 @@ static void* thread_v2_main(void* arg) {
          * allows the architecture to reorder the load before the store,
          * which would race with the producer's symmetric "push count ; load
          * idle_workers" and leave a task stranded while the worker sleeps.
-         * See sched_v2_wake for the matching fence on the producer side. */
+         * See sched_v2_wake for the matching fence on the producer side.
+         *
+         * The wake ticket is read BEFORE is_idle is published. A waker
+         * that finds is_idle==1 CASes it to 0, bumps wake.value and issues
+         * the wake. If we read the ticket after that bump we would park on
+         * the new value with is_idle already 0: not idle, not running,
+         * and no waker will ever look at us again — a worker lost for the
+         * life of the process. Read first, and a wake that lands after
+         * the read makes wake_primitive_wait return at once. */
+        uint32_t val = atomic_load_explicit(&g_v2.threads[tid].wake.value,
+                                            memory_order_acquire);
         atomic_store_explicit(&g_v2.threads[tid].is_idle, 1, memory_order_release);
         atomic_fetch_add_explicit(&g_v2.idle_workers, 1, memory_order_acq_rel);
         V2_STAT_INC(g_v2_worker_idle_entries);
         atomic_thread_fence(memory_order_seq_cst);
-        uint32_t val = atomic_load_explicit(&g_v2.threads[tid].wake.value,
-                                            memory_order_acquire);
 
         /* Recheck: work appeared after we marked ourselves idle. */
-        if (atomic_load_explicit(&g_v2.ready_queue.count, memory_order_acquire) > 0) {
+        if (atomic_load_explicit(&g_v2.ready_queue.count, memory_order_acquire) > 0 ||
+            atomic_load_explicit(&g_v2.worklets.count, memory_order_acquire) > 0) {
             if (atomic_exchange_explicit(&g_v2.threads[tid].is_idle, 0, memory_order_acq_rel)) {
                 atomic_fetch_sub_explicit(&g_v2.idle_workers, 1, memory_order_acq_rel);
             }
@@ -2033,7 +2769,8 @@ static void* thread_v2_main(void* arg) {
         if (atomic_exchange_explicit(&g_v2.threads[tid].is_idle, 0, memory_order_acq_rel)) {
             atomic_fetch_sub_explicit(&g_v2.idle_workers, 1, memory_order_acq_rel);
         }
-        if (atomic_load_explicit(&g_v2.ready_queue.count, memory_order_acquire) > 0) {
+        if (atomic_load_explicit(&g_v2.ready_queue.count, memory_order_acquire) > 0 ||
+            atomic_load_explicit(&g_v2.worklets.count, memory_order_acquire) > 0) {
             V2_STAT_INC(g_v2_worker_busy_from_wake);
         }
     }
@@ -2090,6 +2827,38 @@ static int sched_v2_detect_num_threads(void) {
      * Hard-capped at V2_MAX_THREADS. */
     if (n > V2_MAX_THREADS) n = V2_MAX_THREADS;
     return (int)n;
+}
+
+static uint64_t sched_v2_park_sum(void) {
+    int n = atomic_load_explicit(&g_v2.num_threads, memory_order_acquire);
+    uint64_t s = 0;
+    for (int i = 0; i < n; i++) {
+        s += atomic_load_explicit(&g_v2.threads[i].parks, memory_order_relaxed);
+    }
+    return s;
+}
+
+/* Run-to-park multiplexing: more than half the episode's pops parked.
+ * dp_pops == 0 is CPU saturation between pops, not a park wave. */
+static int sched_v2_grow_run_to_park(uint64_t dp_pops, uint64_t dp_parks) {
+    return dp_pops > 0 && dp_parks * 2ull > dp_pops;
+}
+
+int sched_v2_live_workers(void) {
+    sched_v2_ensure_init();
+    return atomic_load_explicit(&g_v2.num_threads, memory_order_acquire);
+}
+
+int sched_v2_max_workers(void) {
+    sched_v2_ensure_init();
+    return g_v2.max_threads;
+}
+
+static int sched_v2_count_idle_workers(void);
+
+int sched_v2_idle_workers(void) {
+    sched_v2_ensure_init();
+    return sched_v2_count_idle_workers();
 }
 
 static int sched_v2_count_idle_workers(void) {
@@ -2226,8 +2995,11 @@ static void* sched_v2_sysmon_main(void* arg) {
     const int STALL_DIAG_TICKS = 2000 / V2_SYSMON_INTERVAL_MS;
     /* Pool-growth recheck state (see g_v2_grow_pending block comment). */
     uint64_t grow_base_pops = 0;
+    uint64_t grow_base_parks = 0;
     uint64_t grow_base_ns = 0;
     int grow_have_baseline = 0;
+    int grow_depth_streak = 0;
+    uint64_t grow_slack_since_ns = 0;
     int slow_prev_backlog = 0;
     uint64_t last_slow_ns = 0;
     v2_mach_tb_init_once();
@@ -2242,23 +3014,66 @@ static void* sched_v2_sysmon_main(void* arg) {
 
         if (!atomic_load_explicit(&g_v2.running, memory_order_acquire)) break;
 
+        /* CC_V2_IDLE_TRACE: every 100ms, the idle counter against the
+         * per-slot is_idle flags and the running count. A worker parked
+         * with is_idle=0 and not running is a lost worker. */
+        {
+            static int trace = -1;
+            static uint64_t last_ns = 0;
+            if (trace < 0) trace = getenv("CC_V2_IDLE_TRACE") ? 1 : 0;
+            if (trace) {
+                uint64_t now = v2_now_ns();
+                if (now - last_ns > 100000000ull) {
+                    int n = atomic_load_explicit(&g_v2.num_threads, memory_order_relaxed);
+                    int real_idle = sched_v2_count_idle_workers();
+                    fprintf(stderr, "[idle-trace] idle_workers=%d is_idle=%d/%d running=%d queue=%zu grow_pending=%d\n",
+                            atomic_load_explicit(&g_v2.idle_workers, memory_order_relaxed),
+                            real_idle, n,
+                            atomic_load_explicit(&g_v2_running_workers, memory_order_relaxed),
+                            atomic_load_explicit(&g_v2.ready_queue.count, memory_order_relaxed),
+                            atomic_load_explicit(&g_v2_grow_pending, memory_order_relaxed));
+                    last_ns = now;
+                }
+            }
+        }
+
         /* Deferred pool growth: decide grow/hold once per recheck window. */
         if (atomic_load_explicit(&g_v2_grow_pending, memory_order_acquire)) {
-            size_t depth = atomic_load_explicit(&g_v2.ready_queue.count,
+            size_t ready = atomic_load_explicit(&g_v2.ready_queue.count,
                                                 memory_order_relaxed);
+            size_t wdepth = atomic_load_explicit(&g_v2.worklets.count,
+                                                 memory_order_relaxed);
+            size_t depth = ready > wdepth ? ready : wdepth;
             int n = atomic_load_explicit(&g_v2.num_threads, memory_order_acquire);
             int admit_ok = (g_v2_target_active <= 0 ||
                             atomic_load_explicit(&g_v2_running_workers,
                                                  memory_order_acquire)
                                 < g_v2_target_active);
-            if (depth == 0 || n >= g_v2.max_threads || !admit_ok) {
-                /* Demand resolved, pool full, or admission-capped: episode
-                 * over. A producer re-arms the flag if demand returns. */
+            int idle = atomic_load_explicit(&g_v2.idle_workers,
+                                            memory_order_acquire);
+            int slack_now = (depth == 0 && idle > 0);
+            uint64_t slack_now_ns = 0;
+            int slack_done = 0;
+            if (slack_now) {
+                slack_now_ns = v2_now_ns();
+                if (grow_slack_since_ns == 0)
+                    grow_slack_since_ns = slack_now_ns;
+                slack_done = (idle >= n) ||
+                    (slack_now_ns - grow_slack_since_ns >= SCHED_V2_GROW_SLACK_NS);
+            } else {
+                grow_slack_since_ns = 0;
+            }
+            if (n >= g_v2.max_threads || !admit_ok || slack_done) {
                 atomic_store_explicit(&g_v2_grow_pending, 0, memory_order_release);
                 grow_have_baseline = 0;
+                grow_depth_streak = 0;
+                grow_slack_since_ns = 0;
+                if (slack_done)
+                    sched_v2_settle_pool();
             } else {
                 uint64_t pops = atomic_load_explicit(&g_v2.ready_queue.pops,
                                                      memory_order_relaxed);
+                uint64_t parks = sched_v2_park_sum();
                 uint64_t now = v2_now_ns();
                 if (!grow_have_baseline) {
                     /* One baseline per demand episode, captured on the
@@ -2266,29 +3081,54 @@ static void* sched_v2_sysmon_main(void* arg) {
                      * would be clobbered by every push at saturation).
                      * The rate below is cumulative since episode start. */
                     grow_base_pops = pops;
+                    grow_base_parks = parks;
                     grow_base_ns = now;
                     grow_have_baseline = 1;
                 } else {
                     uint64_t dp = pops - grow_base_pops;
+                    uint64_t dpark = parks - grow_base_parks;
                     uint64_t dt = now - grow_base_ns;
                     /* Need a long-enough sample for the rate to mean
                      * anything; an early/spurious wake defers the decision
-                     * to the next recheck. */
-                    if (dt >= 10000ull) {
+                     * to the next recheck. The bar is one pop per worker
+                     * per grow_rate_us, so the sample must span at least
+                     * that period: in a shorter window a healthy pool is
+                     * expected to show zero pops, which the test would
+                     * read as a stall (and run_to_park cannot answer at
+                     * dp == 0). */
+                    if (dt >= (uint64_t)g_v2_grow_rate_us * 1000ull) {
+                        int run_to_park = sched_v2_grow_run_to_park(dp, dpark);
+                        int rate_slow = (dp * (uint64_t)g_v2_grow_rate_us
+                                         * 1000ull < (uint64_t)n * dt);
+                        int depth_hit = (g_v2_grow_depth_mult > 0 &&
+                                         depth >= (size_t)(g_v2_grow_depth_mult * n));
                         /* Grow on rate: cumulative drain rate below one
                          * pop per worker per grow_rate_us. Computed as
                          * dp/dt < n/(rate_us*1000), cross-multiplied to
-                         * stay in integers. */
-                        if (dp * (uint64_t)g_v2_grow_rate_us * 1000ull
-                                < (uint64_t)n * dt) {
+                         * stay in integers. Depth is the same backlog
+                         * test, gated on run-to-park so an accept or
+                         * request wave does not walk ncpu. */
+                        /* Depth must persist (see g_v2_grow_depth_dwell). */
+                        if (depth_hit && !run_to_park)
+                            grow_depth_streak++;
+                        else
+                            grow_depth_streak = 0;
+                        int depth_grow = depth_hit && !run_to_park &&
+                                         grow_depth_streak >= g_v2_grow_depth_dwell;
+                        /* Rate-grow only while something is waiting. A
+                         * CHURN-inlined tree (or any single CPU fiber)
+                         * occupies a worker with depth==0; more threads
+                         * cannot run work that is not queued. */
+                        if (rate_slow && !run_to_park && depth > 0) {
                             V2_STAT_INC(g_v2_grow_stall);
+                            grow_depth_streak = 0;
                             (void)sched_v2_try_expand_pool();
-                        } else if (g_v2_grow_depth_mult > 0 &&
-                                   depth >= (size_t)(g_v2_grow_depth_mult * n)) {
-                            /* Draining briskly, but backlog is deep
-                             * relative to the pool. */
+                        } else if (depth_grow) {
                             V2_STAT_INC(g_v2_grow_backlog);
+                            grow_depth_streak = 0;
                             (void)sched_v2_try_expand_pool();
+                        } else if (run_to_park && (rate_slow || depth_hit)) {
+                            V2_STAT_INC(g_v2_grow_parked);
                         } else {
                             V2_STAT_INC(g_v2_grow_held);
                         }
@@ -2297,6 +3137,8 @@ static void* sched_v2_sysmon_main(void* arg) {
             }
         } else {
             grow_have_baseline = 0;
+            grow_depth_streak = 0;
+            grow_slack_since_ns = 0;
         }
 
         /* Everything below assumes ~one V2_SYSMON_INTERVAL_MS between
@@ -2312,15 +3154,28 @@ static void* sched_v2_sysmon_main(void* arg) {
         /* Syscall-age eviction runs every tick: cheap scan, high payoff. */
         sched_v2_sysmon_evict_aged_workers();
 
+        /* Empty queues + spare workers: release extras down to the eager cap.
+         * Noblock pins the pool (worklets leave the queue while running, so
+         * settle would otherwise see false slack and shrink mid-frame). */
+        {
+            size_t depth = atomic_load_explicit(&g_v2.ready_queue.count,
+                                                 memory_order_relaxed);
+            size_t wdepth = atomic_load_explicit(&g_v2.worklets.count,
+                                                 memory_order_relaxed);
+            int n = atomic_load_explicit(&g_v2.num_threads, memory_order_acquire);
+            int idle = atomic_load_explicit(&g_v2.idle_workers, memory_order_acquire);
+            if (depth == 0 && wdepth == 0 && idle > 0 && n > g_v2_eager_threads &&
+                !atomic_load_explicit(&g_v2_noblock_pool_pinned, memory_order_relaxed))
+                sched_v2_settle_pool();
+        }
+
         /* Park-deadline wakeup: signal any fiber whose @with_deadline
          * has expired while it was parked.  Short-circuits to a single
          * relaxed load when no deadlines are in flight. */
         sched_v2_wake_expired_parkers();
 
-        /* Deadlock detector: runs every tick. Internal checks (idle
-         * count + ready queue depth + first-seen timestamp) short-circuit
-         * the all_fibers walk when the system is healthy, so the
-         * amortized cost on the hot path is just two atomic loads. */
+        /* Deadlock detector: idle/queue/deadline every tick. The
+         * all_fibers walk runs only after the stall has persisted. */
         sched_v2_check_deadlock();
 
         /* Unconditional every-tick safety net: if any work is queued AND
@@ -2331,7 +3186,8 @@ static void* sched_v2_sysmon_main(void* arg) {
          * some worker is parked and the queue was already deep won't
          * wake anyone, but this tick will, bounded to ~V2_SYSMON_INTERVAL_MS
          * (20ms). Producer-exceeds-drainer bursts self-heal here. */
-        if (atomic_load_explicit(&g_v2.ready_queue.count, memory_order_relaxed) > 0 &&
+        if ((atomic_load_explicit(&g_v2.ready_queue.count, memory_order_relaxed) > 0 ||
+             atomic_load_explicit(&g_v2.worklets.count, memory_order_relaxed) > 0) &&
             atomic_load_explicit(&g_v2.idle_workers, memory_order_relaxed) > 0) {
             sched_v2_wake(-1);
         }
@@ -2394,6 +3250,7 @@ static void* sched_v2_sysmon_main(void* arg) {
                 uint64_t parked_internal = 0;
                 uint64_t parked_external_wait = 0;
                 uint64_t parked_deadlock_suppressed = 0;
+                uint64_t running_external_wait = 0;
                 park_reason_bucket reason_buckets[V2_DIAG_REASON_BUCKETS];
                 size_t reason_bucket_count = 0;
                 sched_v2_diag_scan_fibers(state_counts,
@@ -2404,6 +3261,7 @@ static void* sched_v2_sysmon_main(void* arg) {
                                           &parked_internal,
                                           &parked_external_wait,
                                           &parked_deadlock_suppressed,
+                                          &running_external_wait,
                                           reason_buckets,
                                           &reason_bucket_count);
                 size_t external_threads = atomic_load_explicit(&g_external_wait_threads,
@@ -2484,15 +3342,21 @@ static void* sched_v2_sysmon_main(void* arg) {
                         (unsigned long long)parked_other,
                         (unsigned long long)parked_unknown);
                 fprintf(stderr,
-                        "  deadlock classification: internal=%llu external_wait=%llu "
+                        "  deadlock classification: internal=%llu external_wait(parked=%llu running=%llu) "
                         "deadlock_suppressed=%llu external_wait_threads=%zu%s\n",
                         (unsigned long long)parked_internal,
                         (unsigned long long)parked_external_wait,
+                        (unsigned long long)running_external_wait,
                         (unsigned long long)parked_deadlock_suppressed,
                         external_threads,
-                        (parked_external_wait || external_threads)
+                        (parked_external_wait || running_external_wait || external_threads)
                             ? " (external waits can suppress deadlock verdicts)"
                             : "");
+                if (running_external_wait > 0) {
+                    fprintf(stderr,
+                            "  note: RUNNING+external_wait = blocked in native scope "
+                            "(mutex/sleep/IO) without parking — not a sched park\n");
+                }
                 if (reason_bucket_count > 0) {
                     fprintf(stderr, "  park reason histogram:");
                     for (size_t i = 0; i < reason_bucket_count; ++i) {
@@ -2536,7 +3400,7 @@ static void sched_v2_atexit_dump_stats(void) {
             (unsigned long long)atomic_load_explicit(&g_v2_join_park_fiber, memory_order_relaxed),
             (unsigned long long)atomic_load_explicit(&g_v2_join_park_thread, memory_order_relaxed));
     fprintf(stderr, "[sched_v2 stats] wake: ext_calls=%llu no_idle=%llu issued=%llu scan_miss=%llu  "
-                    "skipped_deep=%llu (depth>=%d)  "
+                    "skipped_deep=%llu (depth>=%d) skipped_local=%llu (local=%d)  "
                     "worker_self_drain=%llu  worker_idle_entries=%llu (recheck=%llu from_wake=%llu)\n",
             (unsigned long long)atomic_load_explicit(&g_v2_wake_calls_ext, memory_order_relaxed),
             (unsigned long long)atomic_load_explicit(&g_v2_wake_no_idle, memory_order_relaxed),
@@ -2544,19 +3408,23 @@ static void sched_v2_atexit_dump_stats(void) {
             (unsigned long long)atomic_load_explicit(&g_v2_wake_scan_miss, memory_order_relaxed),
             (unsigned long long)atomic_load_explicit(&g_v2_wake_skipped_deep, memory_order_relaxed),
             g_v2_wake_skip_depth,
+            (unsigned long long)atomic_load_explicit(&g_v2_wake_skipped_local, memory_order_relaxed),
+            g_v2_wake_local,
             (unsigned long long)atomic_load_explicit(&g_v2_worker_self_drain, memory_order_relaxed),
             (unsigned long long)atomic_load_explicit(&g_v2_worker_idle_entries, memory_order_relaxed),
             (unsigned long long)atomic_load_explicit(&g_v2_worker_busy_from_recheck, memory_order_relaxed),
             (unsigned long long)atomic_load_explicit(&g_v2_worker_busy_from_wake, memory_order_relaxed));
-    fprintf(stderr, "[sched_v2 stats] grow (eager<=%d recheck=%dus rate=%dus/pop/worker depth_x=%d esc=%d): requests=%llu "
-                    "stall=%llu backlog=%llu escalate=%llu held=%llu final_threads=%d/%d\n",
+    fprintf(stderr, "[sched_v2 stats] grow (eager<=%d recheck=%dus rate=%dus/pop/worker depth_x=%d dwell=%d esc=%d): requests=%llu "
+                    "stall=%llu backlog=%llu escalate=%llu held=%llu parked=%llu shrink=%llu final_threads=%d/%d\n",
             g_v2_eager_threads, g_v2_grow_recheck_us, g_v2_grow_rate_us,
-            g_v2_grow_depth_mult, g_v2_grow_escalate_ticks,
+            g_v2_grow_depth_mult, g_v2_grow_depth_dwell, g_v2_grow_escalate_ticks,
             (unsigned long long)atomic_load_explicit(&g_v2_grow_requests, memory_order_relaxed),
             (unsigned long long)atomic_load_explicit(&g_v2_grow_stall, memory_order_relaxed),
             (unsigned long long)atomic_load_explicit(&g_v2_grow_backlog, memory_order_relaxed),
             (unsigned long long)atomic_load_explicit(&g_v2_grow_escalate, memory_order_relaxed),
             (unsigned long long)atomic_load_explicit(&g_v2_grow_held, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&g_v2_grow_parked, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&g_v2_grow_shrink, memory_order_relaxed),
             atomic_load_explicit(&g_v2.num_threads, memory_order_relaxed),
             g_v2.max_threads);
     fprintf(stderr, "[sched_v2 stats] spin_before_park=%d: hit=%llu miss=%llu\n",
@@ -2574,6 +3442,20 @@ static void sched_v2_atexit_dump_stats(void) {
             (unsigned long long)atomic_load_explicit(&g_v2_sysmon_evicted_total, memory_order_relaxed),
             (long long)atomic_load_explicit(&g_v2_orphans_alive, memory_order_relaxed),
             (unsigned long long)atomic_load_explicit(&g_v2_orphans_cap_hit, memory_order_relaxed));
+    fprintf(stderr, "[sched_v2 stats] noblock: fork=%llu cut_idle=%llu cut_ready=%llu cut_cap=%llu cut_nested=%llu fiber=%llu\n",
+            (unsigned long long)atomic_load_explicit(&g_par_noblock_fork, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&g_par_noblock_cut_idle, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&g_par_noblock_cut_ready, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&g_par_noblock_cut_cap, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&g_par_noblock_cut_nested, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&g_v2_noblock_fiber_spawn, memory_order_relaxed));
+    fprintf(stderr, "[sched_v2 stats] worklet: spawn=%llu run=%llu join_fast=%llu join_spin=%llu join_help=%llu join_park=%llu\n",
+            (unsigned long long)atomic_load_explicit(&g_v2_worklet_spawn, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&g_v2_worklet_run, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&g_v2_worklet_join_fast, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&g_v2_worklet_join_spin, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&g_v2_worklet_join_help, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&g_v2_worklet_join_park, memory_order_relaxed));
 }
 
 static void sched_v2_init_impl(void) {
@@ -2584,10 +3466,19 @@ static void sched_v2_init_impl(void) {
     atomic_store_explicit(&g_v2.running, 1, memory_order_release);
     atomic_store_explicit(&g_v2.idle_workers, 0, memory_order_relaxed);
     v2_queue_init(&g_v2.ready_queue);
+    worklet_queue_init(&g_v2.worklets);
+    v2_slock_init(&g_v2.worklet_free_mu);
+    g_v2.worklet_free = NULL;
     /* Publish the ready-depth cell for the lowering's inline @parallel
      * deny gate (cc_sched.cch). _Atomic size_t read as volatile size_t:
      * same object representation; the gate only needs a relaxed load. */
     __cc_par_depth_addr = (volatile size_t*)&g_v2.ready_queue.count;
+    /* Same layout contract as depth: _Atomic int/size_t as volatile. */
+    __cc_par_idle_addr = (volatile int*)&g_v2.idle_workers;
+    /* Capacity Cut reads live outstanding worklets, not queue depth:
+     * running worklets have left the queue but still occupy a worker. */
+    __cc_par_worklet_addr = (volatile size_t*)&g_v2_worklets_live;
+    __cc_par_nworkers_addr = (volatile int*)&g_v2.num_threads;
     v2_slock_init(&g_v2.free_list_mu);
     pthread_mutex_init(&g_v2.all_fibers_mu, NULL);
     g_v2.all_fibers = NULL;
@@ -2615,6 +3506,10 @@ static void sched_v2_init_impl(void) {
         if (end != spin_env && v >= 0 && v <= 65536) {
             g_v2_join_spin = (int)v;
         }
+    }
+    const char* wl_env = getenv("CC_V2_WAKE_LOCAL");
+    if (wl_env && wl_env[0] == '0') {
+        g_v2_wake_local = 0;
     }
     const char* wsd_env = getenv("CC_V2_WAKE_SKIP_DEPTH");
     if (wsd_env) {
@@ -2677,6 +3572,14 @@ static void sched_v2_init_impl(void) {
         long v = strtol(depth_env, &end, 10);
         if (end != depth_env && v >= 0 && v <= 100000L) {
             g_v2_grow_depth_mult = (int)v;
+        }
+    }
+    const char* dwell_env = getenv("CC_V2_GROW_DEPTH_DWELL");
+    if (dwell_env) {
+        char* end = NULL;
+        long v = strtol(dwell_env, &end, 10);
+        if (end != dwell_env && v >= 1 && v <= 10000L) {
+            g_v2_grow_depth_dwell = (int)v;
         }
     }
     const char* esc_env = getenv("CC_V2_GROW_ESCALATE_TICKS");
@@ -2775,7 +3678,7 @@ size_t sched_v2_ready_depth(void) {
 }
 
 uint32_t sched_v2_current_fiber_suspends(void) {
-    fiber_v2* f = tls_v2_current_fiber;
+    fiber_v2* f = sched_v2_current_fiber();
     return f ? atomic_load_explicit(&f->suspends, memory_order_relaxed) : 0;
 }
 
@@ -2784,7 +3687,7 @@ void sched_v2_fiber_release(fiber_v2* f) {
 }
 
 void* sched_v2_current_result_buf(size_t size) {
-    fiber_v2* f = tls_v2_current_fiber;
+    fiber_v2* f = sched_v2_current_fiber();
     if (!f || size > sizeof(f->result_buf)) return NULL;
     return f->result_buf;
 }
@@ -2893,6 +3796,9 @@ void sched_v2_debug_dump_state(const char* prefix) {
  *     on an *open* channel AND some external-wait thread is providing
  *     progress (this is the "I/O-driven progress" exemption V1 had).
  *   - Require the condition to persist for ~1 s before declaring deadlock.
+ *     The all_fibers classify walk runs only after that latch; dest-serve
+ *     I/O-wait (all idle, empty queue, no internal parks) must not walk
+ *     every 20 ms tick.
  *   - Opt out via CC_DEADLOCK_ABORT=0 (print banner, keep running).
  *
  * The idle/queue checks deliberately use sysmon's own snapshot of the V2
@@ -2920,13 +3826,22 @@ static _Atomic int g_v2_deadlock_reported = 0;
 #define SCHED_V2_DEADLOCK_PERSIST_MS 1000u
 
 static uint64_t sched_v2_deadlock_persist_ms(void) {
+    static uint64_t cached = 0;
+    static int inited = 0;
+    if (inited) return cached;
     const char* env = getenv("CC_DEADLOCK_PERSIST_MS");
-    if (!env || !env[0]) return SCHED_V2_DEADLOCK_PERSIST_MS;
-    char* end = NULL;
-    unsigned long v = strtoul(env, &end, 10);
-    if (end == env || (end && *end) || v == 0 || v > 60000ul)
-        return SCHED_V2_DEADLOCK_PERSIST_MS;
-    return (uint64_t)v;
+    if (!env || !env[0]) {
+        cached = SCHED_V2_DEADLOCK_PERSIST_MS;
+    } else {
+        char* end = NULL;
+        unsigned long v = strtoul(env, &end, 10);
+        if (end == env || (end && *end) || v == 0 || v > 60000ul)
+            cached = SCHED_V2_DEADLOCK_PERSIST_MS;
+        else
+            cached = (uint64_t)v;
+    }
+    inited = 1;
+    return cached;
 }
 
 static uint64_t sched_v2_monotonic_ms(void) {
@@ -2971,6 +3886,11 @@ static void sched_v2_classify_parked_fibers(size_t* internal_parked,
         if (base != FIBER_V2_PARKED) continue;
         if (atomic_load_explicit(&f->external_wait_depth, memory_order_acquire) > 0) { (*external_parked)++; continue; }
         if (atomic_load_explicit(&f->deadlock_suppress_depth, memory_order_acquire) > 0) { (*suppressed_parked)++; continue; }
+        /* Clock will wake this fiber (cc_sleep_ms / @with_deadline). */
+        if (atomic_load_explicit(&f->has_park_deadline, memory_order_acquire)) {
+            (*suppressed_parked)++;
+            continue;
+        }
         (*internal_parked)++;
         if (!sched_v2_fiber_is_open_chan_recv_wait(f)) *saw_only_open_recv = 0;
     }
@@ -2996,7 +3916,8 @@ static void sched_v2_dump_parked_fibers_for_verdict(void) {
         if (is_parked) parked_total++;
         int skipped = 0;
         if (is_parked && (atomic_load_explicit(&f->external_wait_depth, memory_order_acquire) > 0 ||
-                          atomic_load_explicit(&f->deadlock_suppress_depth, memory_order_acquire) > 0)) {
+                          atomic_load_explicit(&f->deadlock_suppress_depth, memory_order_acquire) > 0 ||
+                          atomic_load_explicit(&f->has_park_deadline, memory_order_acquire))) {
             skipped = 1;
             skipped_total++;
         } else if (is_parked) {
@@ -3083,6 +4004,29 @@ void sched_v2_check_deadlock(void) {
                               memory_order_relaxed);
         return;
     }
+    /* A published park deadline is a clock wait: sysmon will signal.
+     * A dest join parked on a sleeper is not a deadlock. */
+    if (atomic_load_explicit(&g_v2_park_deadlines, memory_order_relaxed) > 0) {
+        atomic_store_explicit(&g_v2_deadlock_first_seen, 0,
+                              memory_order_relaxed);
+        return;
+    }
+
+    /* Latch first. Dest-serve I/O-wait is idle==n && empty queue for the
+     * life of the process; walking all_fibers every tick is the tax.
+     * Classify only after persist_ms so a healthy kqueue wait is one
+     * walk per latch, not fifty per second. */
+    uint64_t persist_ms = sched_v2_deadlock_persist_ms();
+    uint64_t now = sched_v2_monotonic_ms();
+    uint64_t first = atomic_load_explicit(&g_v2_deadlock_first_seen,
+                                          memory_order_relaxed);
+    if (first == 0) {
+        atomic_compare_exchange_strong_explicit(
+            &g_v2_deadlock_first_seen, &first, now,
+            memory_order_relaxed, memory_order_relaxed);
+        return;
+    }
+    if (now - first < persist_ms) return;
 
     size_t internal_parked = 0, suppressed_parked = 0, external_parked = 0;
     int saw_only_open_recv = 1;
@@ -3106,7 +4050,7 @@ void sched_v2_check_deadlock(void) {
      *   if (external_waits > 0 && only_open_recv_waits) { reset; return; }
      * The open-channel check is the key: if any internal park is NOT on
      * an open-channel recv, the external source has no plausible way to
-     * unblock it, so we proceed to latch the deadlock verdict. */
+     * unblock it, so we proceed to the verdict. */
     size_t external_threads = atomic_load_explicit(&g_external_wait_threads,
                                                    memory_order_relaxed);
     size_t external_waits = external_parked + external_threads;
@@ -3115,19 +4059,6 @@ void sched_v2_check_deadlock(void) {
                               memory_order_relaxed);
         return;
     }
-
-    /* Latch timer: require the stall to persist >= persist_ms. */
-    uint64_t persist_ms = sched_v2_deadlock_persist_ms();
-    uint64_t now = sched_v2_monotonic_ms();
-    uint64_t first = atomic_load_explicit(&g_v2_deadlock_first_seen,
-                                          memory_order_relaxed);
-    if (first == 0) {
-        atomic_compare_exchange_strong_explicit(
-            &g_v2_deadlock_first_seen, &first, now,
-            memory_order_relaxed, memory_order_relaxed);
-        return;
-    }
-    if (now - first < persist_ms) return;
 
     /* Claim the report slot. */
     int expected = 0;
@@ -3264,7 +4195,9 @@ fiber_v2* sched_v2_spawn(void* (*fn)(void*), void* arg) {
     return sched_v2_spawn_in_nursery(fn, arg, NULL);
 }
 
-fiber_v2* sched_v2_spawn_in_nursery(void* (*fn)(void*), void* arg, CCNurseryHost* nursery) {
+static fiber_v2* sched_v2_spawn_finish(void* (*fn)(void*), void* arg,
+                                       CCNurseryHost* nursery,
+                                       int nb_inherit, uint64_t nb_num, uint64_t nb_den) {
     sched_v2_ensure_init();
 
     fiber_v2* f = fiber_v2_alloc();
@@ -3274,6 +4207,10 @@ fiber_v2* sched_v2_spawn_in_nursery(void* (*fn)(void*), void* arg, CCNurseryHost
     f->entry_arg = arg;
     f->saved_nursery = nursery;
     f->admission_nursery = nursery;
+    f->nb_inherit = nb_inherit;
+    f->nb_live = 0;
+    f->nb_num = nb_num ? nb_num : 1;
+    f->nb_den = nb_den ? nb_den : 1;
     atomic_store_explicit(&f->suspends, 0, memory_order_relaxed);
     /* Do NOT create/init the coroutine here.
      *
@@ -3289,6 +4226,23 @@ fiber_v2* sched_v2_spawn_in_nursery(void* (*fn)(void*), void* arg, CCNurseryHost
 
     sched_v2_enqueue_runnable(f);
 
+    return f;
+}
+
+fiber_v2* sched_v2_spawn_in_nursery(void* (*fn)(void*), void* arg, CCNurseryHost* nursery) {
+    return sched_v2_spawn_finish(fn, arg, nursery, 0, 1, 1);
+}
+
+/* Noblock arm whose child still forks. The fiber carries the post-enter
+ * share so its own sites keep dividing, and it can park at the join
+ * without pinning the worker. */
+fiber_v2* sched_v2_spawn_noblock(void* (*fn)(void*), void* arg) {
+    cc_nb_stack* nb = nb_get();
+    uint64_t num = (nb && nb->num) ? nb->num : 1;
+    uint64_t den = (nb && nb->den) ? nb->den : 1;
+    fiber_v2* f = sched_v2_spawn_finish(fn, arg, NULL, 1, num, den);
+    if (f)
+        atomic_fetch_add_explicit(&g_v2_noblock_fiber_spawn, 1, memory_order_relaxed);
     return f;
 }
 

@@ -2,6 +2,8 @@
  * Structured concurrency nursery (minimal stub).
  * Tracks spawned tasks and joins them at close. Cancellation is cooperative
  * via a shared flag; spawned functions should poll cc_nursery_is_cancelled().
+ * `n.spawn` after `n.cancel()` fails `CC_ERR_CANCELLED`. Already-admitted
+ * children stay; they poll / parks wake.
  */
 #ifndef CC_NURSERY_H
 #define CC_NURSERY_H
@@ -115,6 +117,19 @@ void cc_nursery_free_host(CCNurseryHost* n);
  * the field on the host; UFCS peels through this accessor. Handle copy. */
 static inline CCArena cc_nursery_arena(CCNursery n) {
     return cc_nursery_arena_host(n.p);
+}
+
+/* The Region face of that arena, as the surface names it: `n.alloc(...)`,
+ * `n.remaining()`. The face is a viewed one -- the arena is not a field of
+ * the handle, it is behind the accessor above -- so each Region method the
+ * surface offers is a wrapper here, the same peel the rest of this header
+ * writes out. Region is read-only in that sense: there is no
+ * `cc_nursery_reset`, and `n.reset()` stays ill-formed. */
+static inline void* cc_nursery_alloc(CCNursery n, size_t size, size_t align) {
+    return cc_arena_alloc(cc_nursery_arena(n), size, align);
+}
+static inline size_t cc_nursery_remaining(CCNursery n) {
+    return cc_arena_remaining(cc_nursery_arena(n));
 }
 
 // Cancel all tasks (sets flag; tasks must poll cooperatively).

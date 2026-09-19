@@ -65,8 +65,10 @@ void cc__fiber_dump_unpark_reason_stats(void);
 enum {
     CC_FIBER_UNPARK_ATTR_NONE = 0u,
     CC_FIBER_UNPARK_ATTR_CONTENTION_LOCAL = 1u << 0,
+    CC_FIBER_UNPARK_ATTR_PREFER_LOCAL = 1u << 1,
 };
 void cc__fiber_unpark_channel_attrib(uint32_t attrib_flags);
+void cc__fiber_unpark_prefer_local(void* fiber);
 void cc__fiber_yield(void);         /* Cooperative yield - push to local queue */
 void cc__fiber_yield_global(void);  /* Yield to global queue for fairness */
 void cc__fiber_sched_enqueue(void* fiber);
@@ -74,7 +76,7 @@ void cc_fiber_dump_state(const char* reason);  /* Debug: dump scheduler state */
 int cc__fiber_sched_active(void);
 void cc__fiber_set_park_obj(void* obj);
 void cc__fiber_clear_pending_unpark(void);  /* Clear stale pending_unpark before new wait */
-void cc__fiber_sleep_park(unsigned int ms); /* Park fiber on sleep queue with timer */
+void cc__fiber_sleep_park(unsigned int ms); /* Fiber: deadline park. Thread: nanosleep. */
 uint64_t cc__fiber_publish_wait_ticket(void* fiber_ptr);
 int cc__fiber_wait_ticket_matches(void* fiber_ptr, uint64_t ticket);
 void cc_external_wait_enter(void);
@@ -82,6 +84,8 @@ void cc_external_wait_leave(void);
 
 /* Channel direct-handoff helpers — implemented in fiber_sched.c */
 int  cc__sched_current_worker_id(void);
+int  cc__sched_worker_pool_size(void);
+int  cc__sched_worker_pool_cap(void);
 void cc__chan_debug_dump_state(void* ch_obj, const char* prefix);
 
 /* Convenience macro to park with source location */

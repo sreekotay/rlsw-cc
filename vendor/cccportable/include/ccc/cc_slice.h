@@ -35,17 +35,18 @@
 // Slice id bit layout (matches spec):
 // Bits 0–59 : allocation id (non-zero for tracked allocations)
 //   Grower-minted views (Vec / heap String as_slice) pack this field as:
-//   Bits 0–39 : arena epoch
-//   Bits 40–58 : generation
+//   Bits 0–31 : arena epoch
+//   Bits 32–58 : generation (owner token)
 //   Bit 59     : grower. Canonical static id has bits 0–59 all 1 and is not a grower.
 // Bit 60    : is_cstr (ptr[len] is defined and 0 — C-string capability)
 // Bit 61    : is_transferable
 // Bit 62    : is_subslice
 // Bit 63    : is_unique (has destructor, move-only)
 #define CC_SLICE_ID_ALLOC_MASK 0x0FFFFFFFFFFFFFFFULL
-#define CC_SLICE_ID_EPOCH_MASK 0x000000FFFFFFFFFFULL
-#define CC_SLICE_ID_GEN_SHIFT  40
-#define CC_SLICE_ID_GEN_MASK   0x07FFFF0000000000ULL
+#define CC_SLICE_ID_EPOCH_MASK 0x00000000FFFFFFFFULL
+#define CC_SLICE_ID_GEN_SHIFT  32
+#define CC_SLICE_ID_GEN_MASK   0x07FFFFFF00000000ULL
+#define CC_SLICE_ID_GEN_MAX    0x07FFFFFFu
 #define CC_SLICE_ID_GROWER     (1ULL << 59)
 #define CC_SLICE_ID_CSTR         (1ULL << 60)
 #define CC_SLICE_ID_TRANSFERABLE (1ULL << 61)
@@ -88,7 +89,7 @@ static inline int cc__bytes_cmp(const void *a, const void *b, size_t n) {
     return 0;
 }
 
-/* Unnamed facet (enforced by shadow_lower for the whole slice family —
+/* Unnamed facet (enforced by the lowerer for the whole slice family —
  * CCSlice / Unique / Shared / Packed / Hdr / CCSlice_T). Ordinary sites
  * may read `.ptr` / `.len` / `.id`; they may not store fields.
  * First-param CCSlice* bodies are trusted (stdlib + user methods).
@@ -135,7 +136,7 @@ typedef CCSlice CCSliceShared;
  * Members are `NAME##_<member>` — the same instance-prefix convention
  * as Vec and Map families. Header lowering strips `@typeview` and
  * `CC_GENERIC_FACTORY` from `.h` (faces and the factory remain
- * Concurrent-C / shadow facts). */
+ * Concurrent-C facts). */
 #define CC_DECL_SLICE_SPEC(NAME, T)                                            \
     typedef struct NAME {                                                      \
         CCSlice base;                                                          \
@@ -299,12 +300,16 @@ static inline uint32_t cc_slice_id_gen(uint64_t id) {
 }
 static inline uint64_t cc_slice_make_grower_id(uint64_t epoch, uint32_t gen) {
     uint64_t a = (epoch & CC_SLICE_ID_EPOCH_MASK) |
-                 (((uint64_t)(gen & 0x7FFFFu)) << CC_SLICE_ID_GEN_SHIFT) |
+                 (((uint64_t)(gen & CC_SLICE_ID_GEN_MAX)) << CC_SLICE_ID_GEN_SHIFT) |
                  CC_SLICE_ID_GROWER;
     return cc_slice_make_id(a, false, false, false);
 }
+/* Generation registry: `birth` issues a token in [16, CC_SLICE_ID_GEN_MAX]
+ * that is live until `kill`; 0 means the registry could not issue one
+ * (out of memory or every token live) — the caller fails at that
+ * position. Comptime / parser builds keep every token live. */
 #if defined(CC_COMPTIME) || defined(CC_PARSER_MODE)
-static inline uint32_t cc_slice_gen_birth(void) { return 1; }
+static inline uint32_t cc_slice_gen_birth(void) { return 16; }
 static inline void cc_slice_gen_kill(uint32_t gen) { (void)gen; }
 static inline int cc_slice_gen_is_live(uint32_t gen) { (void)gen; return 1; }
 #else
@@ -376,6 +381,21 @@ CC_DECL_SLICE(uint32_t)
 CC_DECL_SLICE(uint64_t)
 CC_DECL_SLICE(float)
 CC_DECL_SLICE(double)
+/* Each pre-declared typed slice announces itself, keyed by the element's
+ * identifier-safe spelling: a container factory tests
+ * `#ifdef CC_HAS_CCSLICE_<T>` to ride along with it. */
+#define CC_HAS_CCSLICE_short 1
+#define CC_HAS_CCSLICE_int 1
+#define CC_HAS_CCSLICE_long 1
+#define CC_HAS_CCSLICE_long_long 1
+#define CC_HAS_CCSLICE_int16_t 1
+#define CC_HAS_CCSLICE_int32_t 1
+#define CC_HAS_CCSLICE_int64_t 1
+#define CC_HAS_CCSLICE_uint16_t 1
+#define CC_HAS_CCSLICE_uint32_t 1
+#define CC_HAS_CCSLICE_uint64_t 1
+#define CC_HAS_CCSLICE_float 1
+#define CC_HAS_CCSLICE_double 1
 
 /* Family is-a face: every `CCSlice_*` instance embeds `CCSlice base`. */
 
@@ -726,7 +746,7 @@ static inline CCSlice cc_slice_trim_right(CCSlice* s) {
 }
 static inline CCSlice CCSlice_trim_right(CCSlice* s) { return cc_slice_trim_right(s); }
 
-/* Indexed get/set live in <ccc/std/slice.h> as Result-returning
+/* Indexed get/set live in <ccc/std/slice.cch> as Result-returning
  * `cc_slice_at` / `cc_slice_get_checked` / `cc_slice_set` (no soft-zero at). */
 
 static inline CCSlice cc__slice_sub_ptr(CCSlice* s, size_t start, size_t end) {
@@ -735,7 +755,13 @@ static inline CCSlice cc__slice_sub_ptr(CCSlice* s, size_t start, size_t end) {
 static inline CCSlice cc__slice_sub_const_ptr(const CCSlice* s, size_t start, size_t end) {
     return s ? cc__slice_sub_value(*s, start, end) : cc_slice_empty();
 }
-static inline CCSlice CCSlice_sub(CCSlice* s, size_t start, size_t end) { return cc__slice_sub_ptr(s, start, end); }
+/* The body, not a call to cc__slice_sub_ptr: through two inline layers,
+ * gcc 13 -O2 loses the subslice's pointer back to the caller's array and
+ * keeps reading the array's initializer past a write through the
+ * subslice. Same value, one layer. */
+static inline CCSlice CCSlice_sub(const CCSlice* s, size_t start, size_t end) {
+    return s ? cc__slice_sub_value(*s, start, end) : cc_slice_empty();
+}
 
 static inline bool cc_slice_starts_with(CCSlice* s, CCSlice prefix) {
     const uint8_t *p;

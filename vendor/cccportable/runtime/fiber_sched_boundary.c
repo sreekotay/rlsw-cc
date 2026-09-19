@@ -1,6 +1,8 @@
 #include "fiber_sched_boundary.h"
 #include "fiber_internal.h"
 
+int cc_parallel_current_cancelled(void);
+
 
 /*
  * V2 compatibility shim for the v3 scheduler boundary.
@@ -33,9 +35,11 @@ static cc_sched_wait_result cc_sched_fiber_wait_impl(
     void* waitable,
     void* io,
     const cc_sched_waitable_ops* ops,
-    const struct timespec* abs_deadline
+    const struct timespec* abs_deadline,
+    CCSchedFiber* fiber
 ) {
-    CCSchedFiber* fiber = (CCSchedFiber*)cc__fiber_current();
+    if (!fiber)
+        fiber = (CCSchedFiber*)cc__fiber_current();
     if (!ops) {
         return CC_SCHED_WAIT_CLOSED;
     }
@@ -87,6 +91,8 @@ static cc_sched_wait_result cc_sched_fiber_wait_impl(
     if (ops->try_complete && ops->try_complete(waitable, fiber, io)) {
         return CC_SCHED_WAIT_OK;
     }
+    if (cc_parallel_current_cancelled())
+        return CC_SCHED_WAIT_CANCELLED;
     return CC_SCHED_WAIT_PARKED;
 }
 
@@ -95,7 +101,16 @@ cc_sched_wait_result cc_sched_fiber_wait(
     void* io,
     const cc_sched_waitable_ops* ops
 ) {
-    return cc_sched_fiber_wait_impl(waitable, io, ops, NULL);
+    return cc_sched_fiber_wait_impl(waitable, io, ops, NULL, NULL);
+}
+
+cc_sched_wait_result cc_sched_fiber_wait_on(
+    CCSchedFiber* fiber,
+    void* waitable,
+    void* io,
+    const cc_sched_waitable_ops* ops
+) {
+    return cc_sched_fiber_wait_impl(waitable, io, ops, NULL, fiber);
 }
 
 cc_sched_wait_result cc_sched_fiber_wait_until(
@@ -104,7 +119,7 @@ cc_sched_wait_result cc_sched_fiber_wait_until(
     const cc_sched_waitable_ops* ops,
     const struct timespec* abs_deadline
 ) {
-    return cc_sched_fiber_wait_impl(waitable, io, ops, abs_deadline);
+    return cc_sched_fiber_wait_impl(waitable, io, ops, abs_deadline, NULL);
 }
 
 cc_sched_wait_result cc_sched_fiber_wait_many(

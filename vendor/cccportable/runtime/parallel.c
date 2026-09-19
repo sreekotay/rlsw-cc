@@ -48,49 +48,158 @@ static void cc_parallel_env_free(CCParallel* h, void* env) {
     cc__heap_free(env);
 }
 
-/* Live occupancy: drop finished admits. Brace pad stays; history does not.
- * Never join the fiber that is admitting (the kick). */
-static void cc_parallel_reap(CCParallel* h) {
-    CCTask* tasks;
-    void** envs;
-    fiber_v2* self;
-    int i, w;
-    if (!h)
-        return;
-    tasks = cc_parallel_tasks(h);
-    envs = cc_parallel_envs(h);
-    self = sched_v2_current_fiber();
-    w = 0;
-    for (i = 0; i < h->nt; i++) {
-        fiber_v2* f = cc_task_fiber_v2(tasks[i]);
-        if (f && f != self && sched_v2_fiber_done(f)) {
-            cc_parallel_join(tasks[i]);
-            cc_parallel_env_free(h, envs[i]);
-            continue;
-        }
-        if (w != i) {
-            tasks[w] = tasks[i];
-            envs[w] = envs[i];
-        }
-        w++;
-    }
-    h->nt = w;
+/* Live-index lock. The index (tasks / envs / nt / ncap / xtasks / xenvs)
+ * is read or written only under it. Nothing parks while holding it.
+ * Whoever takes a slot out under the lock is the only one who joins or
+ * frees that fiber. Completers claim themselves when they finish;
+ * wait / leave / admit-reap take what is still listed. */
+static inline void cc_par_cpu_pause(void) {
+#if defined(__TINYC__)
+    __asm__ __volatile__("" ::: "memory");
+#elif defined(__x86_64__) || defined(__i386__)
+    __asm__ __volatile__("pause");
+#elif defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#else
+    __asm__ __volatile__("" ::: "memory");
+#endif
 }
 
-/* Drop slot i without joining. Shift the tail down. */
-static void cc_parallel_remove_at(CCParallel* h, int i) {
+/* Spin briefly, then yield the worker. A contended dest at c=1000 has a
+ * thousand fibers admitting; a pure spin burns every worker on the one
+ * holder while the sockets starve. The holder's section is bounded (see
+ * reap), so a short spin catches most handoffs; past that the fiber
+ * steps aside and lets a sender run. */
+#define CC_PAR_LOCK_SPIN 64
+
+static void cc_par_lock(CCParallel* h) {
+    int spins = 0;
+    for (;;) {
+        int z = 0;
+        if (atomic_compare_exchange_weak_explicit(&h->lock, &z, 1,
+                memory_order_acquire, memory_order_relaxed))
+            return;
+        if (++spins < CC_PAR_LOCK_SPIN) {
+            cc_par_cpu_pause();
+            continue;
+        }
+        spins = 0;
+        cc_yield();
+    }
+}
+
+static void cc_par_unlock(CCParallel* h) {
+    atomic_store_explicit(&h->lock, 0, memory_order_release);
+}
+
+/* Live occupancy: drop finished admits. Completers claim themselves off
+ * the index when they finish; admit-reap is the backup scan for a done
+ * slot still present. Brace pad stays; history does not. Never join the
+ * fiber that is admitting (the kick). Caller holds the lock; finished
+ * slots are taken out under it and joined after release so the join
+ * never runs under the lock.
+ *
+ * Each admit scans a bounded window of the index from a rotating cursor,
+ * not the whole index: the section under the lock is O(window), and the
+ * cursor walks the index once every nt/window admits so nothing is left
+ * behind. Slots are swap-removed (last into the hole); the index is a
+ * set, and wait takes any slot. */
+#define CC_PAR_REAP_BATCH 16
+#define CC_PAR_REAP_SCAN 64
+
+typedef struct CCParReapSet {
+    CCTask tasks[CC_PAR_REAP_BATCH];
+    void* envs[CC_PAR_REAP_BATCH];
+    int n;
+} CCParReapSet;
+
+static void cc_parallel_set_slot(CCTask t, int slot) {
+    fiber_v2* f = cc_task_fiber_v2(t);
+    if (f)
+        sched_v2_fiber_set_par_slot(f, slot);
+}
+
+/* Caller holds the lock. Take slot i; write task and env; set the taken
+ * fiber's par_slot to -1 and the moved sibling's par_slot to i. */
+static void cc_parallel_index_take(CCParallel* h, int i, CCTask* out_t,
+                                  void** out_env) {
+    CCTask* tasks = cc_parallel_tasks(h);
+    void** envs = cc_parallel_envs(h);
+    fiber_v2* taken;
+    *out_t = tasks[i];
+    *out_env = envs[i];
+    taken = cc_task_fiber_v2(*out_t);
+    h->nt--;
+    if (i != h->nt) {
+        tasks[i] = tasks[h->nt];
+        envs[i] = envs[h->nt];
+        cc_parallel_set_slot(tasks[i], i);
+    }
+    if (taken)
+        sched_v2_fiber_set_par_slot(taken, -1);
+    if (h->reap_at >= h->nt)
+        h->reap_at = 0;
+}
+
+int cc_parallel_claim_child(void* hp, fiber_v2* f) {
+    CCParallel* h = (CCParallel*)hp;
+    CCTask t;
+    void* env;
+    int slot;
+    if (!h || !f)
+        return 0;
+    cc_par_lock(h);
+    slot = sched_v2_fiber_par_slot(f);
+    if (slot < 0 || slot >= h->nt ||
+        cc_task_fiber_v2(cc_parallel_tasks(h)[slot]) != f) {
+        cc_par_unlock(h);
+        return 0;
+    }
+    cc_parallel_index_take(h, slot, &t, &env);
+    cc_par_unlock(h);
+    (void)t;
+    cc_parallel_env_free(h, env);
+    return 1;
+}
+
+static void cc_parallel_reap_take(CCParallel* h, CCParReapSet* rs) {
     CCTask* tasks;
-    void** envs;
-    int k;
-    if (!h || i < 0 || i >= h->nt)
+    fiber_v2* self;
+    int i, seen, budget;
+    rs->n = 0;
+    if (!h || h->nt <= 0)
         return;
     tasks = cc_parallel_tasks(h);
-    envs = cc_parallel_envs(h);
-    for (k = i; k < h->nt - 1; k++) {
-        tasks[k] = tasks[k + 1];
-        envs[k] = envs[k + 1];
+    self = sched_v2_current_fiber();
+    budget = h->nt < CC_PAR_REAP_SCAN ? h->nt : CC_PAR_REAP_SCAN;
+    if (h->reap_at < 0 || h->reap_at >= h->nt)
+        h->reap_at = 0;
+    i = h->reap_at;
+    for (seen = 0; seen < budget && rs->n < CC_PAR_REAP_BATCH; seen++) {
+        fiber_v2* f;
+        if (h->nt <= 0)
+            break;
+        if (i >= h->nt)
+            i = 0;
+        f = cc_task_fiber_v2(tasks[i]);
+        if (f && f != self && sched_v2_fiber_done(f)) {
+            cc_parallel_index_take(h, i, &rs->tasks[rs->n], &rs->envs[rs->n]);
+            rs->n++;
+            /* re-examine slot i: it now holds the moved tail */
+            continue;
+        }
+        i++;
     }
-    h->nt--;
+    h->reap_at = h->nt > 0 ? i % h->nt : 0;
+}
+
+static void cc_parallel_reap_finish(CCParallel* h, CCParReapSet* rs) {
+    int i;
+    for (i = 0; i < rs->n; i++) {
+        cc_parallel_join(rs->tasks[i]);
+        cc_parallel_env_free(h, rs->envs[i]);
+    }
+    rs->n = 0;
 }
 
 static void cc_parallel_release_index(CCParallel* h) {
@@ -142,14 +251,29 @@ static int cc_parallel_grow(CCParallel* h, int need) {
     return 1;
 }
 
+CCResult_void_CCError cc_parallel_admit_ok(CCParallel* h) {
+    if (!h || !cc_parallel_live(h))
+        cc_parallel_die("admit on idle dest");
+    if (cc_atomic_load(&h->cancelled))
+        return cc_err_CCResult_void_CCError(
+            CC_ERROR(CC_ERR_CANCELLED, "admit after cancel"));
+    return cc_ok_CCResult_void_CCError();
+}
+
 void cc_parallel_admit(CCParallel* h, CCTask t, void* env) {
     CCTask* tasks;
     void** envs;
-    if (!h || !cc_parallel_live(h))
+    CCParReapSet rs;
+    if (!h)
         cc_parallel_die("admit on idle dest");
     if (t.kind == CC_TASK_KIND_INVALID)
         cc_parallel_die("admit denied");
-    cc_parallel_reap(h);
+    cc_par_lock(h);
+    /* Liveness is decided under the lock: wait sets joined under the same
+     * hold that saw nt == 0, so an admit cannot land on a joined dest. */
+    if (!cc_parallel_live(h))
+        cc_parallel_die("admit on idle dest");
+    cc_parallel_reap_take(h, &rs);
     if (!cc_parallel_grow(h, h->nt + 1))
         cc_parallel_die("admit: oom");
     tasks = cc_parallel_tasks(h);
@@ -157,7 +281,10 @@ void cc_parallel_admit(CCParallel* h, CCTask t, void* env) {
     tasks[h->nt] = t;
     envs[h->nt] = env;
     cc_parallel_attach(h, t);
+    cc_parallel_set_slot(t, h->nt);
     h->nt++;
+    cc_par_unlock(h);
+    cc_parallel_reap_finish(h, &rs);
 }
 
 void cc_parallel_wake_attached(CCParallel* h) {
@@ -165,12 +292,14 @@ void cc_parallel_wake_attached(CCParallel* h) {
     int i;
     if (!h)
         return;
+    cc_par_lock(h);
     tasks = cc_parallel_tasks(h);
     for (i = 0; i < h->nt; i++) {
         fiber_v2* f = cc_task_fiber_v2(tasks[i]);
         if (f)
             sched_v2_signal(f);
     }
+    cc_par_unlock(h);
 }
 
 int cc_parallel_current_cancelled(void) {
@@ -184,80 +313,40 @@ int cc_parallel_current_cancelled(void) {
     return cc_atomic_load(&h->cancelled) != 0;
 }
 
-#define CC_PAR_DENY_STACK 16
-
-#if defined(__TINYC__)
-#define cc_par_deny_n (cc_rt_tls_get()->par_deny_n)
-#define cc_par_deny_dest (cc_rt_tls_get()->par_deny_dest)
-#define cc_par_deny_flag (cc_rt_tls_get()->par_deny_flag)
-#else
-static __thread int cc_par_deny_n;
-static __thread CCParallel* cc_par_deny_dest[CC_PAR_DENY_STACK];
-static __thread unsigned char cc_par_deny_flag[CC_PAR_DENY_STACK];
-#endif
-
-void cc_parallel_deny_enter(CCParallel* dest) {
-#if defined(__TINYC__)
-    if (!cc_rt_tls_get())
+/* Denied-sibling stack lives in CCParTls (cc_sched.cch; block defined
+ * in scheduler.c). enter / note_denied / deny_leave are header inline;
+ * the dest pop loops, so it stays here. */
+void cc__par_deny_leave_dest(CCParTls* pt, CCParallel* dest) {
+    int i, n;
+    if (!pt)
+        pt = cc__par_tls();
+    if (!pt || !dest)
         return;
-#endif
-    if (cc_par_deny_n >= CC_PAR_DENY_STACK)
+    n = pt->deny_n;
+    if (n <= 0 || n > CC_PAR_DENY_STACK)
         return;
-    cc_par_deny_dest[cc_par_deny_n] = dest;
-    cc_par_deny_flag[cc_par_deny_n] = 0;
-    cc_par_deny_n++;
-}
-
-void cc_parallel_note_denied(void) {
-#if defined(__TINYC__)
-    if (!cc_rt_tls_get())
-        return;
-#endif
-    if (cc_par_deny_n <= 0)
-        return;
-    cc_par_deny_flag[cc_par_deny_n - 1] = 1;
-}
-
-void cc_parallel_deny_leave(void) {
-#if defined(__TINYC__)
-    if (!cc_rt_tls_get())
-        return;
-#endif
-    if (cc_par_deny_n <= 0)
-        return;
-    if (cc_par_deny_dest[cc_par_deny_n - 1] == NULL)
-        cc_par_deny_n--;
-}
-
-void cc_parallel_deny_leave_dest(CCParallel* dest) {
-    int i;
-#if defined(__TINYC__)
-    if (!cc_rt_tls_get())
-        return;
-#endif
-    if (!dest || cc_par_deny_n <= 0)
-        return;
-    for (i = cc_par_deny_n - 1; i >= 0; i--) {
-        if (cc_par_deny_dest[i] == dest) {
+    for (i = n - 1; i >= 0; i--) {
+        if (pt->deny_dest[i] == dest) {
             int k;
-            for (k = i; k < cc_par_deny_n - 1; k++) {
-                cc_par_deny_dest[k] = cc_par_deny_dest[k + 1];
-                cc_par_deny_flag[k] = cc_par_deny_flag[k + 1];
+            for (k = i; k < n - 1; k++) {
+                pt->deny_dest[k] = pt->deny_dest[k + 1];
+                pt->deny_flag[k] = pt->deny_flag[k + 1];
             }
-            cc_par_deny_n--;
+            pt->deny_n = n - 1;
             return;
         }
     }
 }
 
 int cc_parallel_denied_here(void) {
-#if defined(__TINYC__)
-    if (!cc_rt_tls_get())
+    CCParTls* pt = cc__par_tls();
+    int n;
+    if (!pt)
         return 0;
-#endif
-    if (cc_par_deny_n <= 0)
+    n = pt->deny_n;
+    if (n <= 0 || n > CC_PAR_DENY_STACK)
         return 0;
-    return cc_par_deny_flag[cc_par_deny_n - 1] != 0;
+    return pt->deny_flag[n - 1] != 0;
 }
 
 void cc_parallel_abort_if_denied_chan(const char* reason) {
@@ -335,6 +424,8 @@ static CCParallelLeaveHost* cc_parallel_leave_pack(CCParallel* h) {
         envs = cc_parallel_envs(h);
         for (i = 0; i < h->nt; i++) {
             fiber_v2* f = cc_task_fiber_v2(tasks[i]);
+            if (f)
+                sched_v2_fiber_set_par_slot(f, -1);
             if (f && f == self) {
                 cc_parallel_env_free(h, envs[i]);
                 envs[i] = NULL;
@@ -363,44 +454,64 @@ static CCParallelLeaveHost* cc_parallel_leave_pack(CCParallel* h) {
     return L;
 }
 
+void cc_parallel_invalidate(CCParallel* h) {
+    if (!h || !cc_parallel_live(h))
+        return;
+    (void)cc__parallel_cancel_tree(h);
+    (void)cc_parallel_wait(h);
+}
+
 CCResult_void_CCError cc_parallel_wait(CCParallel* h) {
     if (!h)
         return cc_err_CCResult_void_CCError(
             CC_ERROR(CC_ERR_INVALID_ARG, "cc_parallel_wait"));
     if (cc_atomic_load(&h->left))
         cc_parallel_die("wait after leave");
-    cc_parallel_deny_leave_dest(h);
-    if (cc_atomic_load(&h->joined))
+    cc_parallel_deny_leave_dest(cc__par_tls(), h);
+    /* wait is idempotent, and so is its answer: a dest that holds an
+     * error keeps reporting it (sequential-path plants join before the
+     * frame's wait; a second wait must not turn err into ok). */
+    if (cc_atomic_load(&h->joined)) {
+        if (cc_atomic_load(&h->fail))
+            return cc_err_CCResult_void_CCError(h->err);
         return cc_ok_CCResult_void_CCError();
+    }
     if (h->n) {
         CCResult_void_CCError wr = cc_nursery_wait_host(h->n);
         if (!wr.ok) return wr;
     }
-    /* The kick may still be admitting. Join the oldest once (join
-     * releases the fiber), drop that slot, then reap other finished
-     * siblings. A second join of the same CCTask parks on a recycled
-     * fiber — often this one. */
-    while (h->nt > 0) {
-        CCTask* tasks = cc_parallel_tasks(h);
-        void** envs = cc_parallel_envs(h);
-        fiber_v2* f = cc_task_fiber_v2(tasks[0]);
+    /* The kick may still be admitting. Take one slot (the last — O(1), the
+     * index is a set) out under the lock, then join it with the lock
+     * released; whoever holds a slot is the only one who joins it, so a
+     * concurrent admit's reap cannot join the same CCTask (a second join
+     * parks on a recycled fiber — often this one). Admits that land during
+     * the join are seen on the next pass. `joined` is set under the hold
+     * that saw nt == 0, so no admit can land on a joined dest. */
+    for (;;) {
+        CCTask t;
+        void* env;
+        fiber_v2* f;
         fiber_v2* self = sched_v2_current_fiber();
+        cc_par_lock(h);
+        if (h->nt == 0) {
+            cc_parallel_release_index(h);
+            cc_atomic_store(&h->joined, 1);
+            cc_par_unlock(h);
+            break;
+        }
+        cc_parallel_index_take(h, h->nt - 1, &t, &env);
+        cc_par_unlock(h);
+        f = cc_task_fiber_v2(t);
         if (f && f == self) {
-            cc_parallel_env_free(h, envs[0]);
-            cc_parallel_remove_at(h, 0);
+            cc_parallel_env_free(h, env);
             continue;
         }
-        cc_parallel_join(tasks[0]);
-        cc_parallel_env_free(h, envs[0]);
-        cc_parallel_remove_at(h, 0);
-        cc_parallel_reap(h);
+        cc_parallel_join(t);
+        cc_parallel_env_free(h, env);
     }
-    cc_parallel_release_index(h);
-    h->nt = 0;
     cc_parallel_close_list(h->closing, h->nclose);
     h->nclose = 0;
-    cc_atomic_store(&h->joined, 1);
-    if (h->fail)
+    if (cc_atomic_load(&h->fail))
         return cc_err_CCResult_void_CCError(h->err);
     return cc_ok_CCResult_void_CCError();
 }
@@ -450,9 +561,12 @@ void cc_parallel_leave1(CCParallel* h) {
         cc_parallel_die("double leave");
     if (!cc_parallel_live(h))
         cc_parallel_die("leave of idle dest");
-    cc_parallel_deny_leave_dest(h);
+    cc_parallel_deny_leave_dest(cc__par_tls(), h);
+    /* Snapshot and go dead under one hold: no admit lands between them. */
+    cc_par_lock(h);
     cc_atomic_store(&h->left, 1);
     L = cc_parallel_leave_pack(h);
+    cc_par_unlock(h);
     if (!L)
         cc_parallel_die("leave: out of memory");
     if (L->nt == 0) {

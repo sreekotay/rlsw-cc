@@ -1,6 +1,9 @@
 /*
  * Arena-backed array map: pow2 u32 probe index + dense (key, value) rows.
  *
+ * Frozen / deprecated as a public face: prefer Table::[K,V] (table.cch), which
+ * reuses this core. Keep ArrayMap for existing call sites; do not extend it.
+ *
  * Prefer this when values are wide — empty buckets cost 4 B instead of a full
  * key+value slot.  For tiny K/V, the inline open-addressing `map` (Jackson)
  * often has better locality.
@@ -20,6 +23,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <ccc/cc_arena.h>
+#include <ccc/std/map_forward.h>   /* the key hash / equality table */
 
 /* Sugar: ArrayMap::[K,V] / array_map_new::[K,V] / array_map_new_count::[K,V]. */
 #ifdef __CC_ARRAY_MAP
@@ -113,6 +117,8 @@ typedef struct CCArrayMapCore {
     size_t dense_cap;
     size_t bucket_mask; /* buckets_cap - 1; 0 ⇒ no table */
     size_t tomb_count;
+    size_t self_bytes;  /* bytes of the typed handle (sized release at destroy) */
+    size_t slot_bytes;  /* dense row pitch once known (sized release at destroy) */
 } CCArrayMapCore;
 
 static inline void *cc_array_map_core_slot(const CCArrayMapCore *m,
@@ -131,6 +137,7 @@ static inline int cc_array_map_core_reserve_dense(CCArrayMapCore *m,
     void *p;
     if (!m || !cc_arena_is_live(m->arena)) return -1;
     if (need <= m->dense_cap) return 0;
+    m->slot_bytes = k->slot_size;
     new_cap = m->dense_cap ? m->dense_cap : 8u;
     while (new_cap < need) {
         size_t next = (new_cap * 8u) / 5u;
@@ -138,27 +145,38 @@ static inline int cc_array_map_core_reserve_dense(CCArrayMapCore *m,
         new_cap = next;
     }
     {
+        /* Grow the rows first, then the bucket index, committing each
+         * as it lands: a failure on the second leaves the first already
+         * recorded (a moved block is released by realloc, so an
+         * uncommitted pointer would dangle). Capacity is raised only
+         * once both fit. */
         uint32_t *bp;
-        if (m->dense_bkt) {
-            bp = (uint32_t *)cc_arena_realloc(
-                m->arena, m->arena, m->dense_bkt,
-                m->dense_cap * sizeof(uint32_t), new_cap * sizeof(uint32_t),
-                _Alignof(uint32_t));
-        } else {
-            bp = (uint32_t *)cc_arena_alloc(m->arena, new_cap * sizeof(uint32_t),
-                                            _Alignof(uint32_t));
-        }
-        if (!bp) return -1;
+        size_t old_cap = m->dense_cap;
         if (m->dense) {
             p = cc_arena_realloc(m->arena, m->arena, m->dense,
-                                 m->dense_cap * k->slot_size,
+                                 old_cap * k->slot_size,
                                  new_cap * k->slot_size, k->slot_align);
         } else {
             p = cc_arena_alloc(m->arena, new_cap * k->slot_size, k->slot_align);
         }
         if (!p) return -1;
-        m->dense_bkt = bp;
         m->dense = p;
+        if (m->dense_bkt) {
+            bp = (uint32_t *)cc_arena_realloc(
+                m->arena, m->arena, m->dense_bkt,
+                old_cap * sizeof(uint32_t), new_cap * sizeof(uint32_t),
+                _Alignof(uint32_t));
+        } else {
+            bp = (uint32_t *)cc_arena_alloc(m->arena, new_cap * sizeof(uint32_t),
+                                            _Alignof(uint32_t));
+        }
+        if (!bp) {
+            /* Rows already hold new_cap slots; shrink the recorded reach
+             * back is not needed — dense_cap still says old_cap, so the
+             * extra rows are simply unused until the next reserve. */
+            return -1;
+        }
+        m->dense_bkt = bp;
         m->dense_cap = new_cap;
     }
     return 0;
@@ -196,13 +214,14 @@ static inline int cc_array_map_core_rehash(CCArrayMapCore *m,
             }
         }
         if (failed) {
-            (void)cc_arena_release(m->arena, nb);
+            (void)cc_arena_release_sized(m->arena, nb, new_bucket_cap * sizeof(uint32_t));
             if (new_bucket_cap > (SIZE_MAX / 2u)) return -1;
             new_bucket_cap *= 2u;
             continue;
         }
         if (m->buckets && cc_array_map_core_buckets_cap(m))
-            (void)cc_arena_release(m->arena, m->buckets);
+            (void)cc_arena_release_sized(m->arena, m->buckets,
+                                         cc_array_map_core_buckets_cap(m) * sizeof(uint32_t));
         m->buckets = nb;
         m->bucket_mask = mask;
         m->tomb_count = 0;
@@ -373,12 +392,21 @@ static inline void cc_array_map_core_clear(CCArrayMapCore *m) {
     if (m->buckets && bcap) cc__am_zero(m->buckets, bcap * sizeof(uint32_t));
 }
 
+/* Ends the map: every block goes back through a sized release, newest
+ * first so a tip pop can reclaim what it can. The caller's pointer names
+ * released storage afterwards. */
 static inline void cc_array_map_core_destroy(CCArrayMapCore *m) {
+    CCArena arena;
     if (!m || !cc_arena_is_live(m->arena)) return;
-    if (m->buckets) (void)cc_arena_release(m->arena, m->buckets);
-    if (m->dense) (void)cc_arena_release(m->arena, m->dense);
-    if (m->dense_bkt) (void)cc_arena_release(m->arena, m->dense_bkt);
-    (void)cc_arena_release(m->arena, m);
+    arena = m->arena;
+    if (m->dense_bkt)
+        (void)cc_arena_release_sized(arena, m->dense_bkt, m->dense_cap * sizeof(uint32_t));
+    if (m->dense)
+        (void)cc_arena_release_sized(arena, m->dense, m->dense_cap * m->slot_bytes);
+    if (m->buckets)
+        (void)cc_arena_release_sized(arena, m->buckets,
+                                     cc_array_map_core_buckets_cap(m) * sizeof(uint32_t));
+    (void)cc_arena_release_sized(arena, m, m->self_bytes);
 }
 
 static inline CCArrayMapCore *cc_array_map_core_init(CCArena arena,
@@ -396,6 +424,8 @@ static inline CCArrayMapCore *cc_array_map_core_init(CCArena arena,
     m->dense_cap = 0;
     m->bucket_mask = 0;
     m->tomb_count = 0;
+    m->self_bytes = self_size;
+    m->slot_bytes = 0;
     return m;
 }
 
@@ -436,7 +466,11 @@ static inline CCArrayMapCore *cc_array_map_core_init_count(CCArena arena,
         size_t dense_cap;                                                             \
         size_t bucket_mask; /* buckets_cap - 1; 0 ⇒ no table */                      \
         size_t tomb_count;                                                            \
+        size_t self_bytes;                                                            \
+        size_t slot_bytes;                                                            \
     } Name;                                                                           \
+    _Static_assert(offsetof(Name, slot_bytes) == offsetof(CCArrayMapCore, slot_bytes),\
+                   #Name " must match CCArrayMapCore through slot_bytes");            \
                                                                                       \
     static inline size_t Name##__hashv(const void *k) {                               \
         return (size_t)(HASH_FN(*(const K *)k));                                      \
@@ -578,58 +612,8 @@ static inline CCArrayMapCore *cc_array_map_core_init_count(CCArena arena,
 #include <string.h>
 #endif
                                  
-                                                  
-                                            
-                                                                        
-                                                                        
-                     
-                              
-              
-                              
-              
-               
-                   
-                                                                      
-                                    
-                                                            
-                                             
-                        
-     
-                                                                
-                                                                        
-                                
-                                                        
-                                                  
-                                              
-                                                              
-                                                        
-                                                 
-                                                                 
-                                                           
                                                                           
-                                                          
-                                                    
-                                                                          
-                                                          
-                                                    
-                                         
-                                                        
-                                                  
-                                                                         
-                                                                       
-                                                 
-                                                      
-                                                        
-                                                  
-            
-                                                              
-                                                        
-                     
-     
-                 
-                                  
-                                                                   
-                                    
+                                                                  
                   
                            
                                                          
@@ -637,20 +621,28 @@ static inline CCArrayMapCore *cc_array_map_core_init_count(CCArena arena,
                                        
  
      
-      
+                                    
                                                          
                                                      
+     
+                                                           
+                                                                 
+                                                             
+                                                         
+      
+                                                                                           
+                                                                                              
                                 
  
-                                                       
+                                                                                                                                         
                                                            
                                 
  
                                                                    
-                                                                  
+                                                                                                                
                                            
  
-                                                                 
+                                                                                                                                                             
       
           
  

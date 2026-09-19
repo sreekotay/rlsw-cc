@@ -37,12 +37,16 @@
 #include <ccc/cc_turnstile.h>
 #include "map_forward.h"
 #include "array_map.h"
+#include "table.h"
 #include "shard_map.h"
 #include "dir.h"
 #include "process.h"
 #include "exec.h"
 #include "async_io.h"
 #include "future.h"
+#ifndef CC_UFCS_SLIM
+#include "postlude.h"
+#endif
 
 #endif // CC_STD_PRELUDE_H
 

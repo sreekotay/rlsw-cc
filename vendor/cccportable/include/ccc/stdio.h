@@ -1,12 +1,13 @@
 /*
  * Console print + flipped UFCS stdio (`println`, `eprintln`, `CCStdio`, …).
  *
- *   CCStdio io@(a) @destroy;
+ * Scripts: driver predecls supply `stdin` (BufReader) and `arena`; use
+ *   stdin.read_line(&line) !> / stdin.read_all(arena) !> and naked println.
+ *
+ * Explicit CCStdio handle (`.ccs` or declared in a script):
+ *   CCStdio io@(arena) @destroy;
  *   char[:] in = io.read_all() !>;
- *   msg.println();                    // void ?>(CCPrintError) — bare discard ok
- *   "literal".println();
- *   @string(`n=${n}`, a).println();
- *   msg.fprintln(STDERR_FILENO);      // UFCS: data first, then fd
+ *   msg.println();
  *
  * Naked aliases (call position; sink-oriented for f*):
  *   println(msg);
@@ -31,6 +32,7 @@
 #include <ccc/cc_slice.h>
 #include <ccc/cc_type.h>
 #include <ccc/cc_io_error.h>
+#include <ccc/cc_print_error.h>
 #include <ccc/std/io.h>
 #include <ccc/std/slice.h>
 #include <ccc/std/string.h>
@@ -433,6 +435,84 @@ static inline CCResult_void_CCPrintError cc__eprintln_ucstr(const unsigned char 
 }
 static inline CCResult_void_CCPrintError cc__eprintln_scstr(const signed char *s) {
     return cc__eprintln_cstr((const char *)s);
+}
+
+/* The UFCS family spelling of the same arms. `us.println()` composes
+ * `cc_unsigned_char_println` from the receiver type the way `s.println()`
+ * composes `cc_char_println`; the _Generic arms above are the free-call
+ * surface and no name resolves to them. Both spellings, so a byte string
+ * reads the same whichever it is written as. */
+static inline CCResult_void_CCPrintError cc_const_unsigned_char_print(const unsigned char *s) {
+    return cc__print_ucstr(s);
+}
+static inline CCResult_void_CCPrintError cc_const_unsigned_char_println(const unsigned char *s) {
+    return cc__println_ucstr(s);
+}
+static inline CCResult_void_CCPrintError cc_const_unsigned_char_eprint(const unsigned char *s) {
+    return cc__eprint_ucstr(s);
+}
+static inline CCResult_void_CCPrintError cc_const_unsigned_char_eprintln(const unsigned char *s) {
+    return cc__eprintln_ucstr(s);
+}
+static inline CCResult_void_CCPrintError cc_const_unsigned_char_fprint(const unsigned char *s, int fd) {
+    return cc_const_char_fprint((const char *)s, fd);
+}
+static inline CCResult_void_CCPrintError cc_const_unsigned_char_fprintln(const unsigned char *s, int fd) {
+    return cc_const_char_fprintln((const char *)s, fd);
+}
+static inline CCResult_void_CCPrintError cc_unsigned_char_print(unsigned char *s) {
+    return cc_const_unsigned_char_print(s);
+}
+static inline CCResult_void_CCPrintError cc_unsigned_char_println(unsigned char *s) {
+    return cc_const_unsigned_char_println(s);
+}
+static inline CCResult_void_CCPrintError cc_unsigned_char_eprint(unsigned char *s) {
+    return cc_const_unsigned_char_eprint(s);
+}
+static inline CCResult_void_CCPrintError cc_unsigned_char_eprintln(unsigned char *s) {
+    return cc_const_unsigned_char_eprintln(s);
+}
+static inline CCResult_void_CCPrintError cc_unsigned_char_fprint(unsigned char *s, int fd) {
+    return cc_const_unsigned_char_fprint(s, fd);
+}
+static inline CCResult_void_CCPrintError cc_unsigned_char_fprintln(unsigned char *s, int fd) {
+    return cc_const_unsigned_char_fprintln(s, fd);
+}
+static inline CCResult_void_CCPrintError cc_const_signed_char_print(const signed char *s) {
+    return cc__print_scstr(s);
+}
+static inline CCResult_void_CCPrintError cc_const_signed_char_println(const signed char *s) {
+    return cc__println_scstr(s);
+}
+static inline CCResult_void_CCPrintError cc_const_signed_char_eprint(const signed char *s) {
+    return cc__eprint_scstr(s);
+}
+static inline CCResult_void_CCPrintError cc_const_signed_char_eprintln(const signed char *s) {
+    return cc__eprintln_scstr(s);
+}
+static inline CCResult_void_CCPrintError cc_const_signed_char_fprint(const signed char *s, int fd) {
+    return cc_const_char_fprint((const char *)s, fd);
+}
+static inline CCResult_void_CCPrintError cc_const_signed_char_fprintln(const signed char *s, int fd) {
+    return cc_const_char_fprintln((const char *)s, fd);
+}
+static inline CCResult_void_CCPrintError cc_signed_char_print(signed char *s) {
+    return cc_const_signed_char_print(s);
+}
+static inline CCResult_void_CCPrintError cc_signed_char_println(signed char *s) {
+    return cc_const_signed_char_println(s);
+}
+static inline CCResult_void_CCPrintError cc_signed_char_eprint(signed char *s) {
+    return cc_const_signed_char_eprint(s);
+}
+static inline CCResult_void_CCPrintError cc_signed_char_eprintln(signed char *s) {
+    return cc_const_signed_char_eprintln(s);
+}
+static inline CCResult_void_CCPrintError cc_signed_char_fprint(signed char *s, int fd) {
+    return cc_const_signed_char_fprint(s, fd);
+}
+static inline CCResult_void_CCPrintError cc_signed_char_fprintln(signed char *s, int fd) {
+    return cc_const_signed_char_fprintln(s, fd);
 }
 
 #define cc_print(x) _Generic((x), \

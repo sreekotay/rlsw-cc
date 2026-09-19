@@ -1,7 +1,7 @@
 /*
  * comptime.cch — the whole compile-time API in one include.
  *
- * `#include <ccc/comptime.h>` to write `@comptime` code: type reflection,
+ * `#include <ccc/comptime.cch>` to write `@comptime` code: type reflection,
  * generic instantiation, fragment/template emission, and user generic-factory
  * registration.  This is an umbrella that re-exports the individual comptime
  * headers so the API is discoverable and learned in one place; the sub-headers

@@ -153,7 +153,7 @@ static inline int cc_map_eq_slice_hdr(CCSliceHdr a, CCSliceHdr b) {
  * Parser-safe forward declarations for the cc_containers (`ccj_*`) surface that
  * the real CC_MAP_DECL_ARENA bodies (map_impl.cch) reference.
  *
- * Under CC_PARSER_MODE the full <ccc/cc_containers.h> (~9.7k lines) is gated
+ * Under CC_PARSER_MODE the full <ccc/cc_containers.cch> (~9.7k lines) is gated
  * out, but the stub-AST parse still needs these names declared so the *real*
  * inline Map methods parse identically in both modes — there is no longer a
  * separate parser-mode Map body to drift from the implementation.
@@ -203,8 +203,8 @@ size_t ccj_map_bucket_index_from_itr();
 
 /* map_impl defines CC_MAP_DECL_ARENA. Do not include it on the default
  * host-CCS path: that pulls cc_containers (string.h / stdlib.h) into
- * every TU. Parser mode needs the stub macro; shadow_lower host-cc
- * (SHADOW_HAVE_LIBTCC) still spells CC_MAP_DECL_ARENA in last-good.
+ * every TU. Parser mode needs the stub macro; a 0.3 pin seed, host-compiled
+ * with SHADOW_HAVE_LIBTCC, still spells CC_MAP_DECL_ARENA.
  * User Map TUs get the body from map.cch / emit-plan map.h. */
 #if defined(CC_PARSER_MODE) || defined(SHADOW_HAVE_LIBTCC)
 #include "map_impl.h"
@@ -218,49 +218,44 @@ size_t ccj_map_bucket_index_from_itr();
 #include <stdio.h>
 #include <string.h>
 #endif
+/* The hash and equality of a key type, keyed by its identifier-safe
+ * spelling (`long long` -> long_long, `Foo*` -> Fooptr). A key with no
+ * entry is a user key: its instance declares `cc_map_key_hash_<key>` and
+ * `cc_map_key_eq_<key>` for the user to define. */
+#define CC_MAP_HASH_int cc_map_hash_i32
+#define CC_MAP_EQ_int cc_map_eq_i32
+#define CC_MAP_HASH_CCSliceHdr cc_map_hash_slice_hdr
+#define CC_MAP_EQ_CCSliceHdr cc_map_eq_slice_hdr
+#define CC_MAP_HASH_CCSlicePacked cc_map_hash_slice_packed
+#define CC_MAP_EQ_CCSlicePacked cc_map_eq_slice_packed
+#define CC_MAP_HASH_CCSlice cc_map_hash_slice
+#define CC_MAP_EQ_CCSlice cc_map_eq_slice
+#define CC_MAP_HASH_charslice cc_map_hash_slice
+#define CC_MAP_EQ_charslice cc_map_eq_slice
+#define CC_MAP_HASH_int64_t cc_map_hash_u64
+#define CC_MAP_EQ_int64_t cc_map_eq_u64
+#define CC_MAP_HASH_uint64_t cc_map_hash_u64
+#define CC_MAP_EQ_uint64_t cc_map_eq_u64
+#define CC_MAP_HASH_size_t cc_map_hash_u64
+#define CC_MAP_EQ_size_t cc_map_eq_u64
+#define CC_MAP_HASH_ptrdiff_t cc_map_hash_u64
+#define CC_MAP_EQ_ptrdiff_t cc_map_eq_u64
+#define CC_MAP_HASH_intptr_t cc_map_hash_u64
+#define CC_MAP_EQ_intptr_t cc_map_eq_u64
+#define CC_MAP_HASH_uintptr_t cc_map_hash_u64
+#define CC_MAP_EQ_uintptr_t cc_map_eq_u64
+#define CC_MAP_HASH_long cc_map_hash_u64
+#define CC_MAP_EQ_long cc_map_eq_u64
+#define CC_MAP_HASH_long_long cc_map_hash_u64
+#define CC_MAP_EQ_long_long cc_map_eq_u64
+#define CC_MAP_HASH_unsigned_long cc_map_hash_u64
+#define CC_MAP_EQ_unsigned_long cc_map_eq_u64
+#define CC_MAP_HASH_unsigned_long_long cc_map_hash_u64
+#define CC_MAP_EQ_unsigned_long_long cc_map_eq_u64
+
                             
-                                                  
-                                                                        
-                                                                        
-                     
-                              
-              
-                              
-              
-               
-                                
-                                                        
-                                                  
-                                              
-                                                              
-                                                        
-                                                 
-                                                                 
-                                                           
-                                                                          
-                                                          
-                                                    
-                                                                          
-                                                          
-                                                    
-                                         
-                                                        
-                                                  
-                                                                         
                                                                        
-                                                 
-                                                      
                                                         
-                                                  
-            
-                                                              
-                                                        
-                     
-     
-                 
-                                  
-                                                                   
-                                    
                   
                            
                                                          
@@ -269,8 +264,16 @@ size_t ccj_map_bucket_index_from_itr();
  
      
                         
-      
+                                    
                                                          
+                                                     
+     
+                                                           
+                                                                 
+                                                             
+                                                         
+      
+                                                                                           
                                                            
                                 
  

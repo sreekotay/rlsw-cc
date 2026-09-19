@@ -226,11 +226,15 @@ static inline fiber_v2* cc__untag_v2_fiber_local(cc__fiber* f) {
     return (fiber_v2*)((uintptr_t)f & ~CC_FIBER_V2_TAG_LOCAL);
 }
 int    sched_v2_in_context(void);
+int    sched_v2_current_worker_id(void);
+int    sched_v2_live_workers(void);
+int    sched_v2_max_workers(void);
 fiber_v2* sched_v2_current_fiber(void);
 void   sched_v2_park(void);
 void   sched_v2_yield(void);
 void   sched_v2_set_park_reason(const char* reason);
 void   sched_v2_signal(fiber_v2* f);
+void   sched_v2_signal_local(fiber_v2* f);
 uint64_t sched_v2_fiber_publish_wait_ticket(fiber_v2* f);
 int      sched_v2_fiber_wait_ticket_matches(fiber_v2* f, uint64_t ticket);
 void*  sched_v2_current_result_buf(size_t size);
@@ -696,6 +700,14 @@ int cc__sched_current_worker_id(void) {
     return sched_v2_current_worker_id();
 }
 
+int cc__sched_worker_pool_size(void) {
+    return sched_v2_live_workers();
+}
+
+int cc__sched_worker_pool_cap(void) {
+    return sched_v2_max_workers();
+}
+
 /* V1 retired: cc__fiber_set_worker_affinity used to pin the current fiber
  * to a specific V1 worker for the duration of the next park.  V2 has no
  * equivalent — sysmon's orphan-and-replace can move work between threads at
@@ -1053,10 +1065,13 @@ void cc__fiber_suspend_until_ready(_Atomic int* flag, int expected,
     cc_external_wait_leave();
 }
 
+/* Cancel-aware park. This is an *internal* wait (channel dest-cancel,
+ * nursery cancel). Do not mark it external — that would exempt the fiber
+ * from the deadlock detector. I/O kqueue parks wrap with
+ * cc_external_wait_enter/leave. */
 int cc__fiber_suspend_until_ready_or_cancel(_Atomic int* flag, int expected,
                                             const char* reason, const char* file, int line) {
     (void)file; (void)line;
-    cc_external_wait_enter();
     CCNurseryHost* cur_nursery = cc__runtime_current_nursery();
     if (sched_v2_in_context()) {
         sched_v2_set_park_reason(reason);
@@ -1064,14 +1079,12 @@ int cc__fiber_suspend_until_ready_or_cancel(_Atomic int* flag, int expected,
             if ((cur_nursery && cc_nursery_is_cancelled_host(cur_nursery)) ||
                 cc_parallel_current_cancelled()) {
                 sched_v2_set_park_reason(NULL);
-                cc_external_wait_leave();
                 return ECANCELED;
             }
             sched_v2_park();
         }
         sched_v2_set_park_reason(NULL);
     }
-    cc_external_wait_leave();
     return 0;
 }
 
@@ -1091,7 +1104,6 @@ int cc__fiber_suspend_until_ready_or_cancel_until(_Atomic int* flag, int expecte
     (void)file; (void)line;
     if (!abs_deadline) return cc__fiber_suspend_until_ready_or_cancel(flag, expected, reason, file, line);
 
-    cc_external_wait_enter();
     CCNurseryHost* cur_nursery = cc__runtime_current_nursery();
     if (sched_v2_in_context()) {
         fiber_v2* self = sched_v2_current_fiber();
@@ -1100,12 +1112,10 @@ int cc__fiber_suspend_until_ready_or_cancel_until(_Atomic int* flag, int expecte
             if ((cur_nursery && cc_nursery_is_cancelled_host(cur_nursery)) ||
                 cc_parallel_current_cancelled()) {
                 sched_v2_set_park_reason(NULL);
-                cc_external_wait_leave();
                 return ECANCELED;
             }
             if (cc__fiber_deadline_expired(abs_deadline)) {
                 sched_v2_set_park_reason(NULL);
-                cc_external_wait_leave();
                 return ETIMEDOUT;
             }
             if (self) sched_v2_fiber_set_park_deadline(self, abs_deadline);
@@ -1114,7 +1124,6 @@ int cc__fiber_suspend_until_ready_or_cancel_until(_Atomic int* flag, int expecte
         }
         sched_v2_set_park_reason(NULL);
     }
-    cc_external_wait_leave();
     return 0;
 }
 
@@ -1192,6 +1201,13 @@ void cc__fiber_unpark(void* fiber_ptr) {
     cc__fiber_unpark_tagged(fiber_ptr, CC_FIBER_UNPARK_REASON_GENERIC);
 }
 
+void cc__fiber_unpark_prefer_local(void* fiber_ptr) {
+    if (!fiber_ptr) return;
+    if ((uintptr_t)fiber_ptr & 1) {
+        sched_v2_signal_local((fiber_v2*)((uintptr_t)fiber_ptr & ~(uintptr_t)1));
+        return;
+    }
+}
 
 void cc__fiber_unpark_channel_attrib(uint32_t attrib_flags) {
     /* V1 retired: the attribute flags steered V1 worker-pool wake heuristics
@@ -1236,25 +1252,26 @@ void cc__fiber_yield_global(void) {
     sched_yield();
 }
 
-/* Signal to the sysmon that the current worker is still alive and doing
-* productive work.  Call this from long-running tasks that do not yield
-* (e.g. CPU-bound pool tasks) to prevent the orphan-threshold detector
-* from treating the worker as "stuck" and spawning hybrid-promotion
-* threads unnecessarily. */
 /* Sleep for `ms` milliseconds.
  *
- * V1 had a dedicated fiber sleep queue drained by sysmon every ~250µs,
- * which avoided O(N) run-queue churn for many concurrent sleepers.  V2
- * has no equivalent yet: a sleeping V2 fiber currently blocks the worker
- * thread via nanosleep, and sysmon's orphan-and-replace mechanism spawns
- * a temp worker if the pool becomes fully blocked.  This is cheap and
- * correct for the small number of cc_sleep_ms callers in the codebase;
- * if a workload ever stresses concurrent fiber sleeps, a dedicated V2
- * timer park can be added in sched_v2.c and this shim rewired.  Until
- * then the nanosleep fallback is the one-and-only path — the legacy
- * fiber_task->sleep_deadline + YIELD_SLEEP trampoline handoff was V1-only
- * and is now dead code. */
+ * In a fiber: park with a deadline. The worker runs someone else;
+ * sysmon's expired-park walk signals when the clock is due. Resolution
+ * is the sysmon tick (V2_SYSMON_INTERVAL_MS). Cancel does not cut the
+ * sleep. Off-fiber: nanosleep the thread. */
 void cc__fiber_sleep_park(unsigned int ms) {
+    if (sched_v2_in_context()) {
+        struct timespec until;
+        clock_gettime(CLOCK_REALTIME, &until);
+        until.tv_sec += (time_t)(ms / 1000);
+        until.tv_nsec += (long)(ms % 1000) * 1000000L;
+        if (until.tv_nsec >= 1000000000L) {
+            until.tv_nsec -= 1000000000L;
+            until.tv_sec += 1;
+        }
+        (void)cc__fiber_park_if_until(NULL, 0, &until, "sleep",
+                                      __FILE__, __LINE__);
+        return;
+    }
     struct timespec ts = { .tv_sec = ms / 1000,
                            .tv_nsec = (long)(ms % 1000) * 1000000L };
     while (nanosleep(&ts, &ts) == -1 && errno == EINTR) {}

@@ -129,8 +129,10 @@ static void cc__net_disable_sigpipe_best_effort(int fd) {
 #endif
 
 static int cc__net_prepare_fiber_fd(int fd, uint8_t* flags) {
-    if (!cc__fiber_in_context()) return 0;
+    /* Already nonblock: skip cc__fiber_in_context() (mco_running trampoline).
+     * Dest-serve hits this on every read/write after the first prepare. */
     if (flags && (*flags & CC_NET_FLAG_NONBLOCK)) return 0;
+    if (!cc__fiber_in_context()) return 0;
     int err = cc__net_set_nonblocking(fd);
     if (err == 0 && flags) *flags |= CC_NET_FLAG_NONBLOCK;
     return err;
@@ -299,7 +301,10 @@ CCResult_CCListener_CCNetError cc_tcp_listen(CCSlice addr) {
         return cc_err_CCResult_CCListener_CCNetError(err);
     }
 
-    if (listen(fd, 128) < 0) {
+    /* Kernel SYN queue, not dest occupancy. The kernel clamps to its own
+     * somaxconn (128 on stock Darwin; 4096 on Linux 5.4+), so asking for
+     * the platform maximum never asks for less than it will grant. */
+    if (listen(fd, SOMAXCONN) < 0) {
         err = errno_to_net_error(errno);
         close(fd);
         return cc_err_CCResult_CCListener_CCNetError(err);
@@ -310,13 +315,68 @@ CCResult_CCListener_CCNetError cc_tcp_listen(CCSlice addr) {
     return cc_ok_CCResult_CCListener_CCNetError(ln);
 }
 
-CCResult_CCSocket_CCNetError cc_listener_accept(CCListener* ln) {
-    CCSocket sock = {.fd = -1, .flags = 0, .watcher = NULL};
-    int fiber_ctx = cc__fiber_in_context();
+/* Listener close is two-phase (see net.cch). `state` packs the closing bit
+ * with a count of fibers inside accept; whoever observes closing with the
+ * count at zero owns the teardown, so the fd/watcher are freed exactly once
+ * and never under a live accepter. */
+#define CC_LN_CLOSING 1
+#define CC_LN_ONE     2
 
-    if (!ln || ln->fd < 0) {
+static void cc__listener_teardown(CCListener* ln) {
+    if (ln->watcher) {
+        cc__io_watcher_destroy((cc__io_owned_watcher*)ln->watcher);
+        ln->watcher = NULL;
+    } else if (ln->fd >= 0) {
+        cc__io_wait_forget_fd(ln->fd);
+    }
+    if (ln->fd >= 0) {
+        close(ln->fd);
+        ln->fd = -1;
+    }
+}
+
+/* Returns 0 when admitted, nonzero when the listener is closing. */
+static int cc__listener_enter(CCListener* ln) {
+    int cur = atomic_load_explicit(&ln->state, memory_order_acquire);
+    while (1) {
+        if (cur & CC_LN_CLOSING) return 1;
+        if (atomic_compare_exchange_weak_explicit(&ln->state, &cur, cur + CC_LN_ONE,
+                                                  memory_order_acq_rel, memory_order_acquire))
+            return 0;
+    }
+}
+
+static void cc__listener_leave(CCListener* ln) {
+    int prev = atomic_fetch_sub_explicit(&ln->state, CC_LN_ONE, memory_order_acq_rel);
+    if ((prev & CC_LN_CLOSING) && (prev - CC_LN_ONE) == CC_LN_CLOSING) {
+        cc__listener_teardown(ln);
+    }
+}
+
+static CCResult_CCSocket_CCNetError cc__listener_accept_inner(CCListener* ln, int fiber_ctx);
+
+CCResult_CCSocket_CCNetError cc_listener_accept(CCListener* ln) {
+    if (!ln) return cc_err_CCResult_CCSocket_CCNetError(CC_NET_OTHER);
+    if (cc__listener_enter(ln) != 0) {
+        return cc_err_CCResult_CCSocket_CCNetError(CC_NET_CONNECTION_CLOSED);
+    }
+    if (ln->fd < 0) {
+        cc__listener_leave(ln);
         return cc_err_CCResult_CCSocket_CCNetError(CC_NET_OTHER);
     }
+    CCResult_CCSocket_CCNetError r = cc__listener_accept_inner(ln, cc__fiber_in_context());
+    /* A close that raced our last wait is reported as CLOSED, not as the
+     * EBADF/ECANCELED it surfaced as. */
+    if (cc_is_err(r) &&
+        (atomic_load_explicit(&ln->state, memory_order_acquire) & CC_LN_CLOSING)) {
+        r = cc_err_CCResult_CCSocket_CCNetError(CC_NET_CONNECTION_CLOSED);
+    }
+    cc__listener_leave(ln);
+    return r;
+}
+
+static CCResult_CCSocket_CCNetError cc__listener_accept_inner(CCListener* ln, int fiber_ctx) {
+    CCSocket sock = {.fd = -1, .flags = 0, .watcher = NULL};
 
     struct sockaddr_storage client_addr;
     socklen_t client_len = sizeof(client_addr);
@@ -326,6 +386,9 @@ CCResult_CCSocket_CCNetError cc_listener_accept(CCListener* ln) {
     }
 
     while (1) {
+        if (atomic_load_explicit(&ln->state, memory_order_acquire) & CC_LN_CLOSING) {
+            return cc_err_CCResult_CCSocket_CCNetError(CC_NET_CONNECTION_CLOSED);
+        }
         /* A blocking accept outside fiber context is still waiting on
          * outside-world progress, so classify just this wait site as external. */
         if (!fiber_ctx) cc_external_wait_enter();
@@ -345,8 +408,23 @@ CCResult_CCSocket_CCNetError cc_listener_accept(CCListener* ln) {
         }
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             cc__io_owned_watcher* watcher = cc__net_ensure_listener_watcher(ln);
-            int wait_err = watcher ? cc__io_watcher_wait(watcher, POLLIN)
-                                   : cc__io_wait_fd(ln->fd, POLLIN);
+            int wait_err;
+            if (watcher) {
+                wait_err = cc__io_watcher_wait(watcher, POLLIN);
+            } else {
+                /* No watcher (allocation failed): nothing for close to wake,
+                 * so poll in slices and re-read the closing bit ourselves. */
+                struct timespec slice;
+                clock_gettime(CLOCK_REALTIME, &slice);
+                slice.tv_nsec += 50 * 1000000L;
+                if (slice.tv_nsec >= 1000000000L) { slice.tv_sec++; slice.tv_nsec -= 1000000000L; }
+                wait_err = cc__io_wait_fd_deadline(ln->fd, POLLIN, &slice);
+                if (wait_err == ETIMEDOUT) wait_err = 0;
+            }
+            if (wait_err == ECANCELED ||
+                (atomic_load_explicit(&ln->state, memory_order_acquire) & CC_LN_CLOSING)) {
+                return cc_err_CCResult_CCSocket_CCNetError(CC_NET_CONNECTION_CLOSED);
+            }
             if (wait_err != 0) {
                 return cc_err_CCResult_CCSocket_CCNetError(errno_to_net_error(wait_err));
             }
@@ -377,15 +455,19 @@ void cc_listener_serve(CCListener* ln, CCNursery n, CCClosure1 on_conn) {
 
 void cc_listener_close(CCListener* ln) {
     if (!ln) return;
-    if (ln->watcher) {
-        cc__io_watcher_destroy((cc__io_owned_watcher*)ln->watcher);
-        ln->watcher = NULL;
-    } else if (ln->fd >= 0) {
-        cc__io_wait_forget_fd(ln->fd);
+    int prev = atomic_fetch_or_explicit(&ln->state, CC_LN_CLOSING, memory_order_acq_rel);
+    if ((prev & ~CC_LN_CLOSING) == 0) {
+        /* Nobody inside accept: this call owns the teardown. Also the path
+         * a second close / the @destroy hook takes — teardown is a no-op
+         * once fd == -1 and watcher == NULL. */
+        cc__listener_teardown(ln);
+        return;
     }
-    if (ln->fd >= 0) {
-        close(ln->fd);
-        ln->fd = -1;
+    /* Accepters are inside. Wake them; the last one out tears down. The
+     * watcher is only ever created by an accepter, which is admitted, so
+     * it cannot appear or vanish under us here. */
+    if (ln->watcher) {
+        cc__io_watcher_cancel_waiters((cc__io_owned_watcher*)ln->watcher);
     }
 }
 
@@ -528,15 +610,51 @@ CCResult_size_t_CCIoError cc_socket_write_deadline(CCSocket* sock,
 
     while (1) {
         ssize_t n = send(sock->fd, data, len, CC__NET_SEND_FLAGS);
+        int nobufs;
         if (n >= 0) {
             return cc_ok_CCResult_size_t_CCIoError((size_t)n);
         }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        /* ENOBUFS (BSD / Darwin): the kernel could not get an mbuf for this
+         * send. The socket is still writable, so it is a transient like
+         * EAGAIN, not a peer condition. Retry after the writable wait (which
+         * honors the deadline) plus a short park, since the fd reports
+         * POLLOUT immediately and a bare retry would spin on the pool.
+         *
+         * OPEN — BACKPRESSURE POLICY, NOT SETTLED. This keeps every sender
+         * alive and lets them all thrash the pool; at c=1000 x 10MB on
+         * loopback that halves aggregate bytes versus a server that drops
+         * a third of its clients on the first ENOBUFS and serves the rest
+         * fast (the pre-retry runtime did exactly that, by accident). The
+         * 1ms park is a first cut (sysmon expiry is ~250us; yield-first
+         * measured worse). Bounding how many fibers are in send() at once
+         * — here, or in the caller — is the real fix. See TODO: ENOBUFS. */
+        nobufs = errno == ENOBUFS;
+        if (nobufs || errno == EAGAIN || errno == EWOULDBLOCK) {
             cc__io_owned_watcher* watcher = cc__net_ensure_socket_watcher(sock);
             int wait_err = watcher ? cc__io_watcher_wait_deadline(watcher, POLLOUT, abs_deadline)
                                    : cc__io_wait_fd_deadline(sock->fd, POLLOUT, abs_deadline);
             if (wait_err != 0) {
                 return cc_err_CCResult_size_t_CCIoError(errno_to_io_error(wait_err));
+            }
+            if (nobufs) {
+                /* Park the fiber, not the worker (cc_sleep_ms would
+                 * nanosleep the thread). Sysmon expires the deadline. */
+                struct timespec until;
+                clock_gettime(CLOCK_REALTIME, &until);
+                until.tv_nsec += 1000000L;
+                if (until.tv_nsec >= 1000000000L) {
+                    until.tv_nsec -= 1000000000L;
+                    until.tv_sec += 1;
+                }
+                if (abs_deadline &&
+                    (abs_deadline->tv_sec < until.tv_sec ||
+                     (abs_deadline->tv_sec == until.tv_sec &&
+                      abs_deadline->tv_nsec < until.tv_nsec)))
+                    until = *abs_deadline;
+                if (cc__fiber_in_context())
+                    (void)CC_FIBER_PARK_IF_UNTIL(NULL, 0, &until, "send_enobufs");
+                else
+                    cc_sleep_ms(1); /* a thread: there is no one to park */
             }
             continue;
         }

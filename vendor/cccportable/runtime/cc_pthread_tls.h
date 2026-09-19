@@ -15,6 +15,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#include <ccc/cc_sched.h> /* CCParTls */
+
 #ifndef CC_TLS_WAKE_BATCH_SIZE
 #define CC_TLS_WAKE_BATCH_SIZE 32
 #endif
@@ -32,20 +34,19 @@ typedef struct cc_rt_tls {
     uint64_t v2_my_generation;
     void* v2_current_fiber;  /* fiber_v2* */
     uint64_t v2_dispatch_seq;
+    int v2_in_worklet;
+    int v2_noblock_depth;
+    void* v2_nb;             /* cc_nb_stack* (noblock share of the root) */
     unsigned deadlock_suppress_depth;
     unsigned external_wait_depth;
     cc_rt_tls_wake_batch wake_batch;
     char task_v2_result[48];
     void* excl_ring;         /* cc__excl_evt_ring_t* */
     void* env_pools;         /* closure.c CCEnvPools* (heap, process-lived) */
-    uint64_t par_denials;
-    uint64_t par_spawn_calls;
-    uint32_t par_tick;
+    CCParTls par;            /* @parallel gate block (cc__par_tls) */
     void* par_site_fn;
     void* par_site;          /* cc_par_site* */
-    int par_deny_n;
-    void* par_deny_dest[16];
-    unsigned char par_deny_flag[16];
+    void* par_sampling;     /* cc_par_site* currently wrapped for a sample */
 } cc_rt_tls;
 
 static pthread_key_t cc_rt_tls_key;

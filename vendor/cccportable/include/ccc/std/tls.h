@@ -1,6 +1,6 @@
 /*
  * Concurrent-C TLS Support
- * <std/tls.h>
+ * <std/tls.cch>
  *
  * TLS client/server wrapping using BearSSL.
  * Provides Duplex-compatible encrypted connections.
@@ -103,6 +103,25 @@ CCTlsConn cc_tls_accept(CCSocket sock, CCTlsServerConfig cfg,
                          void* iobuf, size_t iobuf_len,
                          CCArena info_arena, CCNetError* out_err);
 
+/* Start server TLS without completing the handshake. Socket stays
+ * nonblocking. Pump with cc_tls_handshake_step until DONE. */
+CCTlsConn cc_tls_server_start(CCSocket sock, CCTlsServerConfig cfg,
+                              void* iobuf, size_t iobuf_len,
+                              CCNetError* out_err);
+
+/* Handshake step result for poll-driven TLS. */
+typedef enum CCTlsHs {
+    CC_TLS_HS_DONE = 0,
+    CC_TLS_HS_WANT_READ = 1,
+    CC_TLS_HS_WANT_WRITE = 2,
+    CC_TLS_HS_FAIL = -1,
+} CCTlsHs;
+
+/* One nonblocking handshake pump. Never select()-waits. */
+CCTlsHs cc_tls_handshake_step(CCTlsConn* conn, CCNetError* out_err);
+
+int cc_tls_is_ready(const CCTlsConn* conn);
+
 /* Async variant */
 /* @async CCTlsConn cc_tls_accept_async(...); */
 
@@ -119,6 +138,20 @@ CCSlice cc_tls_read(CCTlsConn* conn, CCArena arena, size_t max_bytes, CCNetError
 /* Write data (encrypted automatically) */
 size_t cc_tls_write(CCTlsConn* conn, const char* data, size_t len, CCNetError* out_err);
 
+/* One non-blocking write shot. Ok bytes accepted into the engine (may be
+ * short). 0 + CC_NET_OK means would-block; dest maps that to CC_IO_BUSY.
+ * Accepted count and record-layer drain are independent: after Ok(n) the
+ * engine may still hold BR_SSL_SENDREC bytes (see pending_out / flush_step). */
+size_t cc_tls_try_write(CCTlsConn* conn, const char* data, size_t len,
+                        CCNetError* out_err);
+
+/* 1 if the engine still has ciphertext waiting for the socket. */
+int cc_tls_pending_out(const CCTlsConn* conn);
+
+/* One non-blocking SENDREC pump. 1 = progress, 0 = would-block / idle,
+ * -1 = error (*out_err set). Does not accept application plaintext. */
+int cc_tls_flush_step(CCTlsConn* conn, CCNetError* out_err);
+
 /* Async write */
 /* @async size_t cc_tls_write_async(CCTlsConn* conn, const char* data, size_t len, CCNetError* out_err); */
 
@@ -134,6 +167,16 @@ const CCTlsInfo* cc_tls_info(const CCTlsConn* conn);
 /* ============================================================================
  * Certificate Loading (helpers)
  * ============================================================================ */
+
+/* Load PEM certificate chain + private key for subsequent cc_tls_accept
+ * calls. Process-wide; call once at startup. Returns 0 on success. */
+int cc_tls_server_load(const char *cert_path, const char *key_path);
+void cc_tls_server_unload(void);
+
+/* 1 when the runtime was built with BearSSL behind it. Without it every
+ * connection call answers with a TLS error and the server materials do
+ * not load: `make bearssl` at the repository root, then `make -C cc`. */
+int cc_tls_available(void);
 
 /* Load certificate chain from PEM file.
  * Returns opaque handle for use in config. */

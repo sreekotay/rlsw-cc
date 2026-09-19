@@ -61,7 +61,7 @@ int cc_external_wait_active(void);
 
 // Forward declarations for runtime handles.
 typedef struct CCChan CCChan;
-/* CCTask is defined in <ccc/std/task.h> as a value type */
+/* CCTask is defined in <ccc/std/task.cch> as a value type */
 
 /* cc_move is transfer: copy, then leave the source empty so generated
    drop / variant transition / @destroy do not still own. User use after

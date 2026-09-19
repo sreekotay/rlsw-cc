@@ -8,7 +8,9 @@
  * `.wait()` and `.leave()`. `h.leave()` consumes the handle without
  * joining (OPEN → LEFT); leftover runs at EMPTY on the LEFT path
  * only (`h.leave(ctx, finish)`). Mixing wait and leave is a
- * programming error. UFCS is the surface (`h.wait()` is
+ * programming error. `@destroy` waits (nursery law). It does not
+ * cancel. `h.invalidate()` cancels the tree, then waits. Idle,
+ * joined, or left is a no-op. UFCS is the surface (`h.wait()` is
  * `cc_parallel_wait(h)`).
  * A void host unwraps in place: `h.wait() !>(e) { (void)e; };`.
  * `.cancel()` is bool !>(CCIoError): Ok(true) means this call
@@ -25,11 +27,15 @@
  * call's transition). The construct honors `paused` at the seams
  * it emits: thunk entry, the next `@parallel for` half, the next
  * leaf iteration. `cc_parallel_honor(h)` yields while paused.
- * Cancel is a mark: it does not skip a thunk, and it unsticks a
- * paused honor. A body still polls if it cares mid-arm. `.wait()`
- * does not resume. Cancel wakes parks on fibers attached to the
- * dest (channel send/recv, exclusive wait). Pause does not complete
- * those parks. Wait-for dest is live during enter; the construct
+ * Dest-live workers do not run on the caller: spawn failure or env
+ * oom is `cc_parallel_die`. `#pragma(@parallel) off` is the sequential
+ * dest-live test. Cancel is a mark: it stops admit. `n.spawn` and dest-attach after
+ * cancel fail `CC_ERR_CANCELLED` (enclosing `@errhandler`; dest-attach
+ * is still a statement, no `!>` in source). It does not skip a thunk,
+ * and it unsticks a paused honor. Already-admitted stay; a body still
+ * polls if it cares mid-arm. `.wait()` does not resume. Cancel wakes
+ * parks on fibers attached to the dest (channel send/recv, exclusive
+ * wait). Pause does not complete those parks. Wait-for dest is live during enter; the construct
  * joins before the statement ends (`h.n` is the nursery). Honor at
  * enter, ticket entry, and after `@stage` wait before the block.
  * `.adopt(child)` links a cancel tree: parent cancel walks children
@@ -67,10 +73,18 @@ typedef struct CCParallel {
     cc_atomic_int paused;
     cc_atomic_int cancelled;
     cc_atomic_int left;
-    int fail;
+    /* Guards the live index (tasks / envs / nt / ncap / xtasks / xenvs).
+     * Admit may come from any fiber while another fiber is in wait. */
+    cc_atomic_int lock;
+    /* Dest error. 0 → 1 once, by whoever records first; `err` is that
+     * error and is written before the flag. wait() returns it after the
+     * join. */
+    cc_atomic_int fail;
+    cc_atomic_int fail_claim;
     int fin;
     int nt;
     int ncap;
+    int reap_at; /* rotating cursor: where the next admit's reap scan starts */
     int nch;
     int nclose;
     CCError err;
@@ -118,15 +132,24 @@ static inline bool cc_parallel_live(const CCParallel* h) {
 }
 
 CCResult_void_CCError cc_parallel_wait(CCParallel* h);
+void cc_parallel_invalidate(CCParallel* h);
+
+/* `@destroy`: wait, no cancel. Join error is not dropped. */
+static inline void cc_parallel_destroy(CCParallel* h) {
+    CCResult_void_CCError w;
+    if (!h || !cc_parallel_live(h))
+        return;
+    w = cc_parallel_wait(h);
+    if (!w.ok) cc_error_exit(w.u.error);
+}
 void cc_parallel_attach(CCParallel* h, CCTask t);
+CCResult_void_CCError cc_parallel_admit_ok(CCParallel* h);
 void cc_parallel_admit(CCParallel* h, CCTask t, void* env);
 void cc_parallel_die(const char* msg);
 void cc_parallel_wake_attached(CCParallel* h);
 int cc_parallel_current_cancelled(void);
-void cc_parallel_deny_enter(CCParallel* dest);
-void cc_parallel_note_denied(void);
-void cc_parallel_deny_leave(void);
-void cc_parallel_deny_leave_dest(CCParallel* dest);
+/* Denied-sibling stack helpers (cc_parallel_deny_enter / note_denied /
+ * deny_leave / deny_leave_dest) take the CCParTls block: cc_sched.cch. */
 int cc_parallel_denied_here(void);
 void cc_parallel_abort_if_denied_chan(const char* reason);
 CCResult_void_CCError cc_parallel_close(CCParallel* h, CCChanTx tx);
@@ -187,6 +210,22 @@ static inline CCResult_bool_CCIoError cc_parallel_cancel(CCParallel* h) {
     if (!h)
         return cc_err_CCResult_bool_CCIoError(cc_io_error(CC_IO_INVALID_ARGUMENT));
     return cc_ok_CCResult_bool_CCIoError(cc__parallel_cancel_tree(h) != 0);
+}
+
+/* Record the dest error. First wins: true when this call recorded `e`;
+ * false when the dest already holds an error, is idle, or is joined.
+ * Does not cancel and does not stop admits. wait() returns `err` after
+ * the join: the claim takes `fail_claim`, writes `err`, then publishes
+ * `fail`, so a waiter that sees `fail` sees the whole error. */
+static inline bool cc_parallel_fail(CCParallel* h, CCError e) {
+    int z = 0;
+    if (!h || !cc_parallel_live(h))
+        return false;
+    if (!cc_atomic_cas(&h->fail_claim, &z, 1))
+        return false;
+    h->err = e;
+    cc_atomic_store(&h->fail, 1);
+    return true;
 }
 
 static inline CCResult_void_CCError cc__parallel_adopt(CCParallel* parent,

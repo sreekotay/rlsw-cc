@@ -1,6 +1,6 @@
 /*
  * Concurrent-C DNS Resolution
- * <std/dns.h>
+ * <std/dns.cch>
  *
  * Async DNS resolution. Uses system resolver by default.
  */

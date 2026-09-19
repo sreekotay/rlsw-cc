@@ -43,16 +43,126 @@ enum {
  *
  * Lookup is a minimal perfect hash: hash(key) -> slot -> verify -> &value.
  * `flags` selects exact or ASCII case-insensitive matching.  Value fields must
- * be POD integers or enums; a field of any other kind (pointer, float, nested
- * aggregate) is a keyed comptime error, as is a value layout the model cannot
- * reproduce, a duplicate key, a key needing C-string escaping, or a failure to
- * construct a perfect hash.
+ * be POD integers or enums, or structs of those (a `@variant` with void arms
+ * is one: its tag); a field of any other kind (pointer, float) is a keyed
+ * comptime error, as is a value layout the model cannot reproduce, a
+ * duplicate key, a key needing C-string escaping, or a failure to construct
+ * a perfect hash.
  *
  * In a `.cch` header: lower_header blanks the `@comptime { }` block so the
  * `.h` stays host-C. Forward-declare `<name>_get` for in-header callers; the
  * including TU harvests and re-runs the block
  * (`cc_harvest_local_header_comptime_blocks`) so the definition is spliced
  * into the merged `.c`. Proof: `tests/comptime_static_map_in_header_smoke`. */
+/* One scalar of a value struct, flattened: where it is, how wide, whether
+ * signed, and the braces around it when it opens or closes a nested
+ * struct in the initializer. */
+typedef struct CCStaticMapLeaf {
+    int off;
+    int size;
+    int sign;
+    int open;
+    int close;
+} CCStaticMapLeaf;
+
+/* The leaves of `type`, appended at `base_off`; the struct's size and
+ * alignment out. 0 with `emsg` filled when a field is not modeled. */
+                                                                    
+                                                                           
+                                                                   
+                                                                
+                                          
+                   
+                      
+          
+                  
+                                                                                                      
+                 
+     
+                              
+                       
+                      
+                      
+                                            
+                                                                  
+                                                              
+                
+                  
+                                                
+                                                                                                   
+                                                                                                      
+                  
+         
+                                                                                                           
+                                                                                                           
+                                                                                                           
+                                                                                                           
+                                                                                                           
+                                                                  
+                                                                                                          
+                                                                                                           
+                                                                                                           
+                                                                                                           
+                                                             
+                                                                                                          
+                                                                                                           
+                                                                                                           
+                                                                                                           
+                                                                
+                                                                                                          
+                                                                                                           
+                                                                                                                
+                                                                                                           
+                                                                                                           
+                                                                                                           
+                                                                                                           
+                                                                
+                                                                            
+                                
+                              
+                           
+                                                                                                  
+                         
+                              
+                                                                                                                
+                         
+             
+                                                                           
+             
+                      
+                                                                                    
+             
+                                    
+                                      
+                            
+                                                             
+                     
+         
+                  
+                                                                                                           
+                                 
+                     
+         
+                        
+                                                                                              
+                     
+         
+                                                         
+                                               
+                             
+                               
+                            
+                             
+               
+                          
+                                           
+     
+                                                                   
+                    
+                           
+             
+ 
+
                                            
                                                  
                                               
@@ -73,12 +183,10 @@ enum {
                           
                    
 
-                                                                           
-                        
-                   
+                                                                         
+                                        
+                               
                     
-                   
-                     
 
                                                              
                                                                                   
@@ -86,81 +194,23 @@ enum {
                
      
 
-                                                                             
-                                                                             
-                                                                              
                                                                            
+                                                                             
+                                                                                
+                                          
      
-                                                    
+                           
+                   
                        
-                          
-                                 
-                                        
-                                                                                   
-                                 
-                                
+                                                                                    
+                                                       
+                                                                                 
                    
          
-                                          
-                          
-                          
-                                                
-                                                                                         
-                                                                             
-
-                                                                       
-                    
-                      
-                                                    
-                                                                                                       
-                                                                                                          
-                      
-             
-
-                                                                                                               
-                                                                                                               
-                                                                                                               
-                                                                                                               
-                                                                                                               
-                                                                      
-                                                                                                              
-                                                                                                               
-                                                                                                               
-                                                                                                               
-                                                                 
-                                                                                                              
-                                                                                                               
-                                                                                                               
-                                                                                                               
-                                                                    
-                                                                                                              
-                                                                                                               
-                                                                                                                    
-                                                                                                               
-                                                                                                               
-                                                                                                               
-                                                                                                               
-
-                      
-                                            
-                                                                                               
-                                         
                                     
-                       
-             
-                                                             
-                                
-                           
-                            
-                              
-                                               
-         
-                                                                       
-                     
-                                
                                         
                                                                                                    
-                                                  
+                                                      
                                 
                    
          
@@ -243,24 +293,28 @@ enum {
                                  
                                  
               
+                           
                                                                             
                                        
                                      
-                                                                                         
+                                                                                              
                                      
+                  
+                                                   
+                                                                          
+                                                                                                
+                                 
                                               
-                           
-                                         
                             
                                                             
                                                   
                                  
-                                                                   
-                                                
+                                                                     
                     
-                                                                    
-                                                
+                                                                      
              
+                                                                                                 
+                           
          
                                                           
      
