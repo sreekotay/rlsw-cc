@@ -14,14 +14,14 @@ Drop this directory into a project (or FetchContent / submodule it) and overlay 
 
 ## Performance vs stock rlsw 1.5
 
-Apple Silicon (M-series), maze scene, 12 frames, adaptive on, **hstripe×64** parallel fill, quality 2. Measured with [rayrender](https://github.com/sreekotay/rayrender) `./tools/parity.sh`:
+Apple Silicon (M-series), maze scene, 12 frames, adaptive on, **hstripe** parallel fill, quality 2. Measured with [rayrender](https://github.com/sreekotay/rayrender) `./tools/parity.sh`:
 
-| Mode | Window (draw FB) | Filter | vs stock |
-| --- | --- | --- | ---: |
-| bench | 1280×720 (2560×1440) | point | **~1.6–1.8×** |
-| bench | 1280×720 (2560×1440) | bilinear | **~2.0–2.2×** |
-| retina | 2560×1440 (5120×2880) | point | **~1.7–1.9×** |
-| retina | 2560×1440 (5120×2880) | bilinear | **~2.3–2.4×** |
+| Mode | Window (draw FB) | Filter | stock ms | cc ms | vs stock |
+| --- | --- | --- | ---: | ---: | ---: |
+| bench | 1280×720 (2560×1440) | point | 328 | 167 | **1.96×** |
+| bench | 1280×720 (2560×1440) | bilinear | 448 | 182 | **2.46×** |
+| retina | 2560×1440 (5120×2880) | point | 1188 | 564 | **2.11×** |
+| retina | 2560×1440 (5120×2880) | bilinear | 1677 | 610 | **2.75×** |
 
 Checksums intentionally DIFF vs stock after bary-plane / integer-span work; cc hashes are stable across SEQ/PAR hstripe (e.g. bench point `0x2e13ab57d738130a`).
 
