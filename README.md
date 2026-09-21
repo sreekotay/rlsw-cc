@@ -33,18 +33,14 @@ FetchContent_Declare(raylib
 FetchContent_MakeAvailable(raylib)
 
 # Local checkout, or FetchContent this repo the same way:
-add_subdirectory(path/to/rlsw-cc)   # defines rlsw_cc_overlay_raylib + rlsw_cc
+add_subdirectory(path/to/rlsw-cc)
 rlsw_cc_overlay_raylib(raylib "${raylib_SOURCE_DIR}")
-# ↑ copies rlsw.h *and* (default) patches RGFW soft present
 
 add_executable(my_app ...)
 target_link_libraries(my_app PRIVATE raylib rlsw_cc)
 ```
 
-`rlsw_cc_overlay_raylib` does two things by default:
-
-1. Overlay `include/rlsw.h` (+ span kernels) onto `raylib/src/external/`
-2. **Soft present** — patch `SwapScreenBuffer` for a stable/fast desktop blit (macOS: staged CGImage; Linux/Win: BGRA-aligned RGFW). Disable with `-DRLSW_CC_SOFT_PRESENT=OFF`.
+That call overlays `include/rlsw.h` (+ span kernels) onto `raylib/src/external/`. It also enables **soft present** by default (see next section).
 
 Optional at runtime (fill-heavy 3D benefits most):
 
@@ -53,17 +49,44 @@ swSetBinSize(0, 64);          // hstripe × 64 (parallel stripe fill)
 swSetAdaptiveAffine(true);    // vary 1/w block size
 ```
 
-### What this does *not* include
+### Limits
 
 - **GPU shaders / modern GL** — software path is GL 1.1-style rlsw.
 
-### Options
+### CMake options
 
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `RLSW_CC_PARALLEL` | `ON` | `@parallel` stripes via `vendor/cccportable` (no `ccc`) |
 | `RLSW_CC_USE_STOCK` | `OFF` | Overlay `stock/rlsw.h` instead of the fork |
-| `RLSW_CC_SOFT_PRESENT` | `ON` | Patch RGFW present (macOS CGImage staging / BGRA blit) |
+| `RLSW_CC_SOFT_PRESENT` | `ON` | Patch RGFW present (see Soft present) |
+
+## Soft present
+
+Separate from the raster fork: how the finished CPU framebuffer reaches the window.
+
+Stock raylib RGFW software swap on desktop often does a full-frame channel scramble and (on macOS) an expensive NSImage/CMS path. Soft present patches that swap at configure time:
+
+| Platform | What it does |
+| --- | --- |
+| **macOS** | `swGetColorBuffer` → Y-flip into a **triple-buffered** staging surface → `CGImage` → `CALayer` (avoids racing Core Animation on the live FB) |
+| **Linux / Windows** | `swReadPixels` into a **BGRA** surface that matches native RGFW blit (no extra R↔B pass when formats align) |
+
+Sources live under `cmake/overlays/` (`apply_sw_present.py`, `macos_sw_present.c`). Applied automatically by `rlsw_cc_overlay_raylib()`.
+
+```cmake
+# default — included in the overlay
+rlsw_cc_overlay_raylib(raylib "${raylib_SOURCE_DIR}")
+
+# or turn it off (stock RGFW blit only)
+cmake -DRLSW_CC_SOFT_PRESENT=OFF ...
+```
+
+If you build a second raylib target that shares the same patched sources (e.g. a stock referee), also:
+
+```cmake
+rlsw_cc_soft_present_attach(raylib_stock)   # Apple: link macos_sw_present.c
+```
 
 ## Performance vs stock rlsw 1.5
 
@@ -87,8 +110,8 @@ Checksums intentionally DIFF vs stock after bary-plane / integer-span work; cc b
 | `vendor/cccportable/` | Host-C headers + runtime (`ccc portable-install`) |
 | `stock/rlsw.h` | Untouched rlsw 1.5 referee |
 | `src/fill/*.ccs` | Concurrent-C sources (authors only) |
-| `CMakeLists.txt` | Overlay helper + `rlsw_cc` library + soft present |
-| `cmake/overlays/` | RGFW SwapScreenBuffer patch + macOS CGImage present |
+| `CMakeLists.txt` | Overlay helper + `rlsw_cc` library |
+| `cmake/overlays/` | Soft present (RGFW swap patch + macOS CGImage) |
 
 ## Authors (have `ccc`)
 
