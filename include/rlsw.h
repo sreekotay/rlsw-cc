@@ -3253,6 +3253,16 @@ static inline bool sw_clipspace_trivial_reject(const sw_vertex_t *v, int n)
     return acc != 0;
 }
 
+/* All verts inside clip (+ scissor) volume — skip Sutherland–Hodgman entirely. */
+static inline bool sw_clipspace_trivial_accept(const sw_vertex_t *v, int n)
+{
+    for (int i = 0; i < n; i++)
+    {
+        if (sw_clip_outcode(v[i].position) != 0) return false;
+    }
+    return true;
+}
+
 static void sw_tri_setup_planes(sw_tri_planes_t *pl, const sw_vertex_t *p1, const sw_vertex_t *p2, const sw_vertex_t *p3)
 {
     pl->valid = 0;
@@ -3421,6 +3431,10 @@ static bool sw_polygon_clip(sw_vertex_t polygon[SW_MAX_CLIPPED_POLYGON_VERTICES]
         *vertexCounter = 0;
         return false;
     }
+
+    /* Fully inside: keep verts as-is, still need project/rcpW downstream. */
+    if (sw_clipspace_trivial_accept(polygon, n))
+        return true;
 
     #define CLIP_AGAINST_PLANE(FUNC_CLIP)                       \
     {                                                           \
@@ -4146,12 +4160,27 @@ static sw_bin_tri_t *SW_BIN_TRIS = NULL;
 static int SW_BIN_COUNT = 0;
 static int SW_BIN_CAP = 0;
 
+/* Per-stripe/column index built at flush (1D stripes only). Avoids O(nTris×nStripes) scans. */
+static int *SW_BIN_CELL_OFF = NULL;   /* length ncells+1 */
+static int *SW_BIN_CELL_IDX = NULL;   /* flattened tri indices */
+static int SW_BIN_CELL_NCELLS = 0;
+static int SW_BIN_CELL_CAP_OFF = 0;
+static int SW_BIN_CELL_CAP_IDX = 0;
+static int SW_BIN_CELL_AXIS = 0;      /* 0 = row (hstripe, cell=ty); 1 = col (vstripe, cell=tx) */
+
 static void sw_bin_free(void)
 {
     SW_FREE(SW_BIN_TRIS);
     SW_BIN_TRIS = NULL;
     SW_BIN_COUNT = 0;
     SW_BIN_CAP = 0;
+    SW_FREE(SW_BIN_CELL_OFF);
+    SW_FREE(SW_BIN_CELL_IDX);
+    SW_BIN_CELL_OFF = NULL;
+    SW_BIN_CELL_IDX = NULL;
+    SW_BIN_CELL_NCELLS = 0;
+    SW_BIN_CELL_CAP_OFF = 0;
+    SW_BIN_CELL_CAP_IDX = 0;
 }
 
 static void sw_bin_discard(void)
@@ -4167,9 +4196,48 @@ static void sw_tri_y_sort3(const sw_vertex_t **v0, const sw_vertex_t **v1, const
     if ((*v0)->position[1] > (*v1)->position[1]) { const sw_vertex_t *t = *v0; *v0 = *v1; *v1 = t; }
 }
 
+/*
+ * Coverage gate shared by bin push and immediate raster — before barycentric
+ * plane setup. Matches SW_RASTER_TRIANGLE: empty floor(Y) scan range, or
+ * entirely outside the color buffer. Does not reject thin columns (px1==px0).
+ * Fills AABB out-params when returning 1.
+ */
+static inline int sw_tri_may_cover(const sw_vertex_t *a, const sw_vertex_t *b, const sw_vertex_t *c,
+                                   float *xmin, float *ymin, float *xmax, float *ymax)
+{
+    float xn = a->position[0], xx = xn;
+    float yn = a->position[1], yx = yn;
+    if (b->position[0] < xn) xn = b->position[0];
+    if (b->position[0] > xx) xx = b->position[0];
+    if (b->position[1] < yn) yn = b->position[1];
+    if (b->position[1] > yx) yx = b->position[1];
+    if (c->position[0] < xn) xn = c->position[0];
+    if (c->position[0] > xx) xx = c->position[0];
+    if (c->position[1] < yn) yn = c->position[1];
+    if (c->position[1] > yx) yx = c->position[1];
+
+    /* Same as raster yTop=(int)y0, yBot=(int)y2 after Y-sort. */
+    if ((int)yn >= (int)yx) return 0;
+
+    if (RLSW.colorBuffer)
+    {
+        int fbW = RLSW.colorBuffer->width;
+        int fbH = RLSW.colorBuffer->height;
+        if ((int)yx <= 0 || (int)yn >= fbH) return 0;
+        if (xx < 0.0f || xn >= (float)fbW) return 0;
+    }
+
+    *xmin = xn; *ymin = yn; *xmax = xx; *ymax = yx;
+    return 1;
+}
+
 static int sw_bin_push(const sw_vertex_t *a, const sw_vertex_t *b, const sw_vertex_t *c,
                        sw_raster_triangle_f raster)
 {
+    float xmin, ymin, xmax, ymax;
+    if (!sw_tri_may_cover(a, b, c, &xmin, &ymin, &xmax, &ymax))
+        return 1; /* no pixel coverage — skip before copy / bary setup */
+
     if (SW_BIN_COUNT >= SW_BIN_CAP)
     {
         int ncap = SW_BIN_CAP ? SW_BIN_CAP * 2 : 4096;
@@ -4184,19 +4252,10 @@ static int sw_bin_push(const sw_vertex_t *a, const sw_vertex_t *b, const sw_vert
     e->v0 = *p0; e->v1 = *p1; e->v2 = *p2;
     e->raster = raster;
     e->tex = RLSW.boundTexture;
+    e->xmin = xmin; e->ymin = ymin; e->xmax = xmax; e->ymax = ymax;
     sw_tri_setup_planes(&e->planes, &e->v0, &e->v1, &e->v2); /* into bin entry, Y-sorted */
     if (!e->planes.valid) return 1; /* degenerate: skip without growing list */
 
-    e->xmin = a->position[0]; e->xmax = a->position[0];
-    e->ymin = a->position[1]; e->ymax = a->position[1];
-    if (b->position[0] < e->xmin) e->xmin = b->position[0];
-    if (b->position[0] > e->xmax) e->xmax = b->position[0];
-    if (b->position[1] < e->ymin) e->ymin = b->position[1];
-    if (b->position[1] > e->ymax) e->ymax = b->position[1];
-    if (c->position[0] < e->xmin) e->xmin = c->position[0];
-    if (c->position[0] > e->xmax) e->xmax = c->position[0];
-    if (c->position[1] < e->ymin) e->ymin = c->position[1];
-    if (c->position[1] > e->ymax) e->ymax = c->position[1];
     SW_BIN_COUNT++;
     return 1;
 }
@@ -4208,6 +4267,93 @@ typedef struct sw_bin_flush_args {
 /* Concurrent-C @parallel for over stripes (see bin_par.ccs / generated/bin_par.c).
  * vertical=0 → rows (tx=0); vertical=1 → columns (ty=0). */
 void sw_bin_par_stripes(int n, int vertical, const sw_bin_flush_args_t *a);
+
+/* Build per-cell tri lists for 1D stripes. Returns 1 on success. */
+static int sw_bin_build_stripe_index(int axis, int ncells, int cellSize, int span)
+{
+    (void)span;
+    if (ncells < 1 || cellSize < 1 || SW_BIN_COUNT < 1) {
+        SW_BIN_CELL_NCELLS = 0;
+        return 0;
+    }
+    if (SW_BIN_CELL_CAP_OFF < ncells + 1) {
+        int *n = (int *)SW_REALLOC(SW_BIN_CELL_OFF, (size_t)(ncells + 1) * sizeof(int));
+        if (!n) { SW_BIN_CELL_NCELLS = 0; return 0; }
+        SW_BIN_CELL_OFF = n;
+        SW_BIN_CELL_CAP_OFF = ncells + 1;
+    }
+
+    /* OFF[0]=0; OFF[c+1] accumulates counts then becomes exclusive prefix. */
+    for (int i = 0; i <= ncells; i++) SW_BIN_CELL_OFF[i] = 0;
+
+    for (int i = 0; i < SW_BIN_COUNT; i++) {
+        sw_bin_tri_t *e = &SW_BIN_TRIS[i];
+        float a0 = axis ? e->xmin : e->ymin;
+        float a1 = axis ? e->xmax : e->ymax;
+        int c0 = (int)(a0 / (float)cellSize);
+        int c1 = (int)(a1 / (float)cellSize);
+        if (c0 < 0) c0 = 0;
+        if (c1 < 0) c1 = 0;
+        if (c0 >= ncells) c0 = ncells - 1;
+        if (c1 >= ncells) c1 = ncells - 1;
+        if (c1 < c0) { int t = c0; c0 = c1; c1 = t; }
+        for (int c = c0; c <= c1; c++) SW_BIN_CELL_OFF[c + 1]++;
+    }
+
+    for (int c = 0; c < ncells; c++) SW_BIN_CELL_OFF[c + 1] += SW_BIN_CELL_OFF[c];
+    int total = SW_BIN_CELL_OFF[ncells];
+    if (total < 1) { SW_BIN_CELL_NCELLS = 0; return 0; }
+
+    if (SW_BIN_CELL_CAP_IDX < total) {
+        int *n = (int *)SW_REALLOC(SW_BIN_CELL_IDX, (size_t)total * sizeof(int));
+        if (!n) { SW_BIN_CELL_NCELLS = 0; return 0; }
+        SW_BIN_CELL_IDX = n;
+        SW_BIN_CELL_CAP_IDX = total;
+    }
+
+    /* Cursor starts at each cell's prefix start; rebuild prefix afterward from counts. */
+    int *cursor = SW_BIN_CELL_OFF; /* temporarily: cursor[c] = write head for cell c */
+    /* Save prefix starts: we'll overwrite OFF[0..ncells-1] as cursors; OFF[ncells] stays total.
+     * First copy prefix starts into IDX region? Simpler: allocate small stack for ncells<=4096
+     * or second pass using a temp. Use SW_BIN_CELL_IDX end as scratch only if we fill after —
+     * easiest: keep a parallel cursor by copying OFF[0..ncells) to the first ncells of a
+     * realloc'd block. For simplicity, second counting-free fill with local prefix copy: */
+
+    /* Materialize write heads into the first ncells entries of IDX temporarily if total>=ncells,
+     * else small VLA-ish via heap. */
+    int *heads = NULL;
+    int heads_local[256];
+    if (ncells <= 256) {
+        heads = heads_local;
+    } else {
+        heads = (int *)SW_MALLOC((size_t)ncells * sizeof(int));
+        if (!heads) { SW_BIN_CELL_NCELLS = 0; return 0; }
+    }
+    for (int c = 0; c < ncells; c++) heads[c] = SW_BIN_CELL_OFF[c];
+
+    for (int i = 0; i < SW_BIN_COUNT; i++) {
+        sw_bin_tri_t *e = &SW_BIN_TRIS[i];
+        float a0 = axis ? e->xmin : e->ymin;
+        float a1 = axis ? e->xmax : e->ymax;
+        int c0 = (int)(a0 / (float)cellSize);
+        int c1 = (int)(a1 / (float)cellSize);
+        if (c0 < 0) c0 = 0;
+        if (c1 < 0) c1 = 0;
+        if (c0 >= ncells) c0 = ncells - 1;
+        if (c1 >= ncells) c1 = ncells - 1;
+        if (c1 < c0) { int t = c0; c0 = c1; c1 = t; }
+        for (int c = c0; c <= c1; c++) {
+            SW_BIN_CELL_IDX[heads[c]++] = i;
+        }
+    }
+
+    if (heads != heads_local) SW_FREE(heads);
+    (void)cursor;
+
+    SW_BIN_CELL_AXIS = axis;
+    SW_BIN_CELL_NCELLS = ncells;
+    return 1;
+}
 
 /* One stripe/tile: stack ctx, planes pointer into bin entry (no plane copy).
  * Non-static: called from @parallel workers in bin_par.c. */
@@ -4227,6 +4373,25 @@ void sw_bin_fill_cell(int tx, int ty, const sw_bin_flush_args_t *a)
 
     float fx0 = (float)cx0, fy0 = (float)cy0;
     float fx1 = (float)cx1, fy1 = (float)cy1;
+
+    /* Indexed 1D stripe path: only tris that overlap this cell. */
+    if (SW_BIN_CELL_NCELLS > 0 && SW_BIN_CELL_OFF && SW_BIN_CELL_IDX) {
+        int cell = SW_BIN_CELL_AXIS ? tx : ty;
+        if (cell >= 0 && cell < SW_BIN_CELL_NCELLS) {
+            int i0 = SW_BIN_CELL_OFF[cell];
+            int i1 = SW_BIN_CELL_OFF[cell + 1];
+            for (int k = i0; k < i1; k++) {
+                sw_bin_tri_t *e = &SW_BIN_TRIS[SW_BIN_CELL_IDX[k]];
+                /* Cross-axis reject still needed (narrow tiles / edge cases). */
+                if (e->xmax < fx0 || e->xmin >= fx1 || e->ymax < fy0 || e->ymin >= fy1) continue;
+                fc.planes = &e->planes;
+                fc.tex = (sw_texture_t *)e->tex;
+                e->raster(&fc, &e->v0, &e->v1, &e->v2);
+            }
+            return;
+        }
+    }
+
     for (int i = 0; i < SW_BIN_COUNT; i++)
     {
         sw_bin_tri_t *e = &SW_BIN_TRIS[i];
@@ -4239,10 +4404,10 @@ void sw_bin_fill_cell(int tx, int ty, const sw_bin_flush_args_t *a)
 
 static void sw_bin_flush(void)
 {
-    if (SW_BIN_COUNT <= 0) { SW_BIN_COUNT = 0; return; }
+    if (SW_BIN_COUNT <= 0) { SW_BIN_COUNT = 0; SW_BIN_CELL_NCELLS = 0; return; }
     /* Both zero → bins off. */
-    if (RLSW.binW <= 0 && RLSW.binH <= 0) { SW_BIN_COUNT = 0; return; }
-    if (!RLSW.colorBuffer) { SW_BIN_COUNT = 0; return; }
+    if (RLSW.binW <= 0 && RLSW.binH <= 0) { SW_BIN_COUNT = 0; SW_BIN_CELL_NCELLS = 0; return; }
+    if (!RLSW.colorBuffer) { SW_BIN_COUNT = 0; SW_BIN_CELL_NCELLS = 0; return; }
 
     sw_bin_flush_args_t a;
     a.fbW = RLSW.colorBuffer->width;
@@ -4260,6 +4425,12 @@ static void sw_bin_flush(void)
     int col_stripe = (RLSW.binH <= 0 && RLSW.binW > 0);
     int use_par = (!RLSW.seq) && ((row_stripe && nty > 1) || (col_stripe && ntx > 1));
 
+    SW_BIN_CELL_NCELLS = 0;
+    if (row_stripe)
+        sw_bin_build_stripe_index(0, nty, a.bh, a.fbH);
+    else if (col_stripe)
+        sw_bin_build_stripe_index(1, ntx, a.bw, a.fbW);
+
     if (use_par)
     {
         if (col_stripe) sw_bin_par_stripes(ntx, 1, &a);
@@ -4273,6 +4444,7 @@ static void sw_bin_flush(void)
     }
 
     SW_BIN_COUNT = 0;
+    SW_BIN_CELL_NCELLS = 0;
 }
 
 static inline void sw_bin_flush_pending(void)
@@ -6517,7 +6689,7 @@ static void SW_RASTER_TRIANGLE(sw_fill_ctx_t *fc, const sw_vertex_t *v0, const s
         if (yMid < yTop) yMid = yTop;
         if (yMid > yBot) yMid = yBot;
     }
-    if (yTop >= yBot) return; /* no scanline / 0 pixel centers vertically */
+    if (yTop >= yBot) return; /* no scanline — same gate as sw_tri_may_cover */
 
     int32_t X0 = sw_to_26_6(x0), Y0 = sw_to_26_6(y0);
     int32_t X1 = sw_to_26_6(x1), Y1 = sw_to_26_6(y1);
@@ -6535,6 +6707,7 @@ static void SW_RASTER_TRIANGLE(sw_fill_ctx_t *fc, const sw_vertex_t *v0, const s
         if (px1 < px0) return;
     }
 
+    /* Barycentric planes only after coverage is known non-empty. */
     if (!fc->planes->valid)
         sw_tri_setup_planes(fc->planes, v0, v1, v2);
     if (!fc->planes->valid) return;
@@ -6555,7 +6728,50 @@ static void SW_RASTER_TRIANGLE(sw_fill_ctx_t *fc, const sw_vertex_t *v0, const s
         return;
     }
 
-    /* Float attrib grads still used when skinny bary falls back to edge lerp. */
+#ifdef SW_GEN_SPAN
+    /*
+     * Integer span kernels (sw_gen_span_*) sample attribs from fc->planes only.
+     * Edge walk needs 26.6 X bounds + scanline Y; skip float vertex gradient
+     * walking (PCT/PC copies) — large win for small tris (terrain) without
+     * changing coverage or the public rlsw API.
+     */
+    {
+        sw_vertex_t lVert, rVert;
+        for (int y = yTop; y < yMid; y++)
+        {
+            int32_t ys = sw_edge_sample_y26(y);
+            int xL = sw_edge_x_at_y26(X0, Y0, X2, Y2, ys) >> SW_EDGE_SHIFT;
+            int xR = sw_edge_x_at_y26(X0, Y0, X1, Y1, ys) >> SW_EDGE_SHIFT;
+            if (xL > xR) { int t = xL; xL = xR; xR = t; }
+            if (xL < clipX0) xL = clipX0;
+            if (xR > clipX1) xR = clipX1;
+            if (xL < xR)
+            {
+                lVert.position[0] = (float)xL;
+                rVert.position[0] = (float)xR;
+                lVert.position[1] = rVert.position[1] = (float)y;
+                SW_RASTER_TRIANGLE_SPAN(fc, &lVert, &rVert, 0.0f, 0.0f);
+            }
+        }
+        for (int y = yMid; y < yBot; y++)
+        {
+            int32_t ys = sw_edge_sample_y26(y);
+            int xL = sw_edge_x_at_y26(X0, Y0, X2, Y2, ys) >> SW_EDGE_SHIFT;
+            int xR = sw_edge_x_at_y26(X1, Y1, X2, Y2, ys) >> SW_EDGE_SHIFT;
+            if (xL > xR) { int t = xL; xL = xR; xR = t; }
+            if (xL < clipX0) xL = clipX0;
+            if (xR > clipX1) xR = clipX1;
+            if (xL < xR)
+            {
+                lVert.position[0] = (float)xL;
+                rVert.position[0] = (float)xR;
+                lVert.position[1] = rVert.position[1] = (float)y;
+                SW_RASTER_TRIANGLE_SPAN(fc, &lVert, &rVert, 0.0f, 0.0f);
+            }
+        }
+    }
+#else
+    /* Float leftover path: edge-lerp attribs when planes are unused / skinny. */
     float h02 = y2 - y0;
     float h01 = y1 - y0;
     float h12 = y2 - y1;
@@ -6621,6 +6837,7 @@ static void SW_RASTER_TRIANGLE(sw_fill_ctx_t *fc, const sw_vertex_t *v0, const s
         SW_ADD_GRAD(&lVert, &dVXdy02);
         SW_ADD_GRAD(&rVert, &dVXdy12);
     }
+#endif /* SW_GEN_SPAN */
 }
 
 #undef SW_GET_GRAD
